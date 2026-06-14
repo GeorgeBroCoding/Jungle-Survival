@@ -70,6 +70,42 @@ canvas {
   letter-spacing: 1px;
 }
 
+.meters-counter .coins-line {
+  margin-top: 4px;
+  font-size: 14px;
+  color: #ffd34d;
+}
+
+.tribe-panel {
+  position: absolute;
+  top: 60px;
+  left: 20px;
+  background: rgba(40, 20, 10, 0.6);
+  border: 2px solid #c2453b;
+  border-radius: 10px;
+  padding: 6px 14px;
+  font-size: 14px;
+}
+
+.raid-banner {
+  position: absolute;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(120, 20, 20, 0.85);
+  border: 2px solid #ff5a5a;
+  border-radius: 10px;
+  padding: 8px 20px;
+  font-size: 16px;
+  font-weight: bold;
+  animation: pulseRaid 1s infinite alternate;
+}
+
+@keyframes pulseRaid {
+  from { box-shadow: 0 0 6px #ff5a5a; }
+  to { box-shadow: 0 0 20px #ff5a5a; }
+}
+
 .stats-panel {
   position: absolute;
   bottom: 16px;
@@ -404,6 +440,10 @@ function onKeyPress(handler) {
   return () => pressHandlers.delete(handler);
 }
 
+// Shared mutable player transform, updated every frame by Player.js.
+// Avoids putting per-frame position data into the zustand store.
+const playerTransform = { position: [0, 0, 8], yaw: 0 };
+
 // ============================================================
 // interactions.js - "walk up and press a key" registry
 // ============================================================
@@ -526,6 +566,31 @@ const KITO_LINES = {
     "Heh, good taste. That one's one of my favorites.",
   ],
 };
+
+// Structures buildable at the workbench's "Build" menu (B)
+const BUILDING_TYPES = [
+  { id: 'house', name: 'House', desc: 'A simple shelter for your tribe.', cost: { wood: 10, fiber: 4 } },
+  { id: 'lookout', name: 'Lookout Tower', desc: 'Spot raiders coming from afar.', cost: { wood: 15, stone: 5 } },
+  { id: 'wall', name: 'Palisade Wall', desc: 'Slows down raiders.', cost: { wood: 8, stone: 2 } },
+  { id: 'storage', name: 'Storage Hut', desc: 'A place to stash resources.', cost: { wood: 6, fiber: 3 } },
+];
+
+// Rival tribes - their camps sit far across the jungle and occasionally send raiders
+const ENEMY_TRIBES = [
+  { id: 'redfang', name: 'Red Fang Tribe', color: '#c2453b', campPosition: [-90, 0, -90] },
+  { id: 'bonecrush', name: 'Bonecrusher Clan', color: '#4a5ad6', campPosition: [95, 0, -80] },
+  { id: 'shadowleaf', name: 'Shadowleaf Raiders', color: '#3bc26a', campPosition: [85, 0, 95] },
+];
+
+// Where the player's own tribe is based - raiders march here
+const BASE_CENTER = [0, 0, 0];
+
+// Coins - a separate currency that occasionally falls from the sky and
+// is spent recruiting warriors for the player's tribe.
+const WARRIOR_BASE_COST = 15; // coins, scales up with each warrior recruited
+const COIN_DROP_MIN = 5;
+const COIN_DROP_MAX = 15;
+const COIN_SPAWN_RADIUS = 50;
 
 // World resource node placement (positions are fixed for now)
 function generateResourceNodes() {
@@ -695,6 +760,102 @@ const useGame = create((set, get) => ({
     setTimeout(() => {
       set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));
     }, 3000);
+  },
+
+  // --- coins (separate currency, collected from sky drops) ---
+  coins: 0,
+  addCoins: (amount) => {
+    set((s) => ({ coins: s.coins + amount }));
+    get().addToast(`+${amount} coins`);
+  },
+  spendCoins: (amount) => {
+    if (get().coins < amount) return false;
+    set((s) => ({ coins: s.coins - amount }));
+    return true;
+  },
+
+  // --- coin drops, fall from the sky and are collected on contact ---
+  coinDrops: [],
+  spawnCoinDrop: () => {
+    const value = COIN_DROP_MIN + Math.floor(Math.random() * (COIN_DROP_MAX - COIN_DROP_MIN + 1));
+    const angle = Math.random() * Math.PI * 2;
+    const dist = Math.random() * COIN_SPAWN_RADIUS;
+    const id = `coin_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    const position = [Math.cos(angle) * dist, 0, Math.sin(angle) * dist];
+    set((s) => ({ coinDrops: [...s.coinDrops, { id, position, value }] }));
+  },
+  collectCoinDrop: (id, value) => {
+    set((s) => ({ coinDrops: s.coinDrops.filter((c) => c.id !== id) }));
+    get().addCoins(value);
+  },
+
+  // --- the player's tribe: recruit warriors to defend against raids ---
+  warriors: 3,
+  recruitWarrior: () => {
+    const cost = WARRIOR_BASE_COST + get().warriors * 8;
+    if (!get().spendCoins(cost)) {
+      get().addToast(`Need ${cost} coins to recruit a warrior`);
+      return false;
+    }
+    set((s) => ({ warriors: s.warriors + 1 }));
+    get().addToast('A new warrior joins your tribe!');
+    return true;
+  },
+
+  // --- player-built structures ---
+  buildings: [],
+  placeBuilding: (typeId) => {
+    const type = BUILDING_TYPES.find((b) => b.id === typeId);
+    if (!type) return false;
+    if (!get().hasItems(type.cost)) {
+      get().addToast(`Not enough resources for ${type.name}`);
+      return false;
+    }
+    for (const [k, v] of Object.entries(type.cost)) get().removeItem(k, v);
+    const [px, , pz] = playerTransform.position;
+    const yaw = playerTransform.yaw;
+    const dist = 4;
+    const x = px - Math.sin(yaw) * dist;
+    const z = pz - Math.cos(yaw) * dist;
+    const id = `bld_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    set((s) => ({ buildings: [...s.buildings, { id, type: typeId, position: [x, 0, z], rotation: yaw }] }));
+    get().addToast(`Built ${type.name}`);
+    return true;
+  },
+
+  // --- rival tribe raids ---
+  raid: null, // { tribeId, tribeName, color, raiders: [{ id, position }] }
+  startRaid: () => {
+    if (get().raid) return;
+    const tribe = ENEMY_TRIBES[Math.floor(Math.random() * ENEMY_TRIBES.length)];
+    const count = 2 + Math.floor(Math.random() * 3);
+    const raiders = [];
+    for (let i = 0; i < count; i++) {
+      raiders.push({
+        id: `raider_${Date.now()}_${i}`,
+        position: [
+          tribe.campPosition[0] + (Math.random() - 0.5) * 6,
+          0,
+          tribe.campPosition[2] + (Math.random() - 0.5) * 6,
+        ],
+      });
+    }
+    set({ raid: { tribeId: tribe.id, tribeName: tribe.name, color: tribe.color, raiders } });
+    get().addToast(`${tribe.name} is raiding your tribe!`);
+  },
+  resolveRaider: (raiderId, raiderWon) => {
+    const raid = get().raid;
+    if (!raid) return;
+    const raiders = raid.raiders.filter((r) => r.id !== raiderId);
+    set({ raid: raiders.length ? { ...raid, raiders } : null });
+    if (raiderWon) {
+      get().adjustStat('health', -10);
+      if (get().warriors > 0) set((s) => ({ warriors: s.warriors - 1 }));
+      get().addToast('A raider broke through and damaged your tribe!');
+    } else {
+      get().addToast('Your warriors repelled a raider!');
+    }
+    if (!raiders.length) get().addToast(`${raid.tribeName} retreats!`);
   },
 
   // --- game start ---
@@ -1092,7 +1253,9 @@ function Player() {
       if (code === 'KeyQ') {
         s.setActiveHotbarSlot((s.activeHotbarSlot + 1) % s.hotbarSlots.length);
       }
-      if (code === 'KeyB') s.addToast('Base building menu coming soon');
+      if (code === 'KeyB') {
+        s.setActivePanel(s.activePanel === 'build' ? null : 'build');
+      }
       if (code === 'KeyM') s.addToast('Full jungle map coming soon');
     });
 
@@ -1253,6 +1416,12 @@ function Player() {
       if (t < 5 || t > 20) s.adjustStat('warmth', -0.6);
       else s.adjustStat('warmth', 0.4);
     }
+
+    // ---- share transform for building placement ----
+    playerTransform.position[0] = pos.x;
+    playerTransform.position[1] = pos.y;
+    playerTransform.position[2] = pos.z;
+    playerTransform.yaw = yaw.current;
 
     // ---- nearby interactables ----
     const near = findNearest([pos.x, pos.y, pos.z]);
@@ -1683,6 +1852,331 @@ function Animals() {
 }
 
 // ============================================================
+// Tribes.js - rival tribe camps, wandering tribesfolk and raiders
+// ============================================================
+
+// Shared low-poly tribesperson model. Used for both peaceful camp
+// members (wander AI) and raiders (march toward the player's base).
+function TribalFigure({ color }) {
+  return html`
+    <${Fragment}>
+      <mesh position=${[0, 1.0, 0]} castShadow=${true}>
+        <capsuleGeometry args=${[0.26, 0.55, 4, 8]} />
+        <meshStandardMaterial color=${color} roughness=${0.85} flatShading=${true} />
+      </mesh>
+      <mesh position=${[0, 1.65, 0]} castShadow=${true}>
+        <sphereGeometry args=${[0.22, 12, 12]} />
+        <meshStandardMaterial color="#a9764e" roughness=${0.8} />
+      </mesh>
+      <mesh position=${[0, 2.0, 0]} castShadow=${true}>
+        <coneGeometry args=${[0.18, 0.32, 5]} />
+        <meshStandardMaterial color=${color} flatShading=${true} />
+      </mesh>
+      <mesh position=${[0.32, 1.15, 0]} rotation=${[0, 0, -0.3]} castShadow=${true}>
+        <capsuleGeometry args=${[0.07, 0.45, 4, 6]} />
+        <meshStandardMaterial color="#a9764e" />
+      </mesh>
+      <mesh position=${[-0.32, 1.15, 0]} rotation=${[0, 0, 0.3]} castShadow=${true}>
+        <capsuleGeometry args=${[0.07, 0.45, 4, 6]} />
+        <meshStandardMaterial color="#a9764e" />
+      </mesh>
+    <//>
+  `;
+}
+
+// ---------- Peaceful tribe member, wanders near its camp ----------
+function TribeMember({ spawn, color }) {
+  const group = useRef();
+  const legL = useRef();
+  const legR = useRef();
+  const legRefs = useWanderAI(group, spawn, { speed: 1.2, fleeSpeed: 3 });
+  legRefs.current = [
+    { ref: legL, sign: 1 },
+    { ref: legR, sign: -1 },
+  ];
+
+  return html`
+    <group ref=${group} position=${spawn}>
+      <${TribalFigure} color=${color} />
+      <group ref=${legL} position=${[0.12, 0.55, 0]}>
+        <mesh position=${[0, -0.3, 0]} castShadow=${true}><capsuleGeometry args=${[0.09, 0.5, 4, 6]} /><meshStandardMaterial color="#5a4632" /></mesh>
+      </group>
+      <group ref=${legR} position=${[-0.12, 0.55, 0]}>
+        <mesh position=${[0, -0.3, 0]} castShadow=${true}><capsuleGeometry args=${[0.09, 0.5, 4, 6]} /><meshStandardMaterial color="#5a4632" /></mesh>
+      </group>
+    </group>
+  `;
+}
+
+// ---------- A rival tribe's camp: tents, totem and a few wandering members ----------
+function TribeCamp({ tribe }) {
+  const [x, , z] = tribe.campPosition;
+  return html`
+    <${Fragment}>
+      <group position=${[x, 0, z]}>
+        ${[[-3, -2], [3, -2], [0, 3]].map((p, i) => html`
+          <group key=${i} position=${[p[0], 0, p[1]]}>
+            <mesh position=${[0, 0.9, 0]} castShadow=${true} receiveShadow=${true}>
+              <coneGeometry args=${[1.4, 1.8, 7]} />
+              <meshStandardMaterial color=${tribe.color} flatShading=${true} roughness=${0.9} />
+            </mesh>
+          </group>
+        `)}
+        <mesh position=${[0, 1.5, 0]} castShadow=${true}>
+          <cylinderGeometry args=${[0.15, 0.15, 3, 6]} />
+          <meshStandardMaterial color="#5a3c22" />
+        </mesh>
+        <mesh position=${[0, 3.2, 0]} castShadow=${true}>
+          <coneGeometry args=${[0.4, 0.6, 5]} />
+          <meshStandardMaterial color=${tribe.color} flatShading=${true} />
+        </mesh>
+      </group>
+      <${TribeMember} spawn=${[x - 4, 0, z + 1]} color=${tribe.color} />
+      <${TribeMember} spawn=${[x + 4, 0, z - 1]} color=${tribe.color} />
+      <${TribeMember} spawn=${[x, 0, z + 4]} color=${tribe.color} />
+    <//>
+  `;
+}
+
+function TribeCamps() {
+  return html`
+    <${Fragment}>
+      ${ENEMY_TRIBES.map((t) => html`<${TribeCamp} key=${t.id} tribe=${t} />`)}
+    <//>
+  `;
+}
+
+// ---------- The player's own tribe banner, marks the raid target ----------
+function PlayerTribeBase() {
+  return html`
+    <group position=${BASE_CENTER}>
+      <mesh position=${[0, 1.5, 0]} castShadow=${true}>
+        <cylinderGeometry args=${[0.15, 0.15, 3, 6]} />
+        <meshStandardMaterial color="#5a3c22" />
+      </mesh>
+      <mesh position=${[0, 3.2, 0]} castShadow=${true}>
+        <coneGeometry args=${[0.45, 0.7, 5]} />
+        <meshStandardMaterial color="#ffe27a" flatShading=${true} />
+      </mesh>
+      <mesh position=${[0, 2.2, 0.05]} castShadow=${true}>
+        <planeGeometry args=${[0.8, 1]} />
+        <meshStandardMaterial color="#c9a227" side=${THREE.DoubleSide} />
+      </mesh>
+    </group>
+  `;
+}
+
+// ---------- A raider marching from its tribe's camp toward the player's base ----------
+function Raider({ id, startPosition, color }) {
+  const group = useRef();
+  const legL = useRef();
+  const legR = useRef();
+  const phase = useRef(Math.random() * 10);
+  const resolved = useRef(false);
+
+  useFrame((_, rawDelta) => {
+    if (resolved.current || !group.current) return;
+    const delta = Math.min(rawDelta, 0.1);
+    const pos = group.current.position;
+    const dx = BASE_CENTER[0] - pos.x;
+    const dz = BASE_CENTER[2] - pos.z;
+    const dist = Math.hypot(dx, dz);
+
+    if (dist < 3) {
+      resolved.current = true;
+      const warriors = useGame.getState().warriors;
+      const winChance = Math.min(0.9, warriors * 0.22 + 0.08);
+      useGame.getState().resolveRaider(id, Math.random() >= winChance);
+      return;
+    }
+
+    const speed = 3;
+    const dirX = dx / dist;
+    const dirZ = dz / dist;
+    pos.x += dirX * speed * delta;
+    pos.z += dirZ * speed * delta;
+    group.current.rotation.y = Math.atan2(dirX, dirZ);
+    phase.current += delta * speed * 3;
+    const swing = Math.sin(phase.current) * 0.4;
+    if (legL.current) legL.current.rotation.x = swing;
+    if (legR.current) legR.current.rotation.x = -swing;
+  });
+
+  return html`
+    <group ref=${group} position=${startPosition}>
+      <${TribalFigure} color=${color} />
+      <group ref=${legL} position=${[0.12, 0.55, 0]}>
+        <mesh position=${[0, -0.3, 0]} castShadow=${true}><capsuleGeometry args=${[0.09, 0.5, 4, 6]} /><meshStandardMaterial color="#3a2a1c" /></mesh>
+      </group>
+      <group ref=${legR} position=${[-0.12, 0.55, 0]}>
+        <mesh position=${[0, -0.3, 0]} castShadow=${true}><capsuleGeometry args=${[0.09, 0.5, 4, 6]} /><meshStandardMaterial color="#3a2a1c" /></mesh>
+      </group>
+      <mesh position=${[0, 1.3, 0.3]} rotation=${[Math.PI / 2.4, 0, 0]} castShadow=${true}>
+        <cylinderGeometry args=${[0.02, 0.02, 1, 5]} />
+        <meshStandardMaterial color="#5a4632" />
+      </mesh>
+    </group>
+  `;
+}
+
+function Raiders() {
+  const raid = useGame((s) => s.raid);
+  if (!raid) return null;
+  return html`
+    <${Fragment}>
+      ${raid.raiders.map((r) => html`<${Raider} key=${r.id} id=${r.id} startPosition=${r.position} color=${raid.color} />`)}
+    <//>
+  `;
+}
+
+// ---------- Periodically triggers raids from a random rival tribe ----------
+function RaidManager() {
+  const timer = useRef(60 + Math.random() * 40);
+  useFrame((_, rawDelta) => {
+    const delta = Math.min(rawDelta, 0.1);
+    const s = useGame.getState();
+    if (s.raid) return;
+    timer.current -= delta;
+    if (timer.current <= 0) {
+      s.startRaid();
+      timer.current = 100 + Math.random() * 80;
+    }
+  });
+  return null;
+}
+
+// ============================================================
+// Buildings.js - player-placed structures
+// ============================================================
+function Building({ building }) {
+  const { type, position, rotation } = building;
+
+  if (type === 'house') {
+    return html`
+      <group position=${position} rotation=${[0, rotation, 0]}>
+        <mesh position=${[0, 0.6, 0]} castShadow=${true} receiveShadow=${true}>
+          <boxGeometry args=${[2, 1.2, 2]} />
+          <meshStandardMaterial color="#caa45a" roughness=${0.85} />
+        </mesh>
+        <mesh position=${[0, 1.5, 0]} castShadow=${true}>
+          <coneGeometry args=${[1.6, 1.2, 4]} />
+          <meshStandardMaterial color="#8a5a2b" flatShading=${true} roughness=${0.9} />
+        </mesh>
+      </group>
+    `;
+  }
+
+  if (type === 'lookout') {
+    return html`
+      <group position=${position} rotation=${[0, rotation, 0]}>
+        <mesh position=${[0, 2, 0]} castShadow=${true} receiveShadow=${true}>
+          <cylinderGeometry args=${[0.3, 0.4, 4, 6]} />
+          <meshStandardMaterial color="#8a5a2b" roughness=${0.9} />
+        </mesh>
+        <mesh position=${[0, 4.1, 0]} castShadow=${true} receiveShadow=${true}>
+          <boxGeometry args=${[1.6, 0.2, 1.6]} />
+          <meshStandardMaterial color="#6a4222" roughness=${0.9} />
+        </mesh>
+        <mesh position=${[0, 4.7, 0]} castShadow=${true}>
+          <coneGeometry args=${[1.2, 1, 4]} />
+          <meshStandardMaterial color="#caa45a" flatShading=${true} />
+        </mesh>
+      </group>
+    `;
+  }
+
+  if (type === 'wall') {
+    return html`
+      <mesh position=${position} rotation=${[0, rotation, 0]} castShadow=${true} receiveShadow=${true}>
+        <boxGeometry args=${[3, 1.4, 0.3]} />
+        <meshStandardMaterial color="#7a5a3a" roughness=${0.9} />
+      </mesh>
+    `;
+  }
+
+  // storage hut
+  return html`
+    <mesh position=${[position[0], 0.4, position[2]]} rotation=${[0, rotation, 0]} castShadow=${true} receiveShadow=${true}>
+      <boxGeometry args=${[1, 0.8, 1]} />
+      <meshStandardMaterial color="#6a4222" roughness=${0.9} />
+    </mesh>
+  `;
+}
+
+function Buildings() {
+  const buildings = useGame((s) => s.buildings);
+  return html`
+    <${Fragment}>
+      ${buildings.map((b) => html`<${Building} key=${b.id} building=${b} />`)}
+    <//>
+  `;
+}
+
+// ============================================================
+// Coins.js - currency that falls from the sky and is collected
+// ============================================================
+function CoinDrop({ id, position, value }) {
+  const group = useRef();
+  const landed = useRef(false);
+  const collected = useRef(false);
+
+  useFrame((_, rawDelta) => {
+    if (collected.current || !group.current) return;
+    const delta = Math.min(rawDelta, 0.1);
+    const obj = group.current;
+    obj.rotation.y += delta * 3;
+
+    if (!landed.current) {
+      obj.position.y -= delta * 9;
+      if (obj.position.y <= 0.6) {
+        obj.position.y = 0.6;
+        landed.current = true;
+      }
+      return;
+    }
+
+    const [px, , pz] = playerTransform.position;
+    const dist = Math.hypot(obj.position.x - px, obj.position.z - pz);
+    if (dist < 1.6) {
+      collected.current = true;
+      useGame.getState().collectCoinDrop(id, value);
+    }
+  });
+
+  return html`
+    <group ref=${group} position=${[position[0], 30, position[2]]}>
+      <mesh rotation=${[Math.PI / 2, 0, 0]} castShadow=${true}>
+        <cylinderGeometry args=${[0.4, 0.4, 0.08, 16]} />
+        <meshStandardMaterial color="#ffd34d" metalness=${0.6} roughness=${0.3} emissive="#7a5a00" emissiveIntensity=${0.4} />
+      </mesh>
+    </group>
+  `;
+}
+
+function CoinDrops() {
+  const coinDrops = useGame((s) => s.coinDrops);
+  return html`
+    <${Fragment}>
+      ${coinDrops.map((c) => html`<${CoinDrop} key=${c.id} id=${c.id} position=${c.position} value=${c.value} />`)}
+    <//>
+  `;
+}
+
+// Periodically spawns a coin that falls from the sky somewhere near the player
+function CoinDropManager() {
+  const timer = useRef(8 + Math.random() * 10);
+  useFrame((_, rawDelta) => {
+    const delta = Math.min(rawDelta, 0.1);
+    timer.current -= delta;
+    if (timer.current <= 0) {
+      useGame.getState().spawnCoinDrop();
+      timer.current = 20 + Math.random() * 25;
+    }
+  });
+  return null;
+}
+
+// ============================================================
 // Hud.js - DOM overlay (stats, hotbar, panels, toasts)
 // ============================================================
 const KEY_LABELS = {
@@ -1738,19 +2232,37 @@ function InventoryPanel() {
 
 function ShopPanel() {
   const meters = useGame((s) => s.meters);
+  const coins = useGame((s) => s.coins);
+  const warriors = useGame((s) => s.warriors);
+  const recruitWarrior = useGame((s) => s.recruitWarrior);
   const setActivePanel = useGame((s) => s.setActivePanel);
   const buyItem = useGame((s) => s.buyItem);
   const [line] = useState(() => {
     const pool = meters > 1000 ? KITO_LINES.richReaction : meters < 100 ? KITO_LINES.poorReaction : KITO_LINES.greeting;
     return pool[Math.floor(Math.random() * pool.length)];
   });
+  const recruitCost = WARRIOR_BASE_COST + warriors * 8;
 
   return html`
     <div class="panel-overlay" onClick=${() => setActivePanel(null)}>
       <div class="panel" onClick=${(e) => e.stopPropagation()}>
         <h2>Kito's Shop</h2>
         <p class="npc-name">"${line}"</p>
-        <p style=${{ marginBottom: '10px' }}>Your meters: <strong style=${{ color: '#ffe27a' }}>${Math.floor(meters)}</strong></p>
+        <p style=${{ marginBottom: '10px' }}>
+          Your meters: <strong style=${{ color: '#ffe27a' }}>${Math.floor(meters)}</strong>
+          &nbsp;&middot;&nbsp;
+          Your coins: <strong style=${{ color: '#ffd34d' }}>${coins}</strong>
+        </p>
+        <div class="shop-item">
+          <div>
+            <div class="name">Recruit Tribal Warrior</div>
+            <div class="desc">Strengthens your tribe against rival raids. Currently: ${warriors} warriors.</div>
+          </div>
+          <div style=${{ textAlign: 'right' }}>
+            <div class="price">${recruitCost}c</div>
+            <button class="buy-btn" disabled=${coins < recruitCost} onClick=${() => recruitWarrior()}>Recruit</button>
+          </div>
+        </div>
         ${SHOP_ITEMS.map((item) => html`
           <div class="shop-item" key=${item.id}>
             <div>
@@ -1800,8 +2312,43 @@ function CraftingPanel() {
   `;
 }
 
+function BuildPanel() {
+  const inventory = useGame((s) => s.inventory);
+  const hasItems = useGame((s) => s.hasItems);
+  const placeBuilding = useGame((s) => s.placeBuilding);
+  const setActivePanel = useGame((s) => s.setActivePanel);
+
+  return html`
+    <div class="panel-overlay" onClick=${() => setActivePanel(null)}>
+      <div class="panel" onClick=${(e) => e.stopPropagation()}>
+        <h2>Build</h2>
+        <p class="npc-name">Places the structure just ahead of you.</p>
+        ${BUILDING_TYPES.map((b) => {
+          const costStr = Object.entries(b.cost)
+            .map(([k, v]) => `${RESOURCES[k]?.name || k} x${v} (have ${inventory[k] || 0})`)
+            .join(', ');
+          return html`
+            <div class="craft-item" key=${b.id}>
+              <div>
+                <div class="name">${b.name}</div>
+                <div class="desc">${b.desc}</div>
+                <div class="desc">${costStr}</div>
+              </div>
+              <button class="craft-btn" disabled=${!hasItems(b.cost)} onClick=${() => placeBuilding(b.id)}>Build</button>
+            </div>
+          `;
+        })}
+        <p class="close-hint">B, Tab or Esc to close</p>
+      </div>
+    </div>
+  `;
+}
+
 function Hud() {
   const meters = useGame((s) => s.meters);
+  const coins = useGame((s) => s.coins);
+  const warriors = useGame((s) => s.warriors);
+  const raid = useGame((s) => s.raid);
   const stats = useGame((s) => s.stats);
   const timeOfDay = useGame((s) => s.timeOfDay);
   const nearInteractable = useGame((s) => s.nearInteractable);
@@ -1816,8 +2363,14 @@ function Hud() {
       <div class="meters-counter">
         <span class="label">METERS TRAVELED</span>
         ${Math.floor(meters)} m
+        <div class="coins-line">🪙 ${coins}</div>
       </div>
       <div class="day-clock">🕐 ${formatTime(timeOfDay)}</div>
+      <div class="tribe-panel">⚔️ ${warriors} warriors</div>
+
+      ${raid && html`
+        <div class="raid-banner">⚠️ ${raid.tribeName} is attacking! Raiders incoming: ${raid.raiders.length}</div>
+      `}
 
       <div class="stats-panel">
         <${StatBar} icon="❤️" value=${stats.health} cls="health" />
@@ -1850,6 +2403,7 @@ function Hud() {
       ${activePanel === 'inventory' && html`<${InventoryPanel} />`}
       ${activePanel === 'shop' && html`<${ShopPanel} />`}
       ${activePanel === 'crafting' && html`<${CraftingPanel} />`}
+      ${activePanel === 'build' && html`<${BuildPanel} />`}
     </div>
   `;
 }
@@ -1864,15 +2418,17 @@ function StartScreen() {
     <div class="start-screen">
       <h1>JUNGLE KING</h1>
       <p>
-        Survive a vast procedural jungle. Gather wood, fiber and stone, craft tools at the workbench,
-        trade with Kito using the meters you travel, and watch out for wild boars and curious monkeys
-        as day turns to night.
+        Survive a vast procedural jungle as the leader of your own tribe. Gather wood, fiber and stone,
+        craft tools at the workbench, and build houses, lookout towers, walls and storage huts to grow
+        your camp. Collect coins that fall from the sky and recruit warriors from Kito's shop to defend
+        against rival tribes, who will occasionally raid your base. Watch out for wild boars and curious
+        monkeys as day turns to night.
       </p>
       <button onClick=${() => { start(); }}>Begin Survival</button>
       <div class="controls-list">
         WASD move &middot; Mouse look (click to lock) &middot; Space jump &middot; Shift sprint (drains energy)
         &middot; Ctrl crouch &middot; F gather / drink &middot; E talk to Kito / shop &middot; R craft at workbench
-        &middot; Tab inventory &middot; Q cycle hotbar &middot; C toggle camera &middot; Scroll zoom &middot; Esc close menus
+        &middot; B build menu &middot; Tab inventory &middot; Q cycle hotbar &middot; C toggle camera &middot; Scroll zoom &middot; Esc close menus
       </div>
     </div>
   `;
@@ -1895,6 +2451,13 @@ function App() {
         <${Animals} />
         <${Kito} />
         <${Workbench} />
+        <${PlayerTribeBase} />
+        <${TribeCamps} />
+        <${Buildings} />
+        <${Raiders} />
+        <${RaidManager} />
+        <${CoinDrops} />
+        <${CoinDropManager} />
       <//>
       <${Hud} />
     <//>
