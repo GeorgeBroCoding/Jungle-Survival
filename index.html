@@ -1656,6 +1656,7 @@ function Player() {
   const rightLeg = useRef();
   const bodyVisual = useRef();
   const fpWeapon = useRef();
+  const fpWeaponAnim = useRef();
 
   const yaw = useRef(0);
   const pitch = useRef(-0.18);
@@ -1865,6 +1866,28 @@ function Player() {
       if (rightArm.current) rightArm.current.rotation.x = -Math.sin(progress * Math.PI) * 1.8;
     }
 
+    // ---- first-person weapon view-model: walk bob + poke animation ----
+    if (fpWeaponAnim.current) {
+      const bobActive = moving && onGround.current && !swimming;
+      const bobAmp = sprinting ? 0.09 : 0.05;
+      const targetBobX = bobActive ? Math.sin(limbPhase.current) * bobAmp * 0.4 : 0;
+      const targetBobY = bobActive ? Math.abs(Math.sin(limbPhase.current)) * bobAmp : 0;
+
+      let pokeOffsetZ = 0;
+      let pokeRotX = 0;
+      if (attackTimer.current > 0) {
+        const progress = 1 - attackTimer.current / ATTACK_DURATION;
+        pokeOffsetZ = -Math.sin(progress * Math.PI) * 0.35;
+        pokeRotX = -Math.sin(progress * Math.PI) * 0.5;
+      }
+
+      const anim = fpWeaponAnim.current;
+      anim.position.x += (targetBobX - anim.position.x) * 0.2;
+      anim.position.y += (targetBobY - anim.position.y) * 0.2;
+      anim.position.z += (pokeOffsetZ - anim.position.z) * 0.5;
+      anim.rotation.x += (pokeRotX - anim.rotation.x) * 0.5;
+    }
+
     // ---- crouch height ----
     const targetScaleY = crouching ? 0.72 : 1;
     if (bodyVisual.current) {
@@ -2001,8 +2024,10 @@ function Player() {
       </group>
     </group>
     <group ref=${fpWeapon} visible=${false}>
-      <group rotation=${[0, Math.PI, 0]}>
-        ${equippedWeaponId && html`<${HeldWeapon} id=${equippedWeaponId} />`}
+      <group ref=${fpWeaponAnim}>
+        <group rotation=${[0, Math.PI, 0]}>
+          ${equippedWeaponId && html`<${HeldWeapon} id=${equippedWeaponId} />`}
+        </group>
       </group>
     </group>
     <//>
