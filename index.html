@@ -2161,8 +2161,8 @@ function Player() {
         s.setChatOpen(true);
         if (document.exitPointerLock) document.exitPointerLock();
       }
-      // 0 key: poke/stab with the equipped weapon without throwing it.
-      if (code === 'Digit0') {
+      // 0 key (main row or numpad): poke/stab with the equipped weapon without throwing it.
+      if (code === 'Digit0' || code === 'Numpad0') {
         const slot = s.hotbarSlots[s.activeHotbarSlot];
         const weapon = WEAPONS[slot];
         if (weapon && (s.inventory[slot] || 0) > 0) {
