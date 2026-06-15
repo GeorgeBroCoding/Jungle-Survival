@@ -444,6 +444,10 @@ function onKeyPress(handler) {
 // Avoids putting per-frame position data into the zustand store.
 const playerTransform = { position: [0, 0, 8], yaw: 0 };
 
+// Live world positions of animals/raiders, updated every frame by their
+// own components. Read by combat actions to avoid per-frame store churn.
+const entityRegistry = { animals: {}, raiders: {} };
+
 // ============================================================
 // interactions.js - "walk up and press a key" registry
 // ============================================================
@@ -524,7 +528,35 @@ const CRAFTING_RECIPES = [
     desc: 'Woven jungle fiber. Used for building.',
     cost: { fiber: 5 },
   },
+  {
+    id: 'club',
+    name: 'Wooden Club',
+    desc: 'Heavy carved wood. Slow but hits hard.',
+    cost: { wood: 6 },
+  },
 ];
+
+// Melee/throwing weapons. Whatever weapon occupies the active hotbar slot
+// (and is present in the inventory) is shown held in the player's hand.
+const WEAPONS = {
+  spear:   { name: 'Spear',       damage: 25, pokeDamage: 18, range: 2.6, throwable: true },
+  machete: { name: 'Machete',     damage: 35, range: 1.9, throwable: false },
+  club:    { name: 'Wooden Club', damage: 22, range: 1.8, throwable: false },
+};
+
+// Wild animals: fixed spawn points, with health/loot for combat.
+const ANIMAL_SPAWNS = [
+  { id: 'boar1',   type: 'boar',   position: [18, 0, 12],   health: 60, loot: { berry: 2 } },
+  { id: 'boar2',   type: 'boar',   position: [-25, 0, -18], health: 60, loot: { berry: 2 } },
+  { id: 'monkey1', type: 'monkey', position: [10, 0, -22],  health: 30, loot: { fiber: 2 } },
+  { id: 'monkey2', type: 'monkey', position: [-15, 0, 20],  health: 30, loot: { fiber: 2 } },
+];
+const ANIMAL_RESPAWN_MS = 45000;
+
+// Throwing / melee combat tuning
+const THROW_RANGE = 14;
+const ATTACK_CONE = Math.PI / 3; // 60 degree cone in front of the player
+const ATTACK_DURATION = 0.25; // seconds, arm swing animation
 
 // Kito's shop - priced in meters traveled
 const SHOP_ITEMS = [
@@ -709,7 +741,7 @@ const useGame = create((set, get) => ({
   setTimeOfDay: (t) => set({ timeOfDay: ((t % 24) + 24) % 24 }),
 
   // --- inventory: itemId -> quantity ---
-  inventory: {},
+  inventory: { spear: 1 },
   addItem: (id, qty = 1) =>
     set((s) => ({ inventory: { ...s.inventory, [id]: (s.inventory[id] || 0) + qty } })),
   removeItem: (id, qty = 1) => {
@@ -750,6 +782,117 @@ const useGame = create((set, get) => ({
       }
     }
     if (changed) set({ depletedNodes: next });
+    get().tickAnimalRespawns();
+  },
+
+  // --- wild animals: health, death, loot, respawn ---
+  animalState: Object.fromEntries(ANIMAL_SPAWNS.map((a) => [a.id, { health: a.health, alive: true, respawnAt: 0 }])),
+  damageAnimal: (id, dmg) => {
+    const spawn = ANIMAL_SPAWNS.find((a) => a.id === id);
+    const cur = get().animalState[id];
+    if (!spawn || !cur || !cur.alive) return;
+    const health = cur.health - dmg;
+    if (health <= 0) {
+      set((s) => ({ animalState: { ...s.animalState, [id]: { health: 0, alive: false, respawnAt: Date.now() + ANIMAL_RESPAWN_MS } } }));
+      for (const [k, v] of Object.entries(spawn.loot)) get().addItem(k, v);
+      get().addToast(`${spawn.type === 'boar' ? 'Boar' : 'Monkey'} down! Loot collected.`);
+    } else {
+      set((s) => ({ animalState: { ...s.animalState, [id]: { ...cur, health } } }));
+    }
+  },
+  tickAnimalRespawns: () => {
+    const now = Date.now();
+    const state = get().animalState;
+    let changed = false;
+    const next = { ...state };
+    for (const [id, st] of Object.entries(state)) {
+      if (!st.alive && st.respawnAt && st.respawnAt <= now) {
+        const spawn = ANIMAL_SPAWNS.find((a) => a.id === id);
+        next[id] = { health: spawn.health, alive: true, respawnAt: 0 };
+        changed = true;
+      }
+    }
+    if (changed) set({ animalState: next });
+  },
+
+  // --- weapon combat: thrown spears lying on the ground, and damage resolution ---
+  groundWeapons: [], // [{ id, weaponId, position: [x,y,z] }]
+  pickupWeapon: (groundId) => {
+    const gw = get().groundWeapons.find((g) => g.id === groundId);
+    if (!gw) return false;
+    get().addItem(gw.weaponId, 1);
+    set((s) => ({ groundWeapons: s.groundWeapons.filter((g) => g.id !== groundId) }));
+    get().addToast(`Picked up ${WEAPONS[gw.weaponId].name}`);
+    return true;
+  },
+  // Finds the closest animal/raider in front of the player within `range`.
+  findAttackTarget: (range) => {
+    const [px, , pz] = playerTransform.position;
+    const yaw = playerTransform.yaw;
+    const dirX = -Math.sin(yaw);
+    const dirZ = -Math.cos(yaw);
+    let best = null;
+    let bestDist = range;
+    for (const [id, pos] of Object.entries(entityRegistry.animals)) {
+      if (!get().animalState[id]?.alive) continue;
+      const dx = pos.x - px, dz = pos.z - pz;
+      const dist = Math.hypot(dx, dz);
+      if (dist > range || dist === 0) continue;
+      const dot = (dx / dist) * dirX + (dz / dist) * dirZ;
+      if (dot > Math.cos(ATTACK_CONE / 2) && dist <= bestDist) { best = { kind: 'animal', id, dist }; bestDist = dist; }
+    }
+    const raid = get().raid;
+    if (raid) {
+      for (const r of raid.raiders) {
+        const pos = entityRegistry.raiders[r.id];
+        if (!pos) continue;
+        const dx = pos.x - px, dz = pos.z - pz;
+        const dist = Math.hypot(dx, dz);
+        if (dist > range || dist === 0) continue;
+        const dot = (dx / dist) * dirX + (dz / dist) * dirZ;
+        if (dot > Math.cos(ATTACK_CONE / 2) && dist <= bestDist) { best = { kind: 'raider', id: r.id, dist }; bestDist = dist; }
+      }
+    }
+    return best;
+  },
+  // Spear poke: short-range stab, doesn't leave the player's hand.
+  meleeAttack: (weaponId) => {
+    const weapon = WEAPONS[weaponId];
+    if (!weapon) return false;
+    const dmg = weapon.pokeDamage ?? weapon.damage;
+    const target = get().findAttackTarget(weapon.range);
+    if (!target) return false;
+    if (target.kind === 'animal') get().damageAnimal(target.id, dmg);
+    else get().damageRaider(target.id, dmg);
+    return true;
+  },
+  // Throws the equipped spear: it leaves the hand, damages whatever it
+  // hits, and lands on the ground to be picked back up later.
+  throwWeapon: (weaponId) => {
+    const weapon = WEAPONS[weaponId];
+    if (!weapon || !weapon.throwable) return false;
+    if (!get().removeItem(weaponId, 1)) return false;
+    const [px, , pz] = playerTransform.position;
+    const yaw = playerTransform.yaw;
+    const dirX = -Math.sin(yaw);
+    const dirZ = -Math.cos(yaw);
+
+    const target = get().findAttackTarget(THROW_RANGE);
+    if (target) {
+      if (target.kind === 'animal') get().damageAnimal(target.id, weapon.damage);
+      else get().damageRaider(target.id, weapon.damage);
+    }
+
+    const landDist = target ? Math.max(1, target.dist - 0.5) : THROW_RANGE;
+    const id = `gw_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    set((s) => ({
+      groundWeapons: [...s.groundWeapons, {
+        id, weaponId,
+        position: [px + dirX * landDist, 0, pz + dirZ * landDist],
+      }],
+    }));
+    get().addToast(target ? `Spear hit its mark! Go pick it back up.` : `Spear thrown! Go pick it back up.`);
+    return true;
   },
 
   // --- crafting ---
@@ -783,7 +926,7 @@ const useGame = create((set, get) => ({
   nearInteractable: null, // { type: 'gather'|'shop'|'craft', label, data }
   setNearInteractable: (v) => set({ nearInteractable: v }),
 
-  hotbarSlots: ['spear', 'torch', 'bandage'],
+  hotbarSlots: ['spear', 'machete', 'club', 'torch', 'bandage'],
   activeHotbarSlot: 0,
   setActiveHotbarSlot: (i) => set({ activeHotbarSlot: i }),
 
@@ -881,6 +1024,7 @@ const useGame = create((set, get) => ({
     for (let i = 0; i < count; i++) {
       raiders.push({
         id: `raider_${Date.now()}_${i}`,
+        health: 40,
         position: [
           tribe.campPosition[0] + (Math.random() - 0.5) * 6,
           0,
@@ -904,6 +1048,19 @@ const useGame = create((set, get) => ({
       get().addToast('Your warriors repelled a raider!');
     }
     if (!raiders.length) get().addToast(`${raid.tribeName} retreats!`);
+  },
+  damageRaider: (raiderId, dmg) => {
+    const raid = get().raid;
+    if (!raid) return;
+    const raider = raid.raiders.find((r) => r.id === raiderId);
+    if (!raider) return;
+    const health = (raider.health ?? 40) - dmg;
+    if (health <= 0) {
+      get().resolveRaider(raiderId, false);
+      get().addToast('Raider struck down!');
+    } else {
+      set({ raid: { ...raid, raiders: raid.raiders.map((r) => (r.id === raiderId ? { ...r, health } : r)) } });
+    }
   },
 
   // --- game start ---
@@ -1234,6 +1391,53 @@ const POND_RADIUS = 18;
 
 const UP = new THREE.Vector3(0, 1, 0);
 
+// ---------- Weapon held in the right hand, swapped based on the active hotbar slot ----------
+function HeldWeapon({ id }) {
+  if (id === 'spear') {
+    return html`
+      <group position=${[0, -0.55, -0.05]} rotation=${[1.35, 0, 0]}>
+        <mesh position=${[0, 0.55, 0]} castShadow=${true}>
+          <cylinderGeometry args=${[0.025, 0.03, 1.3, 6]} />
+          <meshStandardMaterial color="#8a5a2b" roughness=${0.8} flatShading=${true} />
+        </mesh>
+        <mesh position=${[0, 1.25, 0]} castShadow=${true}>
+          <coneGeometry args=${[0.06, 0.3, 6]} />
+          <meshStandardMaterial color="#b9b9b9" metalness=${0.4} roughness=${0.4} flatShading=${true} />
+        </mesh>
+      </group>
+    `;
+  }
+  if (id === 'machete') {
+    return html`
+      <group position=${[0, -0.5, -0.05]} rotation=${[1.15, 0, 0.1]}>
+        <mesh position=${[0, 0.12, 0]} castShadow=${true}>
+          <cylinderGeometry args=${[0.035, 0.035, 0.25, 6]} />
+          <meshStandardMaterial color="#4a3322" roughness=${0.9} flatShading=${true} />
+        </mesh>
+        <mesh position=${[0, 0.55, 0]} castShadow=${true}>
+          <boxGeometry args=${[0.07, 0.75, 0.02]} />
+          <meshStandardMaterial color="#cfd6dd" metalness=${0.6} roughness=${0.3} flatShading=${true} />
+        </mesh>
+      </group>
+    `;
+  }
+  if (id === 'club') {
+    return html`
+      <group position=${[0, -0.5, -0.05]} rotation=${[1.25, 0, 0]}>
+        <mesh position=${[0, 0.3, 0]} castShadow=${true}>
+          <cylinderGeometry args=${[0.04, 0.05, 0.6, 6]} />
+          <meshStandardMaterial color="#6b4a2b" roughness=${0.9} flatShading=${true} />
+        </mesh>
+        <mesh position=${[0, 0.68, 0]} castShadow=${true}>
+          <sphereGeometry args=${[0.13, 8, 8]} />
+          <meshStandardMaterial color="#5a3c22" roughness=${0.9} flatShading=${true} />
+        </mesh>
+      </group>
+    `;
+  }
+  return null;
+}
+
 function Player() {
   const { camera, gl } = useThree();
   const group = useRef();
@@ -1253,6 +1457,12 @@ function Player() {
   const statTimer = useRef(0);
   const lastNearId = useRef(null);
   const inWater = useRef(false);
+  const attackTimer = useRef(0);
+
+  const equippedWeaponId = useGame((s) => {
+    const slot = s.hotbarSlots[s.activeHotbarSlot];
+    return WEAPONS[slot] && (s.inventory[slot] || 0) > 0 ? slot : null;
+  });
 
   useEffect(() => {
     const canvas = gl.domElement;
@@ -1268,10 +1478,25 @@ function Player() {
     const onWheel = (e) => {
       camDistance.current = Math.max(2, Math.min(12, camDistance.current + e.deltaY * 0.01));
     };
+    // Left mouse button: throw the equipped spear, or swing whatever
+    // melee weapon is in hand.
+    const onMouseDown = (e) => {
+      if (e.button !== 0) return;
+      if (document.pointerLockElement !== canvas) return;
+      const s = useGame.getState();
+      if (s.activePanel !== null) return;
+      const slot = s.hotbarSlots[s.activeHotbarSlot];
+      const weapon = WEAPONS[slot];
+      if (!weapon || (s.inventory[slot] || 0) <= 0) return;
+      attackTimer.current = ATTACK_DURATION;
+      if (weapon.throwable) s.throwWeapon(slot);
+      else s.meleeAttack(slot);
+    };
 
     canvas.addEventListener('click', onClick);
     document.addEventListener('mousemove', onMouseMove);
     canvas.addEventListener('wheel', onWheel, { passive: true });
+    canvas.addEventListener('mousedown', onMouseDown);
 
     const offPress = onKeyPress((code) => {
       const s = useGame.getState();
@@ -1305,6 +1530,15 @@ function Player() {
         s.setActivePanel(s.activePanel === 'build' ? null : 'build');
       }
       if (code === 'KeyM') s.addToast('Full jungle map coming soon');
+      // Slash key: poke/stab with the equipped spear without throwing it.
+      if (code === 'Slash') {
+        const slot = s.hotbarSlots[s.activeHotbarSlot];
+        const weapon = WEAPONS[slot];
+        if (weapon && (s.inventory[slot] || 0) > 0) {
+          attackTimer.current = ATTACK_DURATION;
+          s.meleeAttack(slot);
+        }
+      }
     });
 
     // Exit pointer lock whenever a panel opens
@@ -1318,6 +1552,7 @@ function Player() {
       canvas.removeEventListener('click', onClick);
       document.removeEventListener('mousemove', onMouseMove);
       canvas.removeEventListener('wheel', onWheel);
+      canvas.removeEventListener('mousedown', onMouseDown);
       offPress();
       unsub();
     };
@@ -1402,6 +1637,13 @@ function Player() {
 
     if (moved > 0) {
       s.addMeters(moved * meterMult);
+    }
+
+    // ---- attack swing animation (overrides walk-cycle arm pose) ----
+    if (attackTimer.current > 0) {
+      attackTimer.current = Math.max(0, attackTimer.current - delta);
+      const progress = 1 - attackTimer.current / ATTACK_DURATION;
+      if (rightArm.current) rightArm.current.rotation.x = -Math.sin(progress * Math.PI) * 1.8;
     }
 
     // ---- crouch height ----
@@ -1508,6 +1750,7 @@ function Player() {
             <capsuleGeometry args=${[0.08, 0.5, 4, 6]} />
             <meshStandardMaterial color="#d8a878" roughness=${0.8} />
           </mesh>
+          ${equippedWeaponId && html`<${HeldWeapon} id=${equippedWeaponId} />`}
         </group>
         <!-- left leg -->
         <group ref=${leftLeg} position=${[0.14, 0.75, 0]}>
@@ -1559,6 +1802,37 @@ function Resources() {
   return html`
     <${Fragment}>
       ${nodes.map((n) => html`<${ResourceNode} key=${n.id} node=${n} />`)}
+    <//>
+  `;
+}
+
+// ============================================================
+// Weapons lying on the ground (thrown spears) - walk up and press E to pick up
+// ============================================================
+function GroundWeapon({ gw }) {
+  useEffect(() => {
+    return registerInteractable({
+      id: gw.id,
+      position: gw.position,
+      radius: 2,
+      key: 'KeyE',
+      label: `pick up ${WEAPONS[gw.weaponId].name}`,
+      onInteract: () => useGame.getState().pickupWeapon(gw.id),
+    });
+  }, [gw.id]);
+
+  return html`
+    <group position=${[gw.position[0], 0.6, gw.position[2]]} rotation=${[0, Math.random() * Math.PI, 0]}>
+      <${HeldWeapon} id=${gw.weaponId} />
+    </group>
+  `;
+}
+
+function GroundWeapons() {
+  const groundWeapons = useGame((s) => s.groundWeapons);
+  return html`
+    <${Fragment}>
+      ${groundWeapons.map((gw) => html`<${GroundWeapon} key=${gw.id} gw=${gw} />`)}
     <//>
   `;
 }
@@ -1706,7 +1980,7 @@ function Workbench() {
 const WANDER_RADIUS = 14;
 const FLEE_RANGE = 7;
 
-function useWanderAI(group, spawn, { speed = 1.6, fleeSpeed = 5 }) {
+function useWanderAI(group, spawn, { speed = 1.6, fleeSpeed = 5, entityId = null }) {
   const { camera } = useThree();
   const state = useRef('idle');
   const timer = useRef(1 + Math.random() * 3);
@@ -1714,10 +1988,17 @@ function useWanderAI(group, spawn, { speed = 1.6, fleeSpeed = 5 }) {
   const phase = useRef(Math.random() * 10);
   const legRefs = useRef([]);
 
+  useEffect(() => {
+    return () => {
+      if (entityId) delete entityRegistry.animals[entityId];
+    };
+  }, [entityId]);
+
   useFrame((_, rawDelta) => {
     const delta = Math.min(rawDelta, 0.1);
     if (!group.current) return;
     const pos = group.current.position;
+    if (entityId) entityRegistry.animals[entityId] = pos;
     timer.current -= delta;
 
     const dx = pos.x - camera.position.x;
@@ -1789,13 +2070,15 @@ function useWanderAI(group, spawn, { speed = 1.6, fleeSpeed = 5 }) {
 }
 
 // ---------- Wild Boar ----------
-function Boar({ position }) {
+function Boar({ id, position }) {
+  const alive = useGame((s) => s.animalState[id]?.alive ?? true);
   const group = useRef();
   const legFL = useRef();
   const legFR = useRef();
   const legBL = useRef();
   const legBR = useRef();
-  const legRefs = useWanderAI(group, position, { speed: 1.4, fleeSpeed: 5.5 });
+  const legRefs = useWanderAI(group, position, { speed: 1.4, fleeSpeed: 5.5, entityId: alive ? id : null });
+  if (!alive) return null;
   legRefs.current = [
     { ref: legFL, sign: 1 },
     { ref: legFR, sign: -1 },
@@ -1842,11 +2125,13 @@ function Boar({ position }) {
 }
 
 // ---------- Monkey ----------
-function Monkey({ position }) {
+function Monkey({ id, position }) {
+  const alive = useGame((s) => s.animalState[id]?.alive ?? true);
   const group = useRef();
   const legL = useRef();
   const legR = useRef();
-  const legRefs = useWanderAI(group, position, { speed: 1.8, fleeSpeed: 6 });
+  const legRefs = useWanderAI(group, position, { speed: 1.8, fleeSpeed: 6, entityId: alive ? id : null });
+  if (!alive) return null;
   legRefs.current = [
     { ref: legL, sign: 1 },
     { ref: legR, sign: -1 },
@@ -1891,10 +2176,10 @@ function Monkey({ position }) {
 function Animals() {
   return html`
     <${Fragment}>
-      <${Boar} position=${[18, 0, 12]} />
-      <${Boar} position=${[-25, 0, -18]} />
-      <${Monkey} position=${[10, 0, -22]} />
-      <${Monkey} position=${[-15, 0, 20]} />
+      ${ANIMAL_SPAWNS.map((a) => {
+        const Comp = a.type === 'boar' ? Boar : Monkey;
+        return html`<${Comp} key=${a.id} id=${a.id} position=${a.position} />`;
+      })}
     <//>
   `;
 }
@@ -2134,10 +2419,15 @@ function Raider({ id, startPosition, color }) {
   const phase = useRef(Math.random() * 10);
   const resolved = useRef(false);
 
+  useEffect(() => {
+    return () => { delete entityRegistry.raiders[id]; };
+  }, [id]);
+
   useFrame((_, rawDelta) => {
     if (resolved.current || !group.current) return;
     const delta = Math.min(rawDelta, 0.1);
     const pos = group.current.position;
+    entityRegistry.raiders[id] = pos;
     const dx = BASE_CENTER[0] - pos.x;
     const dz = BASE_CENTER[2] - pos.z;
     const dist = Math.hypot(dx, dz);
@@ -2556,7 +2846,7 @@ function Hud() {
       <div class="hotbar">
         ${hotbarSlots.map((id, i) => html`
           <div class="slot ${i === activeHotbarSlot ? 'active' : ''}" key=${id + i}>
-            ${RESOURCES[id]?.name?.[0] || CRAFTING_RECIPES.find((r) => r.id === id)?.name?.[0] || '?'}
+            ${RESOURCES[id]?.name?.[0] || CRAFTING_RECIPES.find((r) => r.id === id)?.name?.[0] || SHOP_ITEMS.find((it) => it.id === id)?.name?.[0] || '?'}
             <span class="count">${inventory[id] || 0}</span>
           </div>
         `)}
@@ -2593,8 +2883,9 @@ function StartScreen() {
       <button onClick=${() => { start(); }}>Begin Survival</button>
       <div class="controls-list">
         WASD move &middot; Mouse look (click to lock) &middot; Space jump &middot; Shift sprint (drains energy)
-        &middot; Ctrl crouch &middot; F gather / drink &middot; E talk to Kito / shop &middot; R craft at workbench
+        &middot; Ctrl crouch &middot; F gather / drink &middot; E talk to Kito / shop / pick up weapon &middot; R craft at workbench
         &middot; B build menu &middot; Tab inventory &middot; Q cycle hotbar &middot; C toggle camera &middot; Scroll zoom &middot; Esc close menus
+        &middot; Left Click attack (throws spear, swings other weapons) &middot; / poke with spear
       </div>
     </div>
   `;
@@ -2614,6 +2905,7 @@ function App() {
         <${World} />
         <${Player} />
         <${Resources} />
+        <${GroundWeapons} />
         <${Animals} />
         <${Kito} />
         <${Workbench} />
