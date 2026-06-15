@@ -1655,6 +1655,7 @@ function Player() {
   const leftLeg = useRef();
   const rightLeg = useRef();
   const bodyVisual = useRef();
+  const fpWeapon = useRef();
 
   const yaw = useRef(0);
   const pitch = useRef(-0.18);
@@ -1909,6 +1910,18 @@ function Player() {
       bodyVisual.current && (bodyVisual.current.visible = false);
     }
 
+    // ---- first-person held weapon view-model ----
+    if (fpWeapon.current) {
+      if (cameraMode.current === 'first' && equippedWeaponId) {
+        fpWeapon.current.visible = true;
+        fpWeapon.current.quaternion.copy(camera.quaternion);
+        const handOffset = new THREE.Vector3(0.35, -0.32, -0.5).applyQuaternion(camera.quaternion);
+        fpWeapon.current.position.copy(camera.position).add(handOffset);
+      } else {
+        fpWeapon.current.visible = false;
+      }
+    }
+
     // ---- survival stat ticking ----
     statTimer.current += delta;
     if (sprinting) s.adjustStat('energy', -delta * 6);
@@ -1943,6 +1956,7 @@ function Player() {
   });
 
   return html`
+    <${Fragment}>
     <group ref=${group} position=${[0, 0, 8]}>
       <group ref=${bodyVisual}>
         <!-- torso -->
@@ -1986,6 +2000,12 @@ function Player() {
         </group>
       </group>
     </group>
+    <group ref=${fpWeapon} visible=${false}>
+      <group rotation=${[0, Math.PI, 0]}>
+        ${equippedWeaponId && html`<${HeldWeapon} id=${equippedWeaponId} />`}
+      </group>
+    </group>
+    <//>
   `;
 }
 
