@@ -1048,6 +1048,8 @@ const PLAYER_WARRIOR_SPAWNS = (() => {
 
 // Offsets (relative to camp center) for the wandering members of a rival camp.
 const TRIBE_MEMBER_OFFSETS = [[-4, 1], [4, -1], [0, 4], [-6, 3], [6, 2], [-2, -6], [3, 6]];
+// Offsets for the friendly garrison that settles into a camp once it's captured.
+const GARRISON_OFFSETS = [[-2, -3], [2, -3], [0, -5]];
 const TRIBE_MEMBER_HEALTH = 25;
 const TRIBE_MEMBER_RESPAWN_MS = 40000;
 const TRIBE_MEMBER_REWARD = { meters: 15 };
@@ -1366,6 +1368,7 @@ const useGame = create((set, get) => ({
     get().addCoins(CAMP_CAPTURE_REWARD.coins);
     const tribe = ENEMY_TRIBES.find((t) => t.id === tribeId);
     get().addToast(`${tribe.name}'s camp is now yours! +${CAMP_CAPTURE_REWARD.meters}m, +${CAMP_CAPTURE_REWARD.coins}c`);
+    get().addToast(`3 tribespeople from ${tribe.name} join your side and settle into the camp!`);
   },
   tickTribeMemberRespawns: () => {
     // The host's tribeSync broadcast is authoritative for joiners.
@@ -1879,12 +1882,78 @@ function DayNightSystem() {
   `;
 }
 
+// ---------- Terrain: rolling hills + a ring of distant mountains ----------
+// Each entry is a smooth "bump" added to the terrain height field. Bumps are placed
+// in the gaps between rival tribe camps and well clear of the base/resources/animals,
+// so the core play area stays flat while the wider jungle gets real hills and mountains.
+const TERRAIN_HILLS = [
+  // mid-range hills
+  { x: 86.1, z: 40.1, amp: 5, r: 13 },
+  { x: 27.8, z: 90.9, amp: 6, r: 14 },
+  { x: -43.1, z: 84.6, amp: 5, r: 13 },
+  { x: -95, z: -2, amp: 6, r: 14 },
+  { x: 3, z: -95, amp: 5, r: 13 },
+  { x: 90.3, z: -29.4, amp: 5, r: 13 },
+  // distant mountains
+  { x: 172.2, z: 80.3, amp: 20, r: 40 },
+  { x: 55.5, z: 181.7, amp: 22, r: 42 },
+  { x: -86.3, z: 169.3, amp: 24, r: 45 },
+  { x: -190, z: -3.3, amp: 20, r: 40 },
+  { x: 6.6, z: -189.9, amp: 22, r: 42 },
+  { x: 180.7, z: -58.7, amp: 24, r: 45 },
+];
+
+function getTerrainHeight(x, z) {
+  let h = 0;
+  for (const hill of TERRAIN_HILLS) {
+    const dx = x - hill.x;
+    const dz = z - hill.z;
+    const d2 = dx * dx + dz * dz;
+    h += hill.amp * Math.exp(-d2 / (2 * hill.r * hill.r));
+  }
+  return h;
+}
+
 // ---------- Ground ----------
+const TERRAIN_SIZE = 600;
+const TERRAIN_SEGMENTS = 100;
+
+function createTerrainGeometry() {
+  const geo = new THREE.BufferGeometry();
+  const half = TERRAIN_SIZE / 2;
+  const seg = TERRAIN_SEGMENTS;
+  const positions = [];
+  const uvs = [];
+  const indices = [];
+  for (let iz = 0; iz <= seg; iz++) {
+    for (let ix = 0; ix <= seg; ix++) {
+      const x = -half + (ix / seg) * TERRAIN_SIZE;
+      const z = -half + (iz / seg) * TERRAIN_SIZE;
+      positions.push(x, getTerrainHeight(x, z), z);
+      uvs.push(ix / seg, iz / seg);
+    }
+  }
+  for (let iz = 0; iz < seg; iz++) {
+    for (let ix = 0; ix < seg; ix++) {
+      const a = iz * (seg + 1) + ix;
+      const b = a + 1;
+      const c = a + (seg + 1);
+      const d = c + 1;
+      indices.push(a, c, b, b, c, d);
+    }
+  }
+  geo.setIndex(indices);
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  geo.computeVertexNormals();
+  return geo;
+}
+
 function Ground() {
   const tex = useMemo(() => createGrassTexture(), []);
+  const geo = useMemo(() => createTerrainGeometry(), []);
   return html`
-    <mesh rotation=${[-Math.PI / 2, 0, 0]} receiveShadow=${true}>
-      <circleGeometry args=${[300, 64]} />
+    <mesh geometry=${geo} receiveShadow=${true}>
       <meshStandardMaterial map=${tex} roughness=${1} />
     </mesh>
   `;
@@ -2403,8 +2472,9 @@ function Player() {
       }
       velocityY.current -= GRAVITY * delta;
       pos.y += velocityY.current * delta;
-      if (pos.y <= 0) {
-        pos.y = 0;
+      const groundY = getTerrainHeight(pos.x, pos.z);
+      if (pos.y <= groundY) {
+        pos.y = groundY;
         velocityY.current = 0;
         onGround.current = true;
       }
@@ -3381,6 +3451,9 @@ function TribeCamp({ tribe }) {
       </group>
       ${!captured && TRIBE_MEMBER_OFFSETS.map((p, i) => html`
         <${TribeMember} key=${i} id=${`${tribe.id}_m${i}`} spawn=${[x + p[0], 0, z + p[1]]} color=${tribe.color} />
+      `)}
+      ${captured && GARRISON_OFFSETS.map((p, i) => html`
+        <${PlayerWarrior} key=${`g${i}`} spawn=${[x + p[0], 0, z + p[1]]} />
       `)}
     <//>
   `;
