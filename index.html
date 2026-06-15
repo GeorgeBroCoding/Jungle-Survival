@@ -679,6 +679,12 @@ const TRIBE_MEMBER_OFFSETS = [[-4, 1], [4, -1], [0, 4], [-6, 3], [6, 2], [-2, -6
 const TRIBE_MEMBER_HEALTH = 25;
 const TRIBE_MEMBER_RESPAWN_MS = 40000;
 const TRIBE_MEMBER_REWARD = { meters: 15 };
+const TRIBE_MEMBER_AGGRO_RANGE = 11;
+const TRIBE_MEMBER_ATTACK_RANGE = 1.8;
+const TRIBE_MEMBER_ATTACK_SPEED = 2.6;
+const TRIBE_MEMBER_DAMAGE = 5;
+const TRIBE_MEMBER_ATTACK_COOLDOWN = 1.2;
+const CAMP_CAPTURE_REWARD = { meters: 100, coins: 20 };
 
 // Coins - a separate currency that occasionally falls from the sky and
 // is spent recruiting warriors for the player's tribe.
@@ -940,16 +946,32 @@ const useGame = create((set, get) => ({
       set((s) => ({ tribeMemberState: { ...s.tribeMemberState, [id]: { health: 0, alive: false, respawnAt: Date.now() + TRIBE_MEMBER_RESPAWN_MS } } }));
       get().addMeters(TRIBE_MEMBER_REWARD.meters);
       get().addToast(`Rival tribesperson defeated! +${TRIBE_MEMBER_REWARD.meters}m`);
+      get().checkCampCapture(id.split('_m')[0]);
     } else {
       set((s) => ({ tribeMemberState: { ...s.tribeMemberState, [id]: { ...cur, health } } }));
     }
   },
+  // --- captured rival camps: become the player's once every member is defeated ---
+  capturedTribes: {},
+  checkCampCapture: (tribeId) => {
+    if (get().capturedTribes[tribeId]) return;
+    const state = get().tribeMemberState;
+    const allDown = TRIBE_MEMBER_OFFSETS.every((_, i) => !state[`${tribeId}_m${i}`]?.alive);
+    if (!allDown) return;
+    set((s) => ({ capturedTribes: { ...s.capturedTribes, [tribeId]: true } }));
+    get().addMeters(CAMP_CAPTURE_REWARD.meters);
+    get().addCoins(CAMP_CAPTURE_REWARD.coins);
+    const tribe = ENEMY_TRIBES.find((t) => t.id === tribeId);
+    get().addToast(`${tribe.name}'s camp is now yours! +${CAMP_CAPTURE_REWARD.meters}m, +${CAMP_CAPTURE_REWARD.coins}c`);
+  },
   tickTribeMemberRespawns: () => {
     const now = Date.now();
     const state = get().tribeMemberState;
+    const captured = get().capturedTribes;
     let changed = false;
     const next = { ...state };
     for (const [id, st] of Object.entries(state)) {
+      if (captured[id.split('_m')[0]]) continue; // captured camps stay empty
       if (!st.alive && st.respawnAt && st.respawnAt <= now) {
         next[id] = { health: TRIBE_MEMBER_HEALTH, alive: true, respawnAt: 0 };
         changed = true;
@@ -1191,7 +1213,9 @@ const useGame = create((set, get) => ({
   raid: null, // { tribeId, tribeName, color, raiders: [{ id, position }] }
   startRaid: () => {
     if (get().raid) return;
-    const tribe = ENEMY_TRIBES[Math.floor(Math.random() * ENEMY_TRIBES.length)];
+    const available = ENEMY_TRIBES.filter((t) => !get().capturedTribes[t.id]);
+    if (!available.length) return;
+    const tribe = available[Math.floor(Math.random() * available.length)];
     const count = 3 + Math.floor(Math.random() * 4);
     const raiders = [];
     for (let i = 0; i < count; i++) {
@@ -2304,13 +2328,19 @@ function Workbench() {
 const WANDER_RADIUS = 14;
 const FLEE_RANGE = 7;
 
-function useWanderAI(group, spawn, { speed = 1.6, fleeSpeed = 5, entityId = null, registryKey = 'animals' }) {
+function useWanderAI(group, spawn, {
+  speed = 1.6, fleeSpeed = 5, entityId = null, registryKey = 'animals',
+  aggressive = false, aggroRange = FLEE_RANGE, attackRange = 1.8,
+  attackSpeed = 0, attackDamage = 0, attackCooldown = 1.2,
+}) {
   const { camera } = useThree();
   const state = useRef('idle');
   const timer = useRef(1 + Math.random() * 3);
   const target = useRef(new THREE.Vector3(spawn[0], 0, spawn[2]));
   const phase = useRef(Math.random() * 10);
   const legRefs = useRef([]);
+  const attackTimer = useRef(0);
+  const warnedAttack = useRef(false);
 
   useEffect(() => {
     return () => {
@@ -2324,13 +2354,21 @@ function useWanderAI(group, spawn, { speed = 1.6, fleeSpeed = 5, entityId = null
     const pos = group.current.position;
     if (entityId) entityRegistry[registryKey][entityId] = pos;
     timer.current -= delta;
+    attackTimer.current -= delta;
 
     const dx = pos.x - camera.position.x;
     const dz = pos.z - camera.position.z;
     const distToPlayer = Math.hypot(dx, dz);
 
-    if (distToPlayer < FLEE_RANGE) {
+    if (aggressive && distToPlayer < aggroRange) {
+      state.current = 'attack';
+    } else if (!aggressive && distToPlayer < FLEE_RANGE) {
       state.current = 'flee';
+    } else if (state.current === 'attack') {
+      // lost the player - give up the chase and wander again
+      state.current = 'idle';
+      timer.current = 1;
+      warnedAttack.current = false;
     } else if (timer.current <= 0) {
       state.current = state.current === 'wander' ? 'idle' : 'wander';
       if (state.current === 'wander') {
@@ -2351,7 +2389,24 @@ function useWanderAI(group, spawn, { speed = 1.6, fleeSpeed = 5, entityId = null
     }
 
     let dirX = 0, dirZ = 0, speedNow = 0;
-    if (state.current === 'flee') {
+    if (state.current === 'attack') {
+      const len = Math.hypot(dx, dz) || 1;
+      if (distToPlayer > attackRange) {
+        dirX = -dx / len;
+        dirZ = -dz / len;
+        speedNow = attackSpeed || speed;
+      } else {
+        group.current.rotation.y = Math.atan2(-dx / len, -dz / len);
+        if (!warnedAttack.current) {
+          useGame.getState().addToast('A rival tribesperson attacks you!');
+          warnedAttack.current = true;
+        }
+        if (attackTimer.current <= 0 && attackDamage > 0) {
+          useGame.getState().adjustStat('health', -attackDamage);
+          attackTimer.current = attackCooldown;
+        }
+      }
+    } else if (state.current === 'flee') {
       const len = Math.hypot(dx, dz) || 1;
       dirX = dx / len;
       dirZ = dz / len;
@@ -2541,13 +2596,17 @@ function TribalFigure({ color }) {
   `;
 }
 
-// ---------- Peaceful tribe member, wanders near its camp ----------
+// ---------- Hostile tribe member: wanders near its camp, attacks if the player gets close ----------
 function TribeMember({ id, spawn, color }) {
   const alive = useGame((s) => s.tribeMemberState[id]?.alive ?? true);
   const group = useRef();
   const legL = useRef();
   const legR = useRef();
-  const legRefs = useWanderAI(group, spawn, { speed: 1.2, fleeSpeed: 3, entityId: alive ? id : null, registryKey: 'tribeMembers' });
+  const legRefs = useWanderAI(group, spawn, {
+    speed: 1.2, fleeSpeed: 3, entityId: alive ? id : null, registryKey: 'tribeMembers',
+    aggressive: true, aggroRange: TRIBE_MEMBER_AGGRO_RANGE, attackRange: TRIBE_MEMBER_ATTACK_RANGE,
+    attackSpeed: TRIBE_MEMBER_ATTACK_SPEED, attackDamage: TRIBE_MEMBER_DAMAGE, attackCooldown: TRIBE_MEMBER_ATTACK_COOLDOWN,
+  });
   if (!alive) return null;
   legRefs.current = [
     { ref: legL, sign: 1 },
@@ -2568,8 +2627,12 @@ function TribeMember({ id, spawn, color }) {
 }
 
 // ---------- A rival tribe's camp: tents, totem and a few wandering members ----------
+// Once captured, the camp's tents and banner are repainted in the player's
+// tribe color and its members no longer respawn.
 function TribeCamp({ tribe }) {
   const [x, , z] = tribe.campPosition;
+  const captured = useGame((s) => !!s.capturedTribes[tribe.id]);
+  const campColor = captured ? PLAYER_TRIBE_COLOR : tribe.color;
   return html`
     <${Fragment}>
       <group position=${[x, 0, z]}>
@@ -2577,7 +2640,7 @@ function TribeCamp({ tribe }) {
           <group key=${i} position=${[p[0], 0, p[1]]}>
             <mesh position=${[0, 0.9, 0]} castShadow=${true} receiveShadow=${true}>
               <coneGeometry args=${[1.4, 1.8, 7]} />
-              <meshStandardMaterial color=${tribe.color} flatShading=${true} roughness=${0.9} />
+              <meshStandardMaterial color=${campColor} flatShading=${true} roughness=${0.9} />
             </mesh>
           </group>
         `)}
@@ -2587,10 +2650,10 @@ function TribeCamp({ tribe }) {
         </mesh>
         <mesh position=${[0, 3.2, 0]} castShadow=${true}>
           <coneGeometry args=${[0.4, 0.6, 5]} />
-          <meshStandardMaterial color=${tribe.color} flatShading=${true} />
+          <meshStandardMaterial color=${campColor} flatShading=${true} />
         </mesh>
       </group>
-      ${TRIBE_MEMBER_OFFSETS.map((p, i) => html`
+      ${!captured && TRIBE_MEMBER_OFFSETS.map((p, i) => html`
         <${TribeMember} key=${i} id=${`${tribe.id}_m${i}`} spawn=${[x + p[0], 0, z + p[1]]} color=${tribe.color} />
       `)}
     <//>
