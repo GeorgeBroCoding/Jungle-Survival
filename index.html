@@ -278,6 +278,20 @@ canvas {
   text-align: center;
 }
 
+.inv-section {
+  font-size: 12px;
+  color: #ffe27a;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin: 12px 0 4px;
+  border-bottom: 1px solid #6a5224;
+  padding-bottom: 4px;
+}
+
+.inv-section:first-of-type {
+  margin-top: 0;
+}
+
 .shop-item, .craft-item, .inv-item {
   display: flex;
   justify-content: space-between;
@@ -509,11 +523,13 @@ function findNearest(position, maxRadius = Infinity) {
 
 // Raw resources gathered from nodes in the world (F to gather)
 const RESOURCES = {
-  wood:   { name: 'Wood',   color: '#8a5a2b' },
-  fiber:  { name: 'Fiber',  color: '#9bbf5e' },
-  stone:  { name: 'Stone',  color: '#8a8a8a' },
-  leaves: { name: 'Leaves', color: '#3f8f3f' },
-  berry:  { name: 'Berry',  color: '#c23b5a' },
+  wood:   { name: 'Wood',   color: '#8a5a2b', category: 'material' },
+  fiber:  { name: 'Fiber',  color: '#9bbf5e', category: 'material' },
+  stone:  { name: 'Stone',  color: '#8a8a8a', category: 'material' },
+  leaves: { name: 'Leaves', color: '#3f8f3f', category: 'material' },
+  berry:  { name: 'Berry',  color: '#c23b5a', category: 'food', hunger: 8 },
+  meat:   { name: 'Meat',   color: '#a8453b', category: 'food', hunger: 30 },
+  apple:  { name: 'Apple',  color: '#d23b3b', category: 'food', hunger: 15 },
 };
 
 // Craftable items, made at the workbench (R)
@@ -572,10 +588,10 @@ const WEAPONS = {
 
 // Wild animals: fixed spawn points, with health/loot for combat.
 const ANIMAL_SPAWNS = [
-  { id: 'boar1',   type: 'boar',   position: [18, 0, 12],   health: 60, loot: { berry: 2 } },
-  { id: 'boar2',   type: 'boar',   position: [-25, 0, -18], health: 60, loot: { berry: 2 } },
-  { id: 'monkey1', type: 'monkey', position: [10, 0, -22],  health: 30, loot: { fiber: 2 } },
-  { id: 'monkey2', type: 'monkey', position: [-15, 0, 20],  health: 30, loot: { fiber: 2 } },
+  { id: 'boar1',   type: 'boar',   position: [18, 0, 12],   health: 60, loot: { berry: 2, meat: 2 } },
+  { id: 'boar2',   type: 'boar',   position: [-25, 0, -18], health: 60, loot: { berry: 2, meat: 2 } },
+  { id: 'monkey1', type: 'monkey', position: [10, 0, -22],  health: 30, loot: { fiber: 2, apple: 1 } },
+  { id: 'monkey2', type: 'monkey', position: [-15, 0, 20],  health: 30, loot: { fiber: 2, apple: 1 } },
 ];
 const ANIMAL_RESPAWN_MS = 45000;
 
@@ -702,7 +718,27 @@ const USABLE_ITEMS = {
       s.addToast(`Mystery Crate contained ${qty} ${RESOURCES[item].name}!`);
     },
   },
+  berry: { label: 'Eat', consumed: true, apply: (s) => { s.adjustStat('hunger', RESOURCES.berry.hunger); s.addToast(`Ate Berry (+${RESOURCES.berry.hunger} hunger)`); } },
+  meat: { label: 'Eat', consumed: true, apply: (s) => { s.adjustStat('hunger', RESOURCES.meat.hunger); s.addToast(`Ate Meat (+${RESOURCES.meat.hunger} hunger)`); } },
+  apple: { label: 'Eat', consumed: true, apply: (s) => { s.adjustStat('hunger', RESOURCES.apple.hunger); s.addToast(`Ate Apple (+${RESOURCES.apple.hunger} hunger)`); } },
 };
+
+// General loot scattered around the map - food, materials, and odds & ends
+// the player can pick up with E. Respawns after LOOT_RESPAWN_MS.
+const LOOT_TABLE = ['apple', 'apple', 'meat', 'berry', 'leaves', 'leaves', 'rope', 'fiber', 'stone', 'wood'];
+const LOOT_RESPAWN_MS = 90000;
+const LOOT_SPAWNS = (() => {
+  const rand = mulberry32(7777);
+  const spawns = [];
+  for (let i = 0; i < 26; i++) {
+    const angle = rand() * Math.PI * 2;
+    const dist = 5 + rand() * 65;
+    const item = LOOT_TABLE[Math.floor(rand() * LOOT_TABLE.length)];
+    const qty = (item === 'apple' || item === 'meat' || item === 'berry') ? 1 : 1 + Math.floor(rand() * 2);
+    spawns.push({ id: `loot_${i}`, item, qty, position: [Math.cos(angle) * dist, 0, Math.sin(angle) * dist] });
+  }
+  return spawns;
+})();
 
 // World resource node placement (positions are fixed for now)
 function generateResourceNodes() {
@@ -810,9 +846,26 @@ const useGame = create((set, get) => ({
   gatherNode: (node) => {
     const id = node.id;
     if (get().depletedNodes[id]) return false;
-    get().addItem(node.type, 1);
-    set((s) => ({ depletedNodes: { ...s.depletedNodes, [id]: Date.now() + 30000 } }));
-    get().addToast(`+1 ${node.type}`);
+    const s = get();
+    const activeWeapon = s.hotbarSlots[s.activeHotbarSlot];
+    const choppingLeaves = node.type === 'wood' && activeWeapon === 'machete' && (s.inventory.machete || 0) > 0;
+    if (choppingLeaves) {
+      get().addItem('leaves', 2);
+      get().addToast('+2 Leaves (chopped with Machete)');
+    } else {
+      get().addItem(node.type, 1);
+      get().addToast(`+1 ${RESOURCES[node.type].name}`);
+    }
+    set((st) => ({ depletedNodes: { ...st.depletedNodes, [id]: Date.now() + 30000 } }));
+    return true;
+  },
+  // --- general loot scattered on the map: pick up with E, respawns over time ---
+  collectedLoot: {}, // id -> respawnAtTimestamp
+  collectLoot: (spawn) => {
+    if (get().collectedLoot[spawn.id]) return false;
+    get().addItem(spawn.item, spawn.qty);
+    set((s) => ({ collectedLoot: { ...s.collectedLoot, [spawn.id]: Date.now() + LOOT_RESPAWN_MS } }));
+    get().addToast(`Found ${spawn.qty}x ${RESOURCES[spawn.item]?.name || spawn.item}!`);
     return true;
   },
   tickRespawns: () => {
@@ -827,6 +880,18 @@ const useGame = create((set, get) => ({
       }
     }
     if (changed) set({ depletedNodes: next });
+
+    const collected = get().collectedLoot;
+    let lootChanged = false;
+    const nextLoot = { ...collected };
+    for (const id of Object.keys(collected)) {
+      if (collected[id] <= now) {
+        delete nextLoot[id];
+        lootChanged = true;
+      }
+    }
+    if (lootChanged) set({ collectedLoot: nextLoot });
+
     get().tickAnimalRespawns();
   },
 
@@ -1897,6 +1962,9 @@ function Player() {
 // ============================================================
 function ResourceNode({ node }) {
   const depleted = useGame((s) => !!s.depletedNodes[node.id]);
+  const activeWeapon = useGame((s) => s.hotbarSlots[s.activeHotbarSlot]);
+  const hasMachete = useGame((s) => (s.inventory.machete || 0) > 0);
+  const choppingLeaves = node.type === 'wood' && activeWeapon === 'machete' && hasMachete;
 
   useEffect(() => {
     if (depleted) return undefined;
@@ -1905,10 +1973,10 @@ function ResourceNode({ node }) {
       position: node.position,
       radius: 2.4,
       key: 'KeyF',
-      label: `Gather ${RESOURCES[node.type].name}`,
+      label: choppingLeaves ? 'Chop Leaves (Machete)' : `Gather ${RESOURCES[node.type].name}`,
       onInteract: () => useGame.getState().gatherNode(node),
     });
-  }, [depleted]);
+  }, [depleted, choppingLeaves]);
 
   if (depleted) return null;
 
@@ -1923,6 +1991,53 @@ function Resources() {
   return html`
     <${Fragment}>
       ${nodes.map((n) => html`<${ResourceNode} key=${n.id} node=${n} />`)}
+    <//>
+  `;
+}
+
+// ============================================================
+// General loot scattered on the map - walk up and press E to pick up.
+// Food (apples, meat, berries) and odds-and-ends from foraging.
+// ============================================================
+function LootPickup({ spawn }) {
+  const collected = useGame((s) => !!s.collectedLoot[spawn.id]);
+
+  useEffect(() => {
+    if (collected) return undefined;
+    return registerInteractable({
+      id: spawn.id,
+      position: spawn.position,
+      radius: 2,
+      key: 'KeyE',
+      label: `pick up ${RESOURCES[spawn.item]?.name || spawn.item}${spawn.qty > 1 ? ` x${spawn.qty}` : ''}`,
+      onInteract: () => useGame.getState().collectLoot(spawn),
+    });
+  }, [collected]);
+
+  if (collected) return null;
+
+  if (spawn.item === 'apple') {
+    return html`
+      <mesh position=${[spawn.position[0], 0.4, spawn.position[2]]} castShadow=${true}>
+        <sphereGeometry args=${[0.18, 8, 8]} />
+        <meshStandardMaterial color="#d23b3b" roughness=${0.6} />
+      </mesh>
+    `;
+  }
+
+  const color = RESOURCES[spawn.item]?.color || '#caa45a';
+  return html`
+    <mesh position=${[spawn.position[0], 0.18, spawn.position[2]]} rotation=${[0.25, 0.6, 0]} castShadow=${true}>
+      <boxGeometry args=${[0.32, 0.22, 0.32]} />
+      <meshStandardMaterial color=${color} roughness=${0.85} />
+    </mesh>
+  `;
+}
+
+function LootPickups() {
+  return html`
+    <${Fragment}>
+      ${LOOT_SPAWNS.map((spawn) => html`<${LootPickup} key=${spawn.id} spawn=${spawn} />`)}
     <//>
   `;
 }
@@ -2857,33 +2972,51 @@ function StatBar({ icon, value, cls }) {
   `;
 }
 
+// Groups an inventory item id into a section for the inventory panel.
+function getItemCategory(id) {
+  const resource = RESOURCES[id];
+  if (resource) return resource.category === 'food' ? 'Food' : 'Materials';
+  if (WEAPONS[id]) return 'Weapons & Tools';
+  return 'Other Loot';
+}
+
 function InventoryPanel() {
   const inventory = useGame((s) => s.inventory);
   const setActivePanel = useGame((s) => s.setActivePanel);
   const useItem = useGame((s) => s.useItem);
   const entries = Object.entries(inventory);
 
+  const sections = ['Food', 'Materials', 'Weapons & Tools', 'Other Loot'];
+  const grouped = Object.fromEntries(sections.map((sec) => [sec, []]));
+  for (const entry of entries) grouped[getItemCategory(entry[0])].push(entry);
+
   return html`
     <div class="panel-overlay" onClick=${() => setActivePanel(null)}>
       <div class="panel" onClick=${(e) => e.stopPropagation()}>
         <h2>Inventory</h2>
-        ${entries.length === 0 && html`<p>Empty. Gather resources with F or buy from Kito.</p>`}
-        ${entries.map(([id, qty]) => {
-          const resource = RESOURCES[id];
-          const recipe = CRAFTING_RECIPES.find((r) => r.id === id);
-          const shopItem = SHOP_ITEMS.find((i) => i.id === id);
-          const name = resource?.name || recipe?.name || shopItem?.name || id;
-          const usable = USABLE_ITEMS[id];
-          return html`
-            <div class="inv-item" key=${id}>
-              <span class="name">${name}</span>
-              <span>x${qty}</span>
-              ${usable && html`
-                <button class="buy-btn" onClick=${() => useItem(id)}>${usable.label}</button>
-              `}
-            </div>
-          `;
-        })}
+        ${entries.length === 0 && html`<p>Empty. Gather resources with F, hunt animals, chop leaves with a machete, or scavenge loot with E.</p>`}
+        ${sections.map((sec) => grouped[sec].length === 0 ? null : html`
+          <${Fragment} key=${sec}>
+            <h3 class="inv-section">${sec}</h3>
+            ${grouped[sec].map(([id, qty]) => {
+              const resource = RESOURCES[id];
+              const recipe = CRAFTING_RECIPES.find((r) => r.id === id);
+              const shopItem = SHOP_ITEMS.find((i) => i.id === id);
+              const weapon = WEAPONS[id];
+              const name = resource?.name || recipe?.name || shopItem?.name || weapon?.name || id;
+              const usable = USABLE_ITEMS[id];
+              return html`
+                <div class="inv-item" key=${id}>
+                  <span class="name">${name}</span>
+                  <span>x${qty}</span>
+                  ${usable && html`
+                    <button class="buy-btn" onClick=${() => useItem(id)}>${usable.label}</button>
+                  `}
+                </div>
+              `;
+            })}
+          <//>
+        `)}
         <p class="close-hint">Tab or Esc to close</p>
       </div>
     </div>
@@ -3110,6 +3243,7 @@ function App() {
         <${World} />
         <${Player} />
         <${Resources} />
+        <${LootPickups} />
         <${GroundWeapons} />
         <${FlyingSpears} />
         <${FxEffects} />
