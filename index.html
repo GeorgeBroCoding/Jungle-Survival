@@ -344,6 +344,58 @@ canvas {
   to { opacity: 1; transform: translateY(0); }
 }
 
+.chat-log {
+  position: absolute;
+  left: 20px;
+  bottom: 90px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 320px;
+}
+
+.chat-msg {
+  background: rgba(0,0,0,0.6);
+  border-left: 3px solid #6fb8ff;
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 13px;
+  animation: fadeIn 0.2s ease;
+}
+
+.chat-msg.me {
+  border-left-color: #7fd87f;
+}
+
+.chat-input-bar {
+  position: absolute;
+  left: 20px;
+  bottom: 50px;
+  display: flex;
+  gap: 6px;
+  pointer-events: auto;
+}
+
+.chat-input-bar input {
+  width: 260px;
+  padding: 8px 10px;
+  font-size: 14px;
+  border-radius: 6px;
+  border: 1px solid #6a5224;
+  background: rgba(0,0,0,0.6);
+  color: #fdf3da;
+}
+
+.chat-input-bar button {
+  padding: 8px 14px;
+  font-size: 14px;
+  border-radius: 6px;
+  border: 1px solid #6a5224;
+  background: #c9a227;
+  color: #1b150f;
+  cursor: pointer;
+}
+
 /* ---------- Modal panels (clickable, pointer events on) ---------- */
 .panel-overlay {
   position: absolute;
@@ -575,7 +627,13 @@ const html = htm.bind(React.createElement);
 const keys = {};
 const pressHandlers = new Set();
 
+function isTypingInField() {
+  const el = document.activeElement;
+  return !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA');
+}
+
 window.addEventListener('keydown', (e) => {
+  if (isTypingInField()) return;
   if (!keys[e.code]) {
     for (const h of pressHandlers) h(e.code);
   }
@@ -583,6 +641,7 @@ window.addEventListener('keydown', (e) => {
 });
 
 window.addEventListener('keyup', (e) => {
+  if (isTypingInField()) return;
   keys[e.code] = false;
 });
 
@@ -673,6 +732,8 @@ function mpSetupConnection(conn) {
       if (useGame.getState().mpRole === 'host') {
         useGame.getState().damageTribeMember(msg.id, msg.dmg);
       }
+    } else if (msg.t === 'chat') {
+      useGame.getState().addChatMessage('friend', msg.text);
     }
   });
   const onClose = () => {
@@ -1082,6 +1143,7 @@ function mulberry32(seed) {
 // store.js - zustand global state
 // ============================================================
 let toastId = 0;
+let chatId = 0;
 
 const useGame = create((set, get) => ({
   // --- currency ---
@@ -1439,6 +1501,18 @@ const useGame = create((set, get) => ({
     setTimeout(() => {
       set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));
     }, 3000);
+  },
+
+  // --- chat (multiplayer text messages) ---
+  chatMessages: [],
+  chatOpen: false,
+  setChatOpen: (v) => set({ chatOpen: v }),
+  addChatMessage: (from, text) => {
+    const id = ++chatId;
+    set((s) => ({ chatMessages: [...s.chatMessages, { id, from, text }] }));
+    setTimeout(() => {
+      set((s) => ({ chatMessages: s.chatMessages.filter((m) => m.id !== id) }));
+    }, 8000);
   },
 
   // --- coins (separate currency, collected from sky drops) ---
@@ -2083,8 +2157,12 @@ function Player() {
         s.setActivePanel(s.activePanel === 'build' ? null : 'build');
       }
       if (code === 'KeyM') s.addToast('Full jungle map coming soon');
-      // Slash key: poke/stab with the equipped weapon without throwing it.
-      if (code === 'Slash') {
+      if (code === 'KeyT' && !s.activePanel) {
+        s.setChatOpen(true);
+        if (document.exitPointerLock) document.exitPointerLock();
+      }
+      // 0 key: poke/stab with the equipped weapon without throwing it.
+      if (code === 'Digit0') {
         const slot = s.hotbarSlots[s.activeHotbarSlot];
         const weapon = WEAPONS[slot];
         if (weapon && (s.inventory[slot] || 0) > 0) {
@@ -3966,6 +4044,7 @@ function TouchControls() {
           <${TouchTapButton} label="📷" cls="touch-btn-sm" onTap=${() => simulateKeyPress('KeyC')} />
           <${TouchTapButton} label="🔁" cls="touch-btn-sm" onTap=${() => simulateKeyPress('KeyQ')} />
           <${TouchTapButton} label="🔨" cls="touch-btn-sm" onTap=${() => simulateKeyPress('KeyB')} />
+          <${TouchTapButton} label="💬" cls="touch-btn-sm" onTap=${() => useGame.getState().setChatOpen(true)} />
         </div>
         <div class="touch-row">
           <${TouchHoldButton} label="🐾" code="ControlLeft" cls="touch-btn-sm" />
@@ -3977,7 +4056,7 @@ function TouchControls() {
             const near = useGame.getState().nearInteractable;
             if (near) near.onInteract();
           }} />
-          <${TouchTapButton} label="🗡️" cls="touch-btn-lg" onTap=${() => simulateKeyPress('Slash')} />
+          <${TouchTapButton} label="🗡️" cls="touch-btn-lg" onTap=${() => simulateKeyPress('Digit0')} />
           <${TouchTapButton} label="⚔️" cls="touch-btn-lg touch-btn-attack" onTap=${() => touchInput.attack()} />
         </div>
       </div>
@@ -4000,6 +4079,21 @@ function Hud() {
   const inventory = useGame((s) => s.inventory);
   const mpStatus = useGame((s) => s.mpStatus);
   const setActivePanel = useGame((s) => s.setActivePanel);
+  const chatMessages = useGame((s) => s.chatMessages);
+  const chatOpen = useGame((s) => s.chatOpen);
+  const setChatOpen = useGame((s) => s.setChatOpen);
+  const addChatMessage = useGame((s) => s.addChatMessage);
+  const [chatText, setChatText] = useState('');
+
+  const sendChat = () => {
+    const text = chatText.trim();
+    if (text) {
+      mpSend({ t: 'chat', text });
+      addChatMessage('me', text);
+    }
+    setChatText('');
+    setChatOpen(false);
+  };
 
   return html`
     <div id="hud">
@@ -4047,6 +4141,30 @@ function Hud() {
         ${toasts.map((t) => html`<div class="toast" key=${t.id}>${t.msg}</div>`)}
       </div>
 
+      <div class="chat-log">
+        ${chatMessages.map((m) => html`
+          <div class="chat-msg ${m.from}" key=${m.id}>${m.from === 'me' ? 'You' : 'Friend'}: ${m.text}</div>
+        `)}
+      </div>
+
+      ${chatOpen && html`
+        <div class="chat-input-bar">
+          <input
+            type="text"
+            autoFocus
+            maxLength=${120}
+            placeholder="Message your friend..."
+            value=${chatText}
+            onChange=${(e) => setChatText(e.target.value)}
+            onKeyDown=${(e) => {
+              if (e.key === 'Enter') sendChat();
+              if (e.key === 'Escape') { setChatText(''); setChatOpen(false); }
+            }}
+          />
+          <button onClick=${sendChat}>Send</button>
+        </div>
+      `}
+
       ${activePanel === 'inventory' && html`<${InventoryPanel} />`}
       ${activePanel === 'shop' && html`<${ShopPanel} />`}
       ${activePanel === 'crafting' && html`<${CraftingPanel} />`}
@@ -4079,8 +4197,9 @@ function StartScreen() {
         WASD move &middot; Mouse or Arrow keys look (click to lock mouse) &middot; Space jump &middot; Shift sprint (drains energy)
         &middot; Ctrl crouch &middot; F gather / drink &middot; E talk to Kito / shop / pick up weapon &middot; R craft at workbench
         &middot; B build menu &middot; Tab inventory &middot; Q cycle hotbar &middot; C toggle camera &middot; Scroll zoom &middot; Esc close menus
-        &middot; Left Click attack (throws spear, swings other weapons) &middot; / poke with spear
-        &middot; On touch devices: drag the left joystick to move, drag anywhere to look, and use the on-screen buttons
+        &middot; Left Click attack (throws spear, swings other weapons) &middot; 0 poke with spear
+        &middot; T chat with your friend (multiplayer)
+        &middot; On touch devices: drag the left joystick to move, drag anywhere to look, and use the on-screen buttons (including 💬 for chat)
         &middot; Click the 🌐 Multiplayer button (top right) to play together with a friend
       </div>
     </div>
