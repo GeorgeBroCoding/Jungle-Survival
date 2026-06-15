@@ -642,6 +642,12 @@ const remotePlayer = {
   attackSeq: 0,
 };
 
+// ---- shared rival-tribe-camp state (host is authoritative) ----
+// Host: populated each frame by TribeMember's wander AI, broadcast periodically.
+const tribeMemberSyncData = {}; // { [memberId]: { position: [x,y,z], yaw } }
+// Joiner: latest positions received from the host, lerped toward each frame.
+const remoteTribeMembers = {}; // { [memberId]: { position: [x,y,z], yaw } }
+
 function mpSetupConnection(conn) {
   mpState.conn = conn;
   conn.on('open', () => {
@@ -659,6 +665,14 @@ function mpSetupConnection(conn) {
       remotePlayer.equippedWeaponId = msg.equippedWeaponId;
     } else if (msg.t === 'attack') {
       remotePlayer.attackSeq++;
+    } else if (msg.t === 'tribeSync') {
+      Object.assign(remoteTribeMembers, msg.members);
+      useGame.getState().setTribeMemberState(msg.tribeMemberState);
+      useGame.getState().setCapturedTribes(msg.capturedTribes);
+    } else if (msg.t === 'tribeDamage') {
+      if (useGame.getState().mpRole === 'host') {
+        useGame.getState().damageTribeMember(msg.id, msg.dmg);
+      }
     }
   });
   const onClose = () => {
@@ -666,6 +680,7 @@ function mpSetupConnection(conn) {
     if (mpState.conn === conn) {
       mpState.conn = null;
       useGame.getState().setMpStatus('offline');
+      useGame.getState().setMpRole(null);
     }
   };
   conn.on('close', onClose);
@@ -680,6 +695,7 @@ function mpHost() {
   useGame.getState().setMpStatus('hosting');
   useGame.getState().setMpCode(code);
   useGame.getState().setMpError(null);
+  useGame.getState().setMpRole('host');
   peer.on('connection', (conn) => mpSetupConnection(conn));
   peer.on('error', (err) => {
     useGame.getState().setMpError(err && err.type === 'unavailable-id'
@@ -695,6 +711,7 @@ function mpJoin(code) {
   mpState.peer = peer;
   useGame.getState().setMpStatus('connecting');
   useGame.getState().setMpError(null);
+  useGame.getState().setMpRole('joiner');
   peer.on('open', () => {
     const conn = peer.connect(`jungleking-${code.trim().toUpperCase()}`);
     mpSetupConnection(conn);
@@ -715,6 +732,7 @@ function mpDisconnect() {
   remotePlayer.active = false;
   useGame.getState().setMpStatus('offline');
   useGame.getState().setMpCode('');
+  useGame.getState().setMpRole(null);
 }
 
 function mpSend(msg) {
@@ -1234,6 +1252,8 @@ const useGame = create((set, get) => ({
     get().addToast(`${tribe.name}'s camp is now yours! +${CAMP_CAPTURE_REWARD.meters}m, +${CAMP_CAPTURE_REWARD.coins}c`);
   },
   tickTribeMemberRespawns: () => {
+    // The host's tribeSync broadcast is authoritative for joiners.
+    if (get().mpRole === 'joiner') return;
     const now = Date.now();
     const state = get().tribeMemberState;
     const captured = get().capturedTribes;
@@ -1300,7 +1320,12 @@ const useGame = create((set, get) => ({
   applyDamageToTarget: (target, dmg) => {
     if (target.kind === 'animal') get().damageAnimal(target.id, dmg);
     else if (target.kind === 'raider') get().damageRaider(target.id, dmg);
-    else if (target.kind === 'tribeMember') get().damageTribeMember(target.id, dmg);
+    else if (target.kind === 'tribeMember') {
+      // Rival tribe camps are simulated on the host; joiners ask the host
+      // to apply the damage so health/captures stay in sync for both players.
+      if (get().mpRole === 'joiner') mpSend({ t: 'tribeDamage', id: target.id, dmg });
+      else get().damageTribeMember(target.id, dmg);
+    }
   },
   // Spear poke: short-range stab, doesn't leave the player's hand.
   meleeAttack: (weaponId) => {
@@ -1401,6 +1426,10 @@ const useGame = create((set, get) => ({
   setMpCode: (v) => set({ mpCode: v }),
   mpError: null,
   setMpError: (v) => set({ mpError: v }),
+  mpRole: null, // null | 'host' | 'joiner' - host's rival-tribe simulation is authoritative
+  setMpRole: (v) => set({ mpRole: v }),
+  setTribeMemberState: (v) => set({ tribeMemberState: v }),
+  setCapturedTribes: (v) => set({ capturedTribes: v }),
 
   // --- toasts ---
   toasts: [],
@@ -2322,6 +2351,16 @@ function Player() {
         crouching,
         equippedWeaponId,
       });
+
+      // Host: keep the joiner's rival tribe camps in sync (positions, health, captures).
+      if (s.mpRole === 'host') {
+        mpSend({
+          t: 'tribeSync',
+          members: tribeMemberSyncData,
+          tribeMemberState: s.tribeMemberState,
+          capturedTribes: s.capturedTribes,
+        });
+      }
     }
   });
 
@@ -2831,6 +2870,7 @@ function useWanderAI(group, spawn, {
   speed = 1.6, fleeSpeed = 5, entityId = null, registryKey = 'animals',
   aggressive = false, aggroRange = FLEE_RANGE, attackRange = 1.8,
   attackSpeed = 0, attackDamage = 0, attackCooldown = 1.2,
+  frozen = false,
 }) {
   const { camera } = useThree();
   const state = useRef('idle');
@@ -2843,15 +2883,24 @@ function useWanderAI(group, spawn, {
 
   useEffect(() => {
     return () => {
-      if (entityId) delete entityRegistry[registryKey][entityId];
+      if (entityId) {
+        delete entityRegistry[registryKey][entityId];
+        if (registryKey === 'tribeMembers') delete tribeMemberSyncData[entityId];
+      }
     };
   }, [entityId, registryKey]);
 
   useFrame((_, rawDelta) => {
     const delta = Math.min(rawDelta, 0.1);
     if (!group.current) return;
+    if (frozen) return; // position is driven by the multiplayer host instead
     const pos = group.current.position;
-    if (entityId) entityRegistry[registryKey][entityId] = pos;
+    if (entityId) {
+      entityRegistry[registryKey][entityId] = pos;
+      if (registryKey === 'tribeMembers' && useGame.getState().mpRole === 'host') {
+        tribeMemberSyncData[entityId] = { position: [pos.x, pos.y, pos.z], yaw: group.current.rotation.y };
+      }
+    }
     timer.current -= delta;
     attackTimer.current -= delta;
 
@@ -3098,14 +3147,51 @@ function TribalFigure({ color }) {
 // ---------- Hostile tribe member: wanders near its camp, attacks if the player gets close ----------
 function TribeMember({ id, spawn, color }) {
   const alive = useGame((s) => s.tribeMemberState[id]?.alive ?? true);
+  const isJoiner = useGame((s) => s.mpRole === 'joiner');
   const group = useRef();
   const legL = useRef();
   const legR = useRef();
+  const netPhase = useRef(Math.random() * 10);
   const legRefs = useWanderAI(group, spawn, {
-    speed: 1.2, fleeSpeed: 3, entityId: alive ? id : null, registryKey: 'tribeMembers',
+    speed: 1.2, fleeSpeed: 3, entityId: (!isJoiner && alive) ? id : null, registryKey: 'tribeMembers',
     aggressive: true, aggroRange: TRIBE_MEMBER_AGGRO_RANGE, attackRange: TRIBE_MEMBER_ATTACK_RANGE,
     attackSpeed: TRIBE_MEMBER_ATTACK_SPEED, attackDamage: TRIBE_MEMBER_DAMAGE, attackCooldown: TRIBE_MEMBER_ATTACK_COOLDOWN,
+    frozen: isJoiner,
   });
+
+  // Joiner: this member's position/rotation is driven by the host's tribeSync
+  // broadcast instead of local wander AI.
+  useFrame((_, rawDelta) => {
+    if (!isJoiner || !group.current) return;
+    const net = remoteTribeMembers[id];
+    if (!net) return;
+    const delta = Math.min(rawDelta, 0.1);
+    const g = group.current;
+    const dx = net.position[0] - g.position.x;
+    const dz = net.position[2] - g.position.z;
+    g.position.x += dx * 0.25;
+    g.position.y += (net.position[1] - g.position.y) * 0.25;
+    g.position.z += dz * 0.25;
+    let yawDiff = net.yaw - g.rotation.y;
+    while (yawDiff > Math.PI) yawDiff -= Math.PI * 2;
+    while (yawDiff < -Math.PI) yawDiff += Math.PI * 2;
+    g.rotation.y += yawDiff * 0.25;
+    entityRegistry.tribeMembers[id] = g.position;
+
+    if (Math.hypot(dx, dz) > 0.05) {
+      netPhase.current += delta * 4;
+      const swing = Math.sin(netPhase.current) * 0.4;
+      for (const leg of legRefs.current) if (leg.ref.current) leg.ref.current.rotation.x = leg.sign * swing;
+    } else {
+      for (const leg of legRefs.current) if (leg.ref.current) leg.ref.current.rotation.x *= 0.9;
+    }
+  });
+
+  useEffect(() => {
+    if (!isJoiner) return undefined;
+    return () => { delete entityRegistry.tribeMembers[id]; };
+  }, [id, isJoiner]);
+
   if (!alive) return null;
   legRefs.current = [
     { ref: legL, sign: 1 },
@@ -3758,7 +3844,7 @@ function MultiplayerPanel() {
           <button class="craft-btn" onClick=${() => mpDisconnect()}>Cancel</button>
         `}
         ${mpStatus === 'connected' && html`
-          <p class="desc">Connected! You can see and fight alongside each other in the jungle.</p>
+          <p class="desc">Connected! You can see and fight alongside each other in the jungle, and rival tribe camps are now shared between you.</p>
           <button class="craft-btn" onClick=${() => mpDisconnect()}>Disconnect</button>
         `}
         <p class="close-hint">Tab or Esc to close</p>
