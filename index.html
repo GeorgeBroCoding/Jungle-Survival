@@ -440,13 +440,39 @@ function onKeyPress(handler) {
   return () => pressHandlers.delete(handler);
 }
 
+// Lazily-created shared audio context for tiny procedural sound effects
+// (no audio assets in this project - everything is synthesized).
+let sharedAudioCtx = null;
+function playChingSound() {
+  try {
+    if (!sharedAudioCtx) sharedAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const ctx = sharedAudioCtx;
+    if (ctx.state === 'suspended') ctx.resume();
+    const now = ctx.currentTime;
+    [2200, 3300].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.22 / (i + 1), now);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.3);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.3);
+    });
+  } catch (err) {
+    // Audio not available - ignore.
+  }
+}
+
 // Shared mutable player transform, updated every frame by Player.js.
 // Avoids putting per-frame position data into the zustand store.
 const playerTransform = { position: [0, 0, 8], yaw: 0 };
 
-// Live world positions of animals/raiders, updated every frame by their
-// own components. Read by combat actions to avoid per-frame store churn.
-const entityRegistry = { animals: {}, raiders: {} };
+// Live world positions of animals/raiders/tribe members, updated every frame
+// by their own components. Read by combat actions to avoid per-frame store churn.
+const entityRegistry = { animals: {}, raiders: {}, tribeMembers: {} };
 
 // ============================================================
 // interactions.js - "walk up and press a key" registry
@@ -557,6 +583,7 @@ const ANIMAL_RESPAWN_MS = 45000;
 const THROW_RANGE = 14;
 const ATTACK_CONE = Math.PI / 3; // 60 degree cone in front of the player
 const ATTACK_DURATION = 0.25; // seconds, arm swing animation
+const SPEAR_FLIGHT_SPEED = 22; // m/s, governs the throw animation duration
 
 // Kito's shop - priced in meters traveled
 const SHOP_ITEMS = [
@@ -618,6 +645,24 @@ const ENEMY_TRIBES = [
 const BASE_CENTER = [0, 0, 0];
 const PLAYER_TRIBE_COLOR = '#d8a13c';
 const MAX_VISIBLE_WARRIORS = 16;
+
+// Fixed ring of guard positions around the base - raiders pick the nearest
+// occupied one to attack instead of marching straight to the banner.
+const PLAYER_WARRIOR_SPAWNS = (() => {
+  const arr = [];
+  for (let i = 0; i < MAX_VISIBLE_WARRIORS; i++) {
+    const angle = (i / MAX_VISIBLE_WARRIORS) * Math.PI * 2;
+    const ring = 4 + (i % 3) * 1.5;
+    arr.push([BASE_CENTER[0] + Math.cos(angle) * ring, 0, BASE_CENTER[2] + Math.sin(angle) * ring]);
+  }
+  return arr;
+})();
+
+// Offsets (relative to camp center) for the wandering members of a rival camp.
+const TRIBE_MEMBER_OFFSETS = [[-4, 1], [4, -1], [0, 4], [-6, 3], [6, 2], [-2, -6], [3, 6]];
+const TRIBE_MEMBER_HEALTH = 25;
+const TRIBE_MEMBER_RESPAWN_MS = 40000;
+const TRIBE_MEMBER_REWARD = { meters: 15 };
 
 // Coins - a separate currency that occasionally falls from the sky and
 // is spent recruiting warriors for the player's tribe.
@@ -813,6 +858,39 @@ const useGame = create((set, get) => ({
       }
     }
     if (changed) set({ animalState: next });
+    get().tickTribeMemberRespawns();
+  },
+
+  // --- rival tribe members at their camps: health, death, loot, respawn ---
+  tribeMemberState: Object.fromEntries(
+    ENEMY_TRIBES.flatMap((tribe) =>
+      TRIBE_MEMBER_OFFSETS.map((_, i) => [`${tribe.id}_m${i}`, { health: TRIBE_MEMBER_HEALTH, alive: true, respawnAt: 0 }])
+    )
+  ),
+  damageTribeMember: (id, dmg) => {
+    const cur = get().tribeMemberState[id];
+    if (!cur || !cur.alive) return;
+    const health = cur.health - dmg;
+    if (health <= 0) {
+      set((s) => ({ tribeMemberState: { ...s.tribeMemberState, [id]: { health: 0, alive: false, respawnAt: Date.now() + TRIBE_MEMBER_RESPAWN_MS } } }));
+      get().addMeters(TRIBE_MEMBER_REWARD.meters);
+      get().addToast(`Rival tribesperson defeated! +${TRIBE_MEMBER_REWARD.meters}m`);
+    } else {
+      set((s) => ({ tribeMemberState: { ...s.tribeMemberState, [id]: { ...cur, health } } }));
+    }
+  },
+  tickTribeMemberRespawns: () => {
+    const now = Date.now();
+    const state = get().tribeMemberState;
+    let changed = false;
+    const next = { ...state };
+    for (const [id, st] of Object.entries(state)) {
+      if (!st.alive && st.respawnAt && st.respawnAt <= now) {
+        next[id] = { health: TRIBE_MEMBER_HEALTH, alive: true, respawnAt: 0 };
+        changed = true;
+      }
+    }
+    if (changed) set({ tribeMemberState: next });
   },
 
   // --- weapon combat: thrown spears lying on the ground, and damage resolution ---
@@ -853,7 +931,20 @@ const useGame = create((set, get) => ({
         if (dot > Math.cos(ATTACK_CONE / 2) && dist <= bestDist) { best = { kind: 'raider', id: r.id, dist }; bestDist = dist; }
       }
     }
+    for (const [id, pos] of Object.entries(entityRegistry.tribeMembers)) {
+      if (!get().tribeMemberState[id]?.alive) continue;
+      const dx = pos.x - px, dz = pos.z - pz;
+      const dist = Math.hypot(dx, dz);
+      if (dist > range || dist === 0) continue;
+      const dot = (dx / dist) * dirX + (dz / dist) * dirZ;
+      if (dot > Math.cos(ATTACK_CONE / 2) && dist <= bestDist) { best = { kind: 'tribeMember', id, dist }; bestDist = dist; }
+    }
     return best;
+  },
+  applyDamageToTarget: (target, dmg) => {
+    if (target.kind === 'animal') get().damageAnimal(target.id, dmg);
+    else if (target.kind === 'raider') get().damageRaider(target.id, dmg);
+    else if (target.kind === 'tribeMember') get().damageTribeMember(target.id, dmg);
   },
   // Spear poke: short-range stab, doesn't leave the player's hand.
   meleeAttack: (weaponId) => {
@@ -862,38 +953,55 @@ const useGame = create((set, get) => ({
     const dmg = weapon.pokeDamage ?? weapon.damage;
     const target = get().findAttackTarget(weapon.range);
     if (!target) return false;
-    if (target.kind === 'animal') get().damageAnimal(target.id, dmg);
-    else get().damageRaider(target.id, dmg);
+    get().applyDamageToTarget(target, dmg);
     return true;
   },
-  // Throws the equipped spear: it leaves the hand, damages whatever it
-  // hits, and lands on the ground to be picked back up later.
+  // Throws the equipped spear: it flies out, damages whatever it hits, and
+  // lands on the ground to be picked back up later.
+  flyingSpears: [], // [{ id, weaponId, start: [x,y,z], end: [x,y,z], startedAt }]
   throwWeapon: (weaponId) => {
     const weapon = WEAPONS[weaponId];
     if (!weapon || !weapon.throwable) return false;
     if (!get().removeItem(weaponId, 1)) return false;
-    const [px, , pz] = playerTransform.position;
+    const [px, py, pz] = playerTransform.position;
     const yaw = playerTransform.yaw;
     const dirX = -Math.sin(yaw);
     const dirZ = -Math.cos(yaw);
 
     const target = get().findAttackTarget(THROW_RANGE);
-    if (target) {
-      if (target.kind === 'animal') get().damageAnimal(target.id, weapon.damage);
-      else get().damageRaider(target.id, weapon.damage);
-    }
+    if (target) get().applyDamageToTarget(target, weapon.damage);
 
     const landDist = target ? Math.max(1, target.dist - 0.5) : THROW_RANGE;
     const id = `gw_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
     set((s) => ({
-      groundWeapons: [...s.groundWeapons, {
+      flyingSpears: [...s.flyingSpears, {
         id, weaponId,
-        position: [px + dirX * landDist, 0, pz + dirZ * landDist],
+        start: [px + dirX * 0.6, py + 1.3, pz + dirZ * 0.6],
+        end: [px + dirX * landDist, 0.05, pz + dirZ * landDist],
+        startedAt: Date.now(),
       }],
     }));
     get().addToast(target ? `Spear hit its mark! Go pick it back up.` : `Spear thrown! Go pick it back up.`);
     return true;
   },
+  landSpear: (id) => {
+    set((s) => {
+      const spear = s.flyingSpears.find((f) => f.id === id);
+      if (!spear) return {};
+      return {
+        flyingSpears: s.flyingSpears.filter((f) => f.id !== id),
+        groundWeapons: [...s.groundWeapons, { id: spear.id, weaponId: spear.weaponId, position: spear.end }],
+      };
+    });
+  },
+
+  // --- visual/audio effect events (e.g. machete "ching") ---
+  fxEvents: [], // [{ id, type, position }]
+  spawnFx: (type, position) => {
+    const id = `fx_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    set((s) => ({ fxEvents: [...s.fxEvents, { id, type, position }] }));
+  },
+  removeFx: (id) => set((s) => ({ fxEvents: s.fxEvents.filter((f) => f.id !== id) })),
 
   // --- crafting ---
   craft: (recipeId) => {
@@ -1391,6 +1499,18 @@ const POND_RADIUS = 18;
 
 const UP = new THREE.Vector3(0, 1, 0);
 
+// Plays a per-weapon sound/visual flourish when it's used to attack.
+function triggerWeaponFx(weaponId) {
+  if (weaponId === 'machete') {
+    playChingSound();
+    const [px, py, pz] = playerTransform.position;
+    const yaw = playerTransform.yaw;
+    const dirX = -Math.sin(yaw);
+    const dirZ = -Math.cos(yaw);
+    useGame.getState().spawnFx('ching', [px + dirX * 1.2, py + 1.3, pz + dirZ * 1.2]);
+  }
+}
+
 // ---------- Weapon held in the right hand, swapped based on the active hotbar slot ----------
 function HeldWeapon({ id }) {
   if (id === 'spear') {
@@ -1490,7 +1610,7 @@ function Player() {
       if (!weapon || (s.inventory[slot] || 0) <= 0) return;
       attackTimer.current = ATTACK_DURATION;
       if (weapon.throwable) s.throwWeapon(slot);
-      else s.meleeAttack(slot);
+      else { s.meleeAttack(slot); triggerWeaponFx(slot); }
     };
 
     canvas.addEventListener('click', onClick);
@@ -1530,13 +1650,14 @@ function Player() {
         s.setActivePanel(s.activePanel === 'build' ? null : 'build');
       }
       if (code === 'KeyM') s.addToast('Full jungle map coming soon');
-      // Slash key: poke/stab with the equipped spear without throwing it.
+      // Slash key: poke/stab with the equipped weapon without throwing it.
       if (code === 'Slash') {
         const slot = s.hotbarSlots[s.activeHotbarSlot];
         const weapon = WEAPONS[slot];
         if (weapon && (s.inventory[slot] || 0) > 0) {
           attackTimer.current = ATTACK_DURATION;
           s.meleeAttack(slot);
+          triggerWeaponFx(slot);
         }
       }
     });
@@ -1837,6 +1958,86 @@ function GroundWeapons() {
   `;
 }
 
+// ---------- A spear in flight, arcing from the player's hand to where it lands ----------
+function FlyingSpear({ spear }) {
+  const group = useRef();
+  const landed = useRef(false);
+  const duration = useRef(Math.max(0.15, Math.hypot(spear.end[0] - spear.start[0], spear.end[2] - spear.start[2]) / SPEAR_FLIGHT_SPEED));
+  const yaw = Math.atan2(spear.end[0] - spear.start[0], spear.end[2] - spear.start[2]);
+
+  useFrame(() => {
+    if (landed.current || !group.current) return;
+    const t = Math.min(1, (Date.now() - spear.startedAt) / 1000 / duration.current);
+    const x = spear.start[0] + (spear.end[0] - spear.start[0]) * t;
+    const z = spear.start[2] + (spear.end[2] - spear.start[2]) * t;
+    const y = spear.start[1] + (spear.end[1] - spear.start[1]) * t + Math.sin(t * Math.PI) * 1.2;
+    group.current.position.set(x, y, z);
+    if (t >= 1) {
+      landed.current = true;
+      useGame.getState().landSpear(spear.id);
+    }
+  });
+
+  return html`
+    <group ref=${group} position=${spear.start} rotation=${[1.5, yaw, 0]}>
+      <${HeldWeapon} id=${spear.weaponId} />
+    </group>
+  `;
+}
+
+function FlyingSpears() {
+  const flyingSpears = useGame((s) => s.flyingSpears);
+  return html`
+    <${Fragment}>
+      ${flyingSpears.map((spear) => html`<${FlyingSpear} key=${spear.id} spear=${spear} />`)}
+    <//>
+  `;
+}
+
+// ---------- Quick visual "ching" spark burst, e.g. when swinging the machete ----------
+function ChingFx({ fx }) {
+  const group = useRef();
+  const t = useRef(0);
+  const DURATION = 0.25;
+
+  useFrame((_, rawDelta) => {
+    const delta = Math.min(rawDelta, 0.1);
+    t.current += delta;
+    if (t.current >= DURATION) {
+      useGame.getState().removeFx(fx.id);
+      return;
+    }
+    const k = t.current / DURATION;
+    if (group.current) {
+      const scale = 0.4 + k * 1.4;
+      group.current.scale.set(scale, scale, scale);
+      for (const child of group.current.children) {
+        if (child.material) child.material.opacity = 1 - k;
+      }
+    }
+  });
+
+  return html`
+    <group ref=${group} position=${fx.position}>
+      ${[0, 1, 2, 3].map((i) => html`
+        <mesh key=${i} rotation=${[0, 0, (i / 4) * Math.PI * 2]}>
+          <planeGeometry args=${[0.6, 0.06]} />
+          <meshBasicMaterial color="#fff7c0" transparent=${true} opacity=${1} side=${THREE.DoubleSide} depthWrite=${false} />
+        </mesh>
+      `)}
+    </group>
+  `;
+}
+
+function FxEffects() {
+  const fxEvents = useGame((s) => s.fxEvents);
+  return html`
+    <${Fragment}>
+      ${fxEvents.map((fx) => fx.type === 'ching' ? html`<${ChingFx} key=${fx.id} fx=${fx} />` : null)}
+    <//>
+  `;
+}
+
 // ============================================================
 // Kito.js - shop NPC and crafting workbench
 // ============================================================
@@ -1980,7 +2181,7 @@ function Workbench() {
 const WANDER_RADIUS = 14;
 const FLEE_RANGE = 7;
 
-function useWanderAI(group, spawn, { speed = 1.6, fleeSpeed = 5, entityId = null }) {
+function useWanderAI(group, spawn, { speed = 1.6, fleeSpeed = 5, entityId = null, registryKey = 'animals' }) {
   const { camera } = useThree();
   const state = useRef('idle');
   const timer = useRef(1 + Math.random() * 3);
@@ -1990,15 +2191,15 @@ function useWanderAI(group, spawn, { speed = 1.6, fleeSpeed = 5, entityId = null
 
   useEffect(() => {
     return () => {
-      if (entityId) delete entityRegistry.animals[entityId];
+      if (entityId) delete entityRegistry[registryKey][entityId];
     };
-  }, [entityId]);
+  }, [entityId, registryKey]);
 
   useFrame((_, rawDelta) => {
     const delta = Math.min(rawDelta, 0.1);
     if (!group.current) return;
     const pos = group.current.position;
-    if (entityId) entityRegistry.animals[entityId] = pos;
+    if (entityId) entityRegistry[registryKey][entityId] = pos;
     timer.current -= delta;
 
     const dx = pos.x - camera.position.x;
@@ -2218,11 +2419,13 @@ function TribalFigure({ color }) {
 }
 
 // ---------- Peaceful tribe member, wanders near its camp ----------
-function TribeMember({ spawn, color }) {
+function TribeMember({ id, spawn, color }) {
+  const alive = useGame((s) => s.tribeMemberState[id]?.alive ?? true);
   const group = useRef();
   const legL = useRef();
   const legR = useRef();
-  const legRefs = useWanderAI(group, spawn, { speed: 1.2, fleeSpeed: 3 });
+  const legRefs = useWanderAI(group, spawn, { speed: 1.2, fleeSpeed: 3, entityId: alive ? id : null, registryKey: 'tribeMembers' });
+  if (!alive) return null;
   legRefs.current = [
     { ref: legL, sign: 1 },
     { ref: legR, sign: -1 },
@@ -2264,13 +2467,9 @@ function TribeCamp({ tribe }) {
           <meshStandardMaterial color=${tribe.color} flatShading=${true} />
         </mesh>
       </group>
-      <${TribeMember} spawn=${[x - 4, 0, z + 1]} color=${tribe.color} />
-      <${TribeMember} spawn=${[x + 4, 0, z - 1]} color=${tribe.color} />
-      <${TribeMember} spawn=${[x, 0, z + 4]} color=${tribe.color} />
-      <${TribeMember} spawn=${[x - 6, 0, z + 3]} color=${tribe.color} />
-      <${TribeMember} spawn=${[x + 6, 0, z + 2]} color=${tribe.color} />
-      <${TribeMember} spawn=${[x - 2, 0, z - 6]} color=${tribe.color} />
-      <${TribeMember} spawn=${[x + 3, 0, z + 6]} color=${tribe.color} />
+      ${TRIBE_MEMBER_OFFSETS.map((p, i) => html`
+        <${TribeMember} key=${i} id=${`${tribe.id}_m${i}`} spawn=${[x + p[0], 0, z + p[1]]} color=${tribe.color} />
+      `)}
     <//>
   `;
 }
@@ -2394,24 +2593,15 @@ function PlayerWarrior({ spawn }) {
 // Renders one PlayerWarrior per recruited warrior, arranged around the base
 function PlayerWarriors() {
   const warriors = useGame((s) => s.warriors);
-  const spawns = useMemo(() => {
-    const arr = [];
-    for (let i = 0; i < MAX_VISIBLE_WARRIORS; i++) {
-      const angle = (i / MAX_VISIBLE_WARRIORS) * Math.PI * 2;
-      const ring = 4 + (i % 3) * 1.5;
-      arr.push([BASE_CENTER[0] + Math.cos(angle) * ring, 0, BASE_CENTER[2] + Math.sin(angle) * ring]);
-    }
-    return arr;
-  }, []);
-  const count = Math.min(warriors, spawns.length);
+  const count = Math.min(warriors, PLAYER_WARRIOR_SPAWNS.length);
   return html`
     <${Fragment}>
-      ${spawns.slice(0, count).map((spawn, i) => html`<${PlayerWarrior} key=${i} spawn=${spawn} />`)}
+      ${PLAYER_WARRIOR_SPAWNS.slice(0, count).map((spawn, i) => html`<${PlayerWarrior} key=${i} spawn=${spawn} />`)}
     <//>
   `;
 }
 
-// ---------- A raider marching from its tribe's camp toward the player's base ----------
+// ---------- A raider marching from its tribe's camp toward the player's tribe ----------
 function Raider({ id, startPosition, color }) {
   const group = useRef();
   const legL = useRef();
@@ -2428,13 +2618,28 @@ function Raider({ id, startPosition, color }) {
     const delta = Math.min(rawDelta, 0.1);
     const pos = group.current.position;
     entityRegistry.raiders[id] = pos;
-    const dx = BASE_CENTER[0] - pos.x;
-    const dz = BASE_CENTER[2] - pos.z;
+
+    // Attack the nearest of the player's warriors guarding the base; if there
+    // are none, fall back to the tribe banner at BASE_CENTER.
+    const warriors = useGame.getState().warriors;
+    const guardCount = Math.min(warriors, PLAYER_WARRIOR_SPAWNS.length);
+    let targetX = BASE_CENTER[0];
+    let targetZ = BASE_CENTER[2];
+    if (guardCount > 0) {
+      let bestDist = Infinity;
+      for (let i = 0; i < guardCount; i++) {
+        const [gx, , gz] = PLAYER_WARRIOR_SPAWNS[i];
+        const d = Math.hypot(gx - pos.x, gz - pos.z);
+        if (d < bestDist) { bestDist = d; targetX = gx; targetZ = gz; }
+      }
+    }
+
+    const dx = targetX - pos.x;
+    const dz = targetZ - pos.z;
     const dist = Math.hypot(dx, dz);
 
-    if (dist < 3) {
+    if (dist < 2) {
       resolved.current = true;
-      const warriors = useGame.getState().warriors;
       const winChance = Math.min(0.9, warriors * 0.22 + 0.08);
       useGame.getState().resolveRaider(id, Math.random() >= winChance);
       return;
@@ -2906,6 +3111,8 @@ function App() {
         <${Player} />
         <${Resources} />
         <${GroundWeapons} />
+        <${FlyingSpears} />
+        <${FxEffects} />
         <${Animals} />
         <${Kito} />
         <${Workbench} />
