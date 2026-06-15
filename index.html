@@ -589,10 +589,43 @@ const MAX_VISIBLE_WARRIORS = 16;
 
 // Coins - a separate currency that occasionally falls from the sky and
 // is spent recruiting warriors for the player's tribe.
-const WARRIOR_BASE_COST = 15; // coins, scales up with each warrior recruited
+// 1st warrior costs 10c, each one after costs 5c more (1st-5th sum to 100c).
+const WARRIOR_BASE_COST = 10;
+const WARRIOR_COST_STEP = 5;
 const COIN_DROP_MIN = 5;
 const COIN_DROP_MAX = 15;
 const COIN_SPAWN_RADIUS = 50;
+
+// Inventory items the player can actively "use" from the inventory panel.
+// `consumed: true` removes one unit on use.
+const USABLE_ITEMS = {
+  bandage: { label: 'Use', consumed: true, apply: (s) => { s.adjustStat('health', 30); s.addToast('Used Leaf Bandage (+30 health)'); } },
+  bandages_buy: { label: 'Use', consumed: true, apply: (s) => { s.adjustStat('health', 30); s.addToast('Used Bandages (+30 health)'); } },
+  waterskin: { label: 'Drink', consumed: true, apply: (s) => { s.adjustStat('thirst', 40); s.addToast('Drank from Waterskin (+40 thirst)'); } },
+  canteen: { label: 'Drink', consumed: true, apply: (s) => { s.adjustStat('thirst', 40); s.addToast('Drank from Canteen (+40 thirst)'); } },
+  torch: { label: 'Light', consumed: true, apply: (s) => { s.adjustStat('warmth', 25); s.addToast('Lit Torch (+25 warmth)'); } },
+  torch_buy: { label: 'Light', consumed: true, apply: (s) => { s.adjustStat('warmth', 25); s.addToast('Lit Torch (+25 warmth)'); } },
+  campfire: { label: 'Set Up', consumed: true, apply: (s) => { s.adjustStat('warmth', 50); s.adjustStat('sanity', 15); s.addToast('Set up Campfire (+50 warmth, +15 sanity)'); } },
+  antidote: { label: 'Use', consumed: true, apply: (s) => { s.adjustStat('health', 15); s.adjustStat('sanity', 20); s.addToast('Used Antidote (+15 health, +20 sanity)'); } },
+  flint_steel: { label: 'Spark', consumed: false, apply: (s) => { s.adjustStat('warmth', 10); s.addToast('Sparked Flint and Steel (+10 warmth)'); } },
+  hammock: { label: 'Rest', consumed: false, apply: (s) => { s.adjustStat('energy', 40); s.addToast('Rested in Hammock (+40 energy)'); } },
+  rope: { label: 'Use', consumed: false, apply: (s) => { s.addToast('You coil the rope, ready for building.'); } },
+  spear: { label: 'Equip', consumed: false, apply: (s) => { s.addToast('Spear equipped - wild animals think twice.'); } },
+  machete: { label: 'Equip', consumed: false, apply: (s) => { s.addToast('Machete equipped - cuts through the jungle with ease.'); } },
+  binoculars: { label: 'Use', consumed: false, apply: (s) => { s.addToast('You scan the horizon for danger.'); } },
+  compass: { label: 'Use', consumed: false, apply: (s) => { s.addToast('The compass points steadily north.'); } },
+  climbing_gear: { label: 'Equip', consumed: false, apply: (s) => { s.addToast('Climbing gear equipped.'); } },
+  night_vision: { label: 'Equip', consumed: false, apply: (s) => { s.addToast('Night vision goggles equipped - the dark holds no secrets.'); } },
+  mystery_crate: {
+    label: 'Open', consumed: true, apply: (s) => {
+      const loot = ['wood', 'fiber', 'stone', 'leaves', 'berry'];
+      const item = loot[Math.floor(Math.random() * loot.length)];
+      const qty = 2 + Math.floor(Math.random() * 4);
+      s.addItem(item, qty);
+      s.addToast(`Mystery Crate contained ${qty} ${RESOURCES[item].name}!`);
+    },
+  },
+};
 
 // World resource node placement (positions are fixed for now)
 function generateResourceNodes() {
@@ -793,14 +826,27 @@ const useGame = create((set, get) => ({
 
   // --- the player's tribe: recruit warriors to defend against raids ---
   warriors: 3,
+  warriorsRecruited: 0,
   recruitWarrior: () => {
-    const cost = WARRIOR_BASE_COST + get().warriors * 8;
+    const cost = WARRIOR_BASE_COST + get().warriorsRecruited * WARRIOR_COST_STEP;
     if (!get().spendCoins(cost)) {
       get().addToast(`Need ${cost} coins to recruit a warrior`);
       return false;
     }
-    set((s) => ({ warriors: s.warriors + 1 }));
+    set((s) => ({ warriors: s.warriors + 1, warriorsRecruited: s.warriorsRecruited + 1 }));
     get().addToast('A new warrior joins your tribe!');
+    return true;
+  },
+
+  // --- use an item from the inventory ---
+  useItem: (id) => {
+    const usable = USABLE_ITEMS[id];
+    if (!usable) return false;
+    if (usable.consumed && !get().removeItem(id, 1)) {
+      get().addToast(`No ${id} left to use`);
+      return false;
+    }
+    usable.apply(get());
     return true;
   },
 
@@ -830,7 +876,7 @@ const useGame = create((set, get) => ({
   startRaid: () => {
     if (get().raid) return;
     const tribe = ENEMY_TRIBES[Math.floor(Math.random() * ENEMY_TRIBES.length)];
-    const count = 2 + Math.floor(Math.random() * 3);
+    const count = 3 + Math.floor(Math.random() * 4);
     const raiders = [];
     for (let i = 0; i < count; i++) {
       raiders.push({
@@ -1177,7 +1223,7 @@ function World() {
 // ============================================================
 // Player.js - movement, camera, survival stats
 // ============================================================
-const WALK_SPEED = 4;
+const WALK_SPEED = 6;
 const SPRINT_MULT = 1.8;
 const CROUCH_MULT = 0.5;
 const JUMP_SPEED = 6.5;
@@ -1916,7 +1962,7 @@ function TribeCamp({ tribe }) {
   return html`
     <${Fragment}>
       <group position=${[x, 0, z]}>
-        ${[[-3, -2], [3, -2], [0, 3]].map((p, i) => html`
+        ${[[-3, -2], [3, -2], [0, 3], [-5, 2], [5, 1], [-2, 5]].map((p, i) => html`
           <group key=${i} position=${[p[0], 0, p[1]]}>
             <mesh position=${[0, 0.9, 0]} castShadow=${true} receiveShadow=${true}>
               <coneGeometry args=${[1.4, 1.8, 7]} />
@@ -1936,6 +1982,10 @@ function TribeCamp({ tribe }) {
       <${TribeMember} spawn=${[x - 4, 0, z + 1]} color=${tribe.color} />
       <${TribeMember} spawn=${[x + 4, 0, z - 1]} color=${tribe.color} />
       <${TribeMember} spawn=${[x, 0, z + 4]} color=${tribe.color} />
+      <${TribeMember} spawn=${[x - 6, 0, z + 3]} color=${tribe.color} />
+      <${TribeMember} spawn=${[x + 6, 0, z + 2]} color=${tribe.color} />
+      <${TribeMember} spawn=${[x - 2, 0, z - 6]} color=${tribe.color} />
+      <${TribeMember} spawn=${[x + 3, 0, z + 6]} color=${tribe.color} />
     <//>
   `;
 }
@@ -2315,6 +2365,7 @@ function StatBar({ icon, value, cls }) {
 function InventoryPanel() {
   const inventory = useGame((s) => s.inventory);
   const setActivePanel = useGame((s) => s.setActivePanel);
+  const useItem = useGame((s) => s.useItem);
   const entries = Object.entries(inventory);
 
   return html`
@@ -2327,10 +2378,14 @@ function InventoryPanel() {
           const recipe = CRAFTING_RECIPES.find((r) => r.id === id);
           const shopItem = SHOP_ITEMS.find((i) => i.id === id);
           const name = resource?.name || recipe?.name || shopItem?.name || id;
+          const usable = USABLE_ITEMS[id];
           return html`
             <div class="inv-item" key=${id}>
               <span class="name">${name}</span>
               <span>x${qty}</span>
+              ${usable && html`
+                <button class="buy-btn" onClick=${() => useItem(id)}>${usable.label}</button>
+              `}
             </div>
           `;
         })}
@@ -2344,6 +2399,7 @@ function ShopPanel() {
   const meters = useGame((s) => s.meters);
   const coins = useGame((s) => s.coins);
   const warriors = useGame((s) => s.warriors);
+  const warriorsRecruited = useGame((s) => s.warriorsRecruited);
   const recruitWarrior = useGame((s) => s.recruitWarrior);
   const setActivePanel = useGame((s) => s.setActivePanel);
   const buyItem = useGame((s) => s.buyItem);
@@ -2351,7 +2407,7 @@ function ShopPanel() {
     const pool = meters > 1000 ? KITO_LINES.richReaction : meters < 100 ? KITO_LINES.poorReaction : KITO_LINES.greeting;
     return pool[Math.floor(Math.random() * pool.length)];
   });
-  const recruitCost = WARRIOR_BASE_COST + warriors * 8;
+  const recruitCost = WARRIOR_BASE_COST + warriorsRecruited * WARRIOR_COST_STEP;
 
   return html`
     <div class="panel-overlay" onClick=${() => setActivePanel(null)}>
