@@ -87,6 +87,20 @@ canvas {
   border-radius: 10px;
   padding: 6px 14px;
   font-size: 14px;
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.stepper {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.stepper button {
+  width: 32px;
+  height: 32px;
+  font-size: 18px;
 }
 
 .mp-button {
@@ -728,6 +742,7 @@ function mpSetupConnection(conn) {
       Object.assign(remoteTribeMembers, msg.members);
       useGame.getState().setTribeMemberState(msg.tribeMemberState);
       useGame.getState().setCapturedTribes(msg.capturedTribes);
+      useGame.getState().setActiveTribeIds(msg.activeTribeIds);
     } else if (msg.t === 'tribeDamage') {
       if (useGame.getState().mpRole === 'host') {
         useGame.getState().damageTribeMember(msg.id, msg.dmg);
@@ -998,12 +1013,21 @@ const BUILDING_TYPES = [
   { id: 'storage', name: 'Storage Hut', desc: 'A place to stash resources.', cost: { wood: 6, fiber: 3 } },
 ];
 
-// Rival tribes - their camps sit far across the jungle and occasionally send raiders
+// Rival tribes - their camps sit far across the jungle and occasionally send raiders.
+// The first ENEMY_TRIBES_INITIAL_COUNT camps exist from the start; the rest "spawn in"
+// gradually over time via TribeSpawnManager, raising the total number of tribes to defeat.
 const ENEMY_TRIBES = [
   { id: 'redfang', name: 'Red Fang Tribe', color: '#c2453b', campPosition: [-90, 0, -90] },
   { id: 'bonecrush', name: 'Bonecrusher Clan', color: '#4a5ad6', campPosition: [95, 0, -80] },
   { id: 'shadowleaf', name: 'Shadowleaf Raiders', color: '#3bc26a', campPosition: [85, 0, 95] },
+  { id: 'skullriver', name: 'Skull River Tribe', color: '#9b59b6', campPosition: [-110, 0, 100] },
+  { id: 'ironvale', name: 'Ironvale Marauders', color: '#e08e2b', campPosition: [140, 0, 10] },
+  { id: 'frostfang', name: 'Frostfang Horde', color: '#5bc8e0', campPosition: [-20, 0, 150] },
 ];
+
+const ENEMY_TRIBES_INITIAL_COUNT = 3;
+// How often (in seconds) a new rival tribe camp appears, until all ENEMY_TRIBES are active.
+const TRIBE_SPAWN_INTERVAL = 240;
 
 // Where the player's own tribe is based - raiders march here
 const BASE_CENTER = [0, 0, 0];
@@ -1033,6 +1057,18 @@ const TRIBE_MEMBER_ATTACK_SPEED = 2.6;
 const TRIBE_MEMBER_DAMAGE = 5;
 const TRIBE_MEMBER_ATTACK_COOLDOWN = 1.2;
 const CAMP_CAPTURE_REWARD = { meters: 100, coins: 20 };
+// How long (ms) the rest of a camp stays alerted and rushes the player after one
+// of its members is attacked - this is what makes a tribe "fight back" as a group.
+const CAMP_ALERT_RANGE = 30;
+const CAMP_ALERT_DURATION_MS = 10000;
+
+// --- escort warriors: a chosen number of the player's warriors follow them into battle ---
+const ESCORT_FOLLOW_DIST = 2.2;
+const ESCORT_AGGRO_RANGE = 9;
+const ESCORT_ATTACK_RANGE = 1.8;
+const ESCORT_ATTACK_DAMAGE = 8;
+const ESCORT_ATTACK_COOLDOWN = 1;
+const ESCORT_SPEED = 3.4;
 
 // Coins - a separate currency that occasionally falls from the sky and
 // is spent recruiting warriors for the player's tribe.
@@ -1290,16 +1326,34 @@ const useGame = create((set, get) => ({
   damageTribeMember: (id, dmg) => {
     const cur = get().tribeMemberState[id];
     if (!cur || !cur.alive) return;
+    const tribeId = id.split('_m')[0];
+    // Alert the rest of the camp - they'll all rush to fight back for a while.
+    set((s) => ({ alertedCamps: { ...s.alertedCamps, [tribeId]: Date.now() + CAMP_ALERT_DURATION_MS } }));
     const health = cur.health - dmg;
     if (health <= 0) {
       set((s) => ({ tribeMemberState: { ...s.tribeMemberState, [id]: { health: 0, alive: false, respawnAt: Date.now() + TRIBE_MEMBER_RESPAWN_MS } } }));
       get().addMeters(TRIBE_MEMBER_REWARD.meters);
       get().addToast(`Rival tribesperson defeated! +${TRIBE_MEMBER_REWARD.meters}m`);
-      get().checkCampCapture(id.split('_m')[0]);
+      get().checkCampCapture(tribeId);
     } else {
       set((s) => ({ tribeMemberState: { ...s.tribeMemberState, [id]: { ...cur, health } } }));
     }
   },
+  // --- alerted camps: when one member is attacked, the whole camp aggros for a while ---
+  alertedCamps: {},
+  // --- rival tribes that have "spawned in" and have an active camp on the map ---
+  activeTribeIds: ENEMY_TRIBES.slice(0, ENEMY_TRIBES_INITIAL_COUNT).map((t) => t.id),
+  setActiveTribeIds: (v) => set({ activeTribeIds: v }),
+  spawnNextTribe: () => {
+    // The host's tribeSync broadcast is authoritative for joiners.
+    if (get().mpRole === 'joiner') return;
+    const active = get().activeTribeIds;
+    const next = ENEMY_TRIBES.find((t) => !active.includes(t.id));
+    if (!next) return;
+    set((s) => ({ activeTribeIds: [...s.activeTribeIds, next.id] }));
+    get().addToast(`A new rival tribe has arrived: ${next.name}!`);
+  },
+
   // --- captured rival camps: become the player's once every member is defeated ---
   capturedTribes: {},
   checkCampCapture: (tribeId) => {
@@ -1556,6 +1610,10 @@ const useGame = create((set, get) => ({
     return true;
   },
 
+  // --- how many warriors come with the player to fight rival tribes (the rest guard the base) ---
+  escortWarriors: 0,
+  setEscortWarriors: (n) => set((s) => ({ escortWarriors: Math.max(0, Math.min(n, s.warriors)) })),
+
   // --- use an item from the inventory ---
   useItem: (id) => {
     const usable = USABLE_ITEMS[id];
@@ -1593,7 +1651,7 @@ const useGame = create((set, get) => ({
   raid: null, // { tribeId, tribeName, color, raiders: [{ id, position }] }
   startRaid: () => {
     if (get().raid) return;
-    const available = ENEMY_TRIBES.filter((t) => !get().capturedTribes[t.id]);
+    const available = ENEMY_TRIBES.filter((t) => get().activeTribeIds.includes(t.id) && !get().capturedTribes[t.id]);
     if (!available.length) return;
     const tribe = available[Math.floor(Math.random() * available.length)];
     const count = 3 + Math.floor(Math.random() * 4);
@@ -1619,7 +1677,7 @@ const useGame = create((set, get) => ({
     set({ raid: raiders.length ? { ...raid, raiders } : null });
     if (raiderWon) {
       get().adjustStat('health', -10);
-      if (get().warriors > 0) set((s) => ({ warriors: s.warriors - 1 }));
+      if (get().warriors > 0) set((s) => ({ warriors: s.warriors - 1, escortWarriors: Math.min(s.escortWarriors, s.warriors - 1) }));
       get().addToast('A raider broke through and damaged your tribe!');
     } else {
       get().addToast('Your warriors repelled a raider!');
@@ -2437,6 +2495,7 @@ function Player() {
           members: tribeMemberSyncData,
           tribeMemberState: s.tribeMemberState,
           capturedTribes: s.capturedTribes,
+          activeTribeIds: s.activeTribeIds,
         });
       }
     }
@@ -2948,7 +3007,7 @@ function useWanderAI(group, spawn, {
   speed = 1.6, fleeSpeed = 5, entityId = null, registryKey = 'animals',
   aggressive = false, aggroRange = FLEE_RANGE, attackRange = 1.8,
   attackSpeed = 0, attackDamage = 0, attackCooldown = 1.2,
-  frozen = false,
+  frozen = false, alertTribeId = null,
 }) {
   const { camera } = useThree();
   const state = useRef('idle');
@@ -2986,7 +3045,11 @@ function useWanderAI(group, spawn, {
     const dz = pos.z - camera.position.z;
     const distToPlayer = Math.hypot(dx, dz);
 
-    if (aggressive && distToPlayer < aggroRange) {
+    // A camp-mate being attacked alerts the whole camp - they rush in from much further away.
+    const alertedUntil = alertTribeId ? useGame.getState().alertedCamps[alertTribeId] : 0;
+    const effectiveAggroRange = alertedUntil && alertedUntil > Date.now() ? Math.max(aggroRange, CAMP_ALERT_RANGE) : aggroRange;
+
+    if (aggressive && distToPlayer < effectiveAggroRange) {
       state.current = 'attack';
     } else if (!aggressive && distToPlayer < FLEE_RANGE) {
       state.current = 'flee';
@@ -3234,7 +3297,7 @@ function TribeMember({ id, spawn, color }) {
     speed: 1.2, fleeSpeed: 3, entityId: (!isJoiner && alive) ? id : null, registryKey: 'tribeMembers',
     aggressive: true, aggroRange: TRIBE_MEMBER_AGGRO_RANGE, attackRange: TRIBE_MEMBER_ATTACK_RANGE,
     attackSpeed: TRIBE_MEMBER_ATTACK_SPEED, attackDamage: TRIBE_MEMBER_DAMAGE, attackCooldown: TRIBE_MEMBER_ATTACK_COOLDOWN,
-    frozen: isJoiner,
+    frozen: isJoiner, alertTribeId: id.split('_m')[0],
   });
 
   // Joiner: this member's position/rotation is driven by the host's tribeSync
@@ -3324,11 +3387,29 @@ function TribeCamp({ tribe }) {
 }
 
 function TribeCamps() {
+  const activeTribeIds = useGame((s) => s.activeTribeIds);
   return html`
     <${Fragment}>
-      ${ENEMY_TRIBES.map((t) => html`<${TribeCamp} key=${t.id} tribe=${t} />`)}
+      ${ENEMY_TRIBES.filter((t) => activeTribeIds.includes(t.id)).map((t) => html`<${TribeCamp} key=${t.id} tribe=${t} />`)}
     <//>
   `;
+}
+
+// ---------- Periodically activates the next rival tribe's camp ----------
+function TribeSpawnManager() {
+  const timer = useRef(TRIBE_SPAWN_INTERVAL);
+  useFrame((_, rawDelta) => {
+    const delta = Math.min(rawDelta, 0.1);
+    const s = useGame.getState();
+    if (s.mpRole === 'joiner') return;
+    if (s.activeTribeIds.length >= ENEMY_TRIBES.length) return;
+    timer.current -= delta;
+    if (timer.current <= 0) {
+      s.spawnNextTribe();
+      timer.current = TRIBE_SPAWN_INTERVAL;
+    }
+  });
+  return null;
 }
 
 // ---------- The player's own tribe banner, marks the raid target ----------
@@ -3411,6 +3492,25 @@ function useGuardWander(group, spawn, speed = 1) {
   return legRefs;
 }
 
+// Shared limbs+weapon for the player's tribe warriors (guards and escorts alike).
+function WarriorFigure({ legL, legR }) {
+  return html`
+    <${Fragment}>
+      <${TribalFigure} color=${PLAYER_TRIBE_COLOR} />
+      <group ref=${legL} position=${[0.12, 0.55, 0]}>
+        <mesh position=${[0, -0.3, 0]} castShadow=${true}><capsuleGeometry args=${[0.09, 0.5, 4, 6]} /><meshStandardMaterial color="#5a4632" /></mesh>
+      </group>
+      <group ref=${legR} position=${[-0.12, 0.55, 0]}>
+        <mesh position=${[0, -0.3, 0]} castShadow=${true}><capsuleGeometry args=${[0.09, 0.5, 4, 6]} /><meshStandardMaterial color="#5a4632" /></mesh>
+      </group>
+      <mesh position=${[0, 1.3, 0.3]} rotation=${[Math.PI / 2.4, 0, 0]} castShadow=${true}>
+        <cylinderGeometry args=${[0.02, 0.02, 1, 5]} />
+        <meshStandardMaterial color="#5a4632" />
+      </mesh>
+    <//>
+  `;
+}
+
 // ---------- A recruited warrior, stands guard and patrols near the tribe base ----------
 function PlayerWarrior({ spawn }) {
   const group = useRef();
@@ -3424,28 +3524,127 @@ function PlayerWarrior({ spawn }) {
 
   return html`
     <group ref=${group} position=${spawn}>
-      <${TribalFigure} color=${PLAYER_TRIBE_COLOR} />
-      <group ref=${legL} position=${[0.12, 0.55, 0]}>
-        <mesh position=${[0, -0.3, 0]} castShadow=${true}><capsuleGeometry args=${[0.09, 0.5, 4, 6]} /><meshStandardMaterial color="#5a4632" /></mesh>
-      </group>
-      <group ref=${legR} position=${[-0.12, 0.55, 0]}>
-        <mesh position=${[0, -0.3, 0]} castShadow=${true}><capsuleGeometry args=${[0.09, 0.5, 4, 6]} /><meshStandardMaterial color="#5a4632" /></mesh>
-      </group>
-      <mesh position=${[0, 1.3, 0.3]} rotation=${[Math.PI / 2.4, 0, 0]} castShadow=${true}>
-        <cylinderGeometry args=${[0.02, 0.02, 1, 5]} />
-        <meshStandardMaterial color="#5a4632" />
-      </mesh>
+      <${WarriorFigure} legL=${legL} legR=${legR} />
     </group>
   `;
 }
 
-// Renders one PlayerWarrior per recruited warrior, arranged around the base
+// Renders one PlayerWarrior per recruited warrior that's staying behind to guard the base
+// (the rest are escortWarriors, chosen by the player to come along and fight).
 function PlayerWarriors() {
   const warriors = useGame((s) => s.warriors);
-  const count = Math.min(warriors, PLAYER_WARRIOR_SPAWNS.length);
+  const escortWarriors = useGame((s) => s.escortWarriors);
+  const guardCount = Math.min(Math.max(warriors - escortWarriors, 0), PLAYER_WARRIOR_SPAWNS.length);
   return html`
     <${Fragment}>
-      ${PLAYER_WARRIOR_SPAWNS.slice(0, count).map((spawn, i) => html`<${PlayerWarrior} key=${i} spawn=${spawn} />`)}
+      ${PLAYER_WARRIOR_SPAWNS.slice(0, guardCount).map((spawn, i) => html`<${PlayerWarrior} key=${i} spawn=${spawn} />`)}
+    <//>
+  `;
+}
+
+// ---------- An escort warrior: follows the player and fights rival tribe members/raiders ----------
+function useEscortAI(group, index) {
+  const legRefs = useRef([]);
+  const phase = useRef(Math.random() * 10);
+  const attackTimer = useRef(Math.random() * ESCORT_ATTACK_COOLDOWN);
+
+  useFrame((_, rawDelta) => {
+    const delta = Math.min(rawDelta, 0.1);
+    if (!group.current) return;
+    const pos = group.current.position;
+    attackTimer.current -= delta;
+
+    const s = useGame.getState();
+    const [px, , pz] = playerTransform.position;
+    const yaw = playerTransform.yaw;
+
+    // Look for the nearest rival tribe member or raider to fight.
+    let target = null;
+    let bestDist = ESCORT_AGGRO_RANGE;
+    for (const [id, p] of Object.entries(entityRegistry.tribeMembers)) {
+      if (!s.tribeMemberState[id]?.alive) continue;
+      const d = Math.hypot(p.x - pos.x, p.z - pos.z);
+      if (d < bestDist) { bestDist = d; target = { kind: 'tribeMember', id, pos: p }; }
+    }
+    if (s.raid) {
+      for (const r of s.raid.raiders) {
+        const p = entityRegistry.raiders[r.id];
+        if (!p) continue;
+        const d = Math.hypot(p.x - pos.x, p.z - pos.z);
+        if (d < bestDist) { bestDist = d; target = { kind: 'raider', id: r.id, pos: p }; }
+      }
+    }
+
+    let tx, tz;
+    if (target) {
+      tx = target.pos.x;
+      tz = target.pos.z;
+    } else {
+      // Hold a formation slot just behind and to the side of the player.
+      const side = index % 2 === 0 ? 1 : -1;
+      const spread = 0.6 + Math.floor(index / 2) * 0.45;
+      const angle = yaw + Math.PI + side * spread;
+      tx = px + Math.sin(angle) * ESCORT_FOLLOW_DIST;
+      tz = pz + Math.cos(angle) * ESCORT_FOLLOW_DIST;
+    }
+
+    const dx = tx - pos.x;
+    const dz = tz - pos.z;
+    const dist = Math.hypot(dx, dz);
+
+    if (target && dist < ESCORT_ATTACK_RANGE) {
+      group.current.rotation.y = Math.atan2(dx, dz);
+      if (attackTimer.current <= 0) {
+        attackTimer.current = ESCORT_ATTACK_COOLDOWN;
+        if (target.kind === 'tribeMember') {
+          if (s.mpRole === 'joiner') mpSend({ t: 'tribeDamage', id: target.id, dmg: ESCORT_ATTACK_DAMAGE });
+          else s.damageTribeMember(target.id, ESCORT_ATTACK_DAMAGE);
+        } else {
+          s.damageRaider(target.id, ESCORT_ATTACK_DAMAGE);
+        }
+      }
+    } else if (dist > 0.3) {
+      const spd = target ? ESCORT_SPEED : ESCORT_SPEED * 0.7;
+      pos.x += (dx / dist) * spd * delta;
+      pos.z += (dz / dist) * spd * delta;
+      group.current.rotation.y = Math.atan2(dx, dz);
+      phase.current += delta * spd * 1.5;
+      const swing = Math.sin(phase.current) * 0.4;
+      for (const leg of legRefs.current) if (leg.ref.current) leg.ref.current.rotation.x = leg.sign * swing;
+    } else {
+      for (const leg of legRefs.current) if (leg.ref.current) leg.ref.current.rotation.x *= 0.9;
+    }
+  });
+
+  return legRefs;
+}
+
+function EscortWarrior({ index }) {
+  const group = useRef();
+  const legL = useRef();
+  const legR = useRef();
+  const legRefs = useEscortAI(group, index);
+  legRefs.current = [
+    { ref: legL, sign: 1 },
+    { ref: legR, sign: -1 },
+  ];
+  const spawn = PLAYER_WARRIOR_SPAWNS[index % PLAYER_WARRIOR_SPAWNS.length];
+
+  return html`
+    <group ref=${group} position=${spawn}>
+      <${WarriorFigure} legL=${legL} legR=${legR} />
+    </group>
+  `;
+}
+
+// Renders the warriors the player has chosen to bring into battle with them.
+function EscortWarriors() {
+  const warriors = useGame((s) => s.warriors);
+  const escortWarriors = useGame((s) => s.escortWarriors);
+  const count = Math.min(escortWarriors, warriors);
+  return html`
+    <${Fragment}>
+      ${Array.from({ length: count }, (_, i) => html`<${EscortWarrior} key=${i} index=${i} />`)}
     <//>
   `;
 }
@@ -3809,6 +4008,46 @@ function ShopPanel() {
   `;
 }
 
+function TribePanel() {
+  const warriors = useGame((s) => s.warriors);
+  const escortWarriors = useGame((s) => s.escortWarriors);
+  const setEscortWarriors = useGame((s) => s.setEscortWarriors);
+  const activeTribeIds = useGame((s) => s.activeTribeIds);
+  const capturedTribes = useGame((s) => s.capturedTribes);
+  const setActivePanel = useGame((s) => s.setActivePanel);
+
+  const defeatedCount = Object.values(capturedTribes).filter(Boolean).length;
+  const guardCount = warriors - escortWarriors;
+
+  return html`
+    <div class="panel-overlay" onClick=${() => setActivePanel(null)}>
+      <div class="panel" onClick=${(e) => e.stopPropagation()}>
+        <h2>Your Tribe</h2>
+        <p class="desc">
+          Rival tribes defeated: ${defeatedCount} of ${ENEMY_TRIBES.length}
+          &middot; ${activeTribeIds.length} camp${activeTribeIds.length === 1 ? '' : 's'} active in the jungle.
+          ${activeTribeIds.length < ENEMY_TRIBES.length ? ' More rival tribes will arrive over time.' : ' All rival tribes have arrived!'}
+        </p>
+        <div class="shop-item">
+          <div>
+            <div class="name">Warriors with you</div>
+            <div class="desc">
+              Chosen warriors follow you and help fight rival tribes and raiders.
+              The rest (${guardCount}) stay behind to guard your base.
+            </div>
+          </div>
+          <div class="stepper">
+            <button class="buy-btn" disabled=${escortWarriors <= 0} onClick=${() => setEscortWarriors(escortWarriors - 1)}>-</button>
+            <strong>${escortWarriors} / ${warriors}</strong>
+            <button class="buy-btn" disabled=${escortWarriors >= warriors} onClick=${() => setEscortWarriors(escortWarriors + 1)}>+</button>
+          </div>
+        </div>
+        <p class="close-hint">E, Tab or Esc to close</p>
+      </div>
+    </div>
+  `;
+}
+
 function CraftingPanel() {
   const inventory = useGame((s) => s.inventory);
   const craft = useGame((s) => s.craft);
@@ -4079,6 +4318,7 @@ function Hud() {
   const inventory = useGame((s) => s.inventory);
   const mpStatus = useGame((s) => s.mpStatus);
   const setActivePanel = useGame((s) => s.setActivePanel);
+  const escortWarriors = useGame((s) => s.escortWarriors);
   const chatMessages = useGame((s) => s.chatMessages);
   const chatOpen = useGame((s) => s.chatOpen);
   const setChatOpen = useGame((s) => s.setChatOpen);
@@ -4103,7 +4343,9 @@ function Hud() {
         <div class="coins-line">🪙 ${coins}</div>
       </div>
       <div class="day-clock">🕐 ${formatTime(timeOfDay)}</div>
-      <div class="tribe-panel">⚔️ ${warriors} warriors</div>
+      <div class="tribe-panel" onClick=${() => setActivePanel(activePanel === 'tribe' ? null : 'tribe')}>
+        ⚔️ ${warriors} warriors (${escortWarriors} with you)
+      </div>
 
       <div class="mp-button ${mpStatus === 'connected' ? 'mp-connected' : ''}" onClick=${() => setActivePanel(activePanel === 'multiplayer' ? null : 'multiplayer')}>
         🌐 ${mpStatus === 'connected' ? 'Friend Online' : 'Multiplayer'}
@@ -4167,6 +4409,7 @@ function Hud() {
 
       ${activePanel === 'inventory' && html`<${InventoryPanel} />`}
       ${activePanel === 'shop' && html`<${ShopPanel} />`}
+      ${activePanel === 'tribe' && html`<${TribePanel} />`}
       ${activePanel === 'crafting' && html`<${CraftingPanel} />`}
       ${activePanel === 'build' && html`<${BuildPanel} />`}
       ${activePanel === 'multiplayer' && html`<${MultiplayerPanel} />`}
@@ -4189,8 +4432,10 @@ function StartScreen() {
         Survive a vast procedural jungle as the leader of your own tribe. Gather wood, fiber and stone,
         craft tools at the workbench, and build houses, lookout towers, walls and storage huts to grow
         your camp. Collect coins that fall from the sky and recruit warriors from Kito's shop to defend
-        against rival tribes, who will occasionally raid your base. Watch out for wild boars and curious
-        monkeys as day turns to night.
+        against rival tribes, who will occasionally raid your base. New rival tribes will arrive in the
+        jungle over time, so choose some of your warriors to bring with you into battle - they'll fight
+        back when you raid an enemy camp, and the rest will stay home to guard your base. Watch out for
+        wild boars and curious monkeys as day turns to night.
       </p>
       <button onClick=${() => { start(); }}>Begin Survival</button>
       <div class="controls-list">
@@ -4199,6 +4444,7 @@ function StartScreen() {
         &middot; B build menu &middot; Tab inventory &middot; Q cycle hotbar &middot; C toggle camera &middot; Scroll zoom &middot; Esc close menus
         &middot; Left Click attack (throws spear, swings other weapons) &middot; 0 poke with spear
         &middot; T chat with your friend (multiplayer)
+        &middot; Click the ⚔️ warriors panel (top left) to choose how many warriors fight alongside you
         &middot; On touch devices: drag the left joystick to move, drag anywhere to look, and use the on-screen buttons (including 💬 for chat)
         &middot; Click the 🌐 Multiplayer button (top right) to play together with a friend
       </div>
@@ -4230,7 +4476,9 @@ function App() {
         <${Workbench} />
         <${PlayerTribeBase} />
         <${PlayerWarriors} />
+        <${EscortWarriors} />
         <${TribeCamps} />
+        <${TribeSpawnManager} />
         <${Buildings} />
         <${Raiders} />
         <${RaidManager} />
