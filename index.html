@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Jungle King</title>
 <script type="importmap">
 {
@@ -37,6 +37,7 @@ html, body, #root {
 canvas {
   display: block;
   outline: none;
+  touch-action: none;
 }
 
 /* ---------- HUD ---------- */
@@ -170,6 +171,89 @@ canvas {
   border-radius: 6px;
   padding: 6px 14px;
   font-size: 14px;
+}
+
+/* ---- touch controls ---- */
+.touch-controls {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.touch-joystick {
+  position: absolute;
+  left: 28px;
+  bottom: 28px;
+  width: 110px;
+  height: 110px;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.12);
+  border: 2px solid rgba(255,255,255,0.3);
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.touch-joystick-thumb {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 50px;
+  height: 50px;
+  margin: -25px;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.35);
+  border: 2px solid rgba(255,255,255,0.5);
+  pointer-events: none;
+}
+
+.touch-actions {
+  position: absolute;
+  right: 18px;
+  bottom: 18px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+  pointer-events: auto;
+}
+
+.touch-row {
+  display: flex;
+  gap: 10px;
+}
+
+.touch-row-main {
+  align-items: flex-end;
+}
+
+.touch-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255,255,255,0.16);
+  border: 2px solid rgba(255,255,255,0.35);
+  border-radius: 50%;
+  color: #fff;
+  font-size: 20px;
+  user-select: none;
+  touch-action: none;
+}
+
+.touch-btn-sm {
+  width: 46px;
+  height: 46px;
+  font-size: 18px;
+}
+
+.touch-btn-lg {
+  width: 64px;
+  height: 64px;
+  font-size: 24px;
+}
+
+.touch-btn-attack {
+  background: rgba(224,69,60,0.35);
+  border-color: rgba(224,69,60,0.6);
 }
 
 .day-clock {
@@ -453,6 +537,24 @@ function onKeyPress(handler) {
   pressHandlers.add(handler);
   return () => pressHandlers.delete(handler);
 }
+
+// Lets on-screen touch buttons trigger the same one-shot actions as a key press.
+function simulateKeyPress(code) {
+  for (const h of pressHandlers) h(code);
+}
+
+// ============================================================
+// touch.js - on-screen controls for tablets/phones (no keyboard/mouse)
+// ============================================================
+const isTouchDevice = (typeof window !== 'undefined')
+  && (('ontouchstart' in window) || navigator.maxTouchPoints > 0);
+
+// Written by the virtual joystick / look-drag, consumed each frame by Player.
+const touchInput = {
+  moveX: 0, moveZ: 0, // virtual joystick vector, same sign convention as WASD
+  lookDX: 0, lookDY: 0, // accumulated look-drag delta (pixels) since last frame
+  attack: () => {}, // wired up by Player to throw/swing the equipped weapon
+};
 
 // Lazily-created shared audio context for tiny procedural sound effects
 // (no audio assets in this project - everything is synthesized).
@@ -1678,7 +1780,7 @@ function Player() {
   useEffect(() => {
     const canvas = gl.domElement;
     const onClick = () => {
-      if (useGame.getState().activePanel === null) canvas.requestPointerLock();
+      if (useGame.getState().activePanel === null && canvas.requestPointerLock) canvas.requestPointerLock();
     };
     const onMouseMove = (e) => {
       if (document.pointerLockElement !== canvas) return;
@@ -1689,11 +1791,9 @@ function Player() {
     const onWheel = (e) => {
       camDistance.current = Math.max(2, Math.min(12, camDistance.current + e.deltaY * 0.01));
     };
-    // Left mouse button: throw the equipped spear, or swing whatever
-    // melee weapon is in hand.
-    const onMouseDown = (e) => {
-      if (e.button !== 0) return;
-      if (document.pointerLockElement !== canvas) return;
+    // Throw the equipped spear, or swing whatever melee weapon is in hand.
+    // Shared by the left mouse button and the on-screen attack button.
+    const doAttack = () => {
       const s = useGame.getState();
       if (s.activePanel !== null) return;
       const slot = s.hotbarSlots[s.activeHotbarSlot];
@@ -1703,11 +1803,47 @@ function Player() {
       if (weapon.throwable) s.throwWeapon(slot);
       else { s.meleeAttack(slot); triggerWeaponFx(slot); }
     };
+    const onMouseDown = (e) => {
+      if (e.button !== 0) return;
+      if (document.pointerLockElement !== canvas) return;
+      doAttack();
+    };
+    touchInput.attack = doAttack;
+
+    // ---- touch: drag-to-look anywhere on the canvas ----
+    const activeLookTouch = { id: null, x: 0, y: 0 };
+    const onTouchStart = (e) => {
+      if (useGame.getState().activePanel !== null) return;
+      if (activeLookTouch.id !== null) return;
+      const t = e.changedTouches[0];
+      activeLookTouch.id = t.identifier;
+      activeLookTouch.x = t.clientX;
+      activeLookTouch.y = t.clientY;
+    };
+    const onTouchMove = (e) => {
+      for (const t of e.changedTouches) {
+        if (t.identifier === activeLookTouch.id) {
+          touchInput.lookDX += t.clientX - activeLookTouch.x;
+          touchInput.lookDY += t.clientY - activeLookTouch.y;
+          activeLookTouch.x = t.clientX;
+          activeLookTouch.y = t.clientY;
+        }
+      }
+    };
+    const onTouchEnd = (e) => {
+      for (const t of e.changedTouches) {
+        if (t.identifier === activeLookTouch.id) activeLookTouch.id = null;
+      }
+    };
 
     canvas.addEventListener('click', onClick);
     document.addEventListener('mousemove', onMouseMove);
     canvas.addEventListener('wheel', onWheel, { passive: true });
     canvas.addEventListener('mousedown', onMouseDown);
+    canvas.addEventListener('touchstart', onTouchStart, { passive: true });
+    canvas.addEventListener('touchmove', onTouchMove, { passive: true });
+    canvas.addEventListener('touchend', onTouchEnd, { passive: true });
+    canvas.addEventListener('touchcancel', onTouchEnd, { passive: true });
 
     const offPress = onKeyPress((code) => {
       const s = useGame.getState();
@@ -1765,8 +1901,13 @@ function Player() {
       document.removeEventListener('mousemove', onMouseMove);
       canvas.removeEventListener('wheel', onWheel);
       canvas.removeEventListener('mousedown', onMouseDown);
+      canvas.removeEventListener('touchstart', onTouchStart);
+      canvas.removeEventListener('touchmove', onTouchMove);
+      canvas.removeEventListener('touchend', onTouchEnd);
+      canvas.removeEventListener('touchcancel', onTouchEnd);
       offPress();
       unsub();
+      touchInput.attack = () => {};
     };
   }, [gl]);
 
@@ -1785,6 +1926,10 @@ function Player() {
       if (isKeyDown('KeyA')) moveX -= 1;
       if (isKeyDown('KeyD')) moveX += 1;
 
+      // ---- virtual joystick (touch) ----
+      moveX += touchInput.moveX;
+      moveZ += touchInput.moveZ;
+
       // ---- arrow keys: look around (alternative to mouse) ----
       const lookSpeed = 1.6; // radians/sec
       if (isKeyDown('ArrowLeft')) yaw.current += lookSpeed * delta;
@@ -1792,6 +1937,15 @@ function Player() {
       if (isKeyDown('ArrowUp')) pitch.current += lookSpeed * delta;
       if (isKeyDown('ArrowDown')) pitch.current -= lookSpeed * delta;
       pitch.current = Math.max(-1.2, Math.min(0.9, pitch.current));
+    }
+
+    // ---- touch drag-to-look ----
+    if (touchInput.lookDX !== 0 || touchInput.lookDY !== 0) {
+      yaw.current -= touchInput.lookDX * 0.0028;
+      pitch.current -= touchInput.lookDY * 0.0028;
+      pitch.current = Math.max(-1.2, Math.min(0.9, pitch.current));
+      touchInput.lookDX = 0;
+      touchInput.lookDY = 0;
     }
     const moving = moveX !== 0 || moveZ !== 0;
     const crouching = !panelOpen && isKeyDown('ControlLeft');
@@ -3254,6 +3408,138 @@ function BuildPanel() {
   `;
 }
 
+// ============================================================
+// TouchControls.js - on-screen joystick + action buttons for tablets/phones
+// ============================================================
+function TouchJoystick() {
+  const baseRef = useRef(null);
+  const thumbRef = useRef(null);
+  const touchId = useRef(null);
+
+  useEffect(() => {
+    const base = baseRef.current;
+    const thumb = thumbRef.current;
+    const radius = 50;
+
+    const setThumb = (dx, dy) => {
+      thumb.style.transform = `translate(${dx}px, ${dy}px)`;
+    };
+
+    const onStart = (e) => {
+      if (touchId.current !== null) return;
+      const t = e.changedTouches[0];
+      touchId.current = t.identifier;
+      e.preventDefault();
+    };
+    const update = (t) => {
+      const rect = base.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      let dx = t.clientX - cx;
+      let dy = t.clientY - cy;
+      const len = Math.hypot(dx, dy);
+      if (len > radius) {
+        dx = (dx / len) * radius;
+        dy = (dy / len) * radius;
+      }
+      setThumb(dx, dy);
+      touchInput.moveX = dx / radius;
+      touchInput.moveZ = dy / radius;
+    };
+    const onMove = (e) => {
+      for (const t of e.changedTouches) {
+        if (t.identifier === touchId.current) {
+          update(t);
+          e.preventDefault();
+        }
+      }
+    };
+    const onEnd = (e) => {
+      for (const t of e.changedTouches) {
+        if (t.identifier === touchId.current) {
+          touchId.current = null;
+          touchInput.moveX = 0;
+          touchInput.moveZ = 0;
+          setThumb(0, 0);
+        }
+      }
+    };
+
+    base.addEventListener('touchstart', onStart, { passive: false });
+    window.addEventListener('touchmove', onMove, { passive: false });
+    window.addEventListener('touchend', onEnd);
+    window.addEventListener('touchcancel', onEnd);
+    return () => {
+      base.removeEventListener('touchstart', onStart);
+      window.removeEventListener('touchmove', onMove);
+      window.removeEventListener('touchend', onEnd);
+      window.removeEventListener('touchcancel', onEnd);
+      touchInput.moveX = 0;
+      touchInput.moveZ = 0;
+    };
+  }, []);
+
+  return html`
+    <div class="touch-joystick" ref=${baseRef}>
+      <div class="touch-joystick-thumb" ref=${thumbRef}></div>
+    </div>
+  `;
+}
+
+// A button that sets a virtual key while held (for jump/sprint/crouch).
+function TouchHoldButton({ label, code, cls = '' }) {
+  const onStart = (e) => { e.preventDefault(); keys[code] = true; };
+  const onEnd = (e) => { e.preventDefault(); keys[code] = false; };
+  return html`
+    <div
+      class="touch-btn ${cls}"
+      ontouchstart=${onStart}
+      ontouchend=${onEnd}
+      ontouchcancel=${onEnd}
+    >${label}</div>
+  `;
+}
+
+// A button that fires a one-shot action on tap (interact/inventory/camera/etc).
+function TouchTapButton({ label, onTap, cls = '' }) {
+  const onStart = (e) => { e.preventDefault(); onTap(); };
+  return html`
+    <div class="touch-btn ${cls}" ontouchstart=${onStart}>${label}</div>
+  `;
+}
+
+function TouchControls() {
+  const nearInteractable = useGame((s) => s.nearInteractable);
+  const interactLabel = nearInteractable ? (KEY_LABELS[nearInteractable.key] || nearInteractable.key) : 'E';
+
+  return html`
+    <div class="touch-controls">
+      <${TouchJoystick} />
+      <div class="touch-actions">
+        <div class="touch-row">
+          <${TouchTapButton} label="🎒" cls="touch-btn-sm" onTap=${() => simulateKeyPress('Tab')} />
+          <${TouchTapButton} label="📷" cls="touch-btn-sm" onTap=${() => simulateKeyPress('KeyC')} />
+          <${TouchTapButton} label="🔁" cls="touch-btn-sm" onTap=${() => simulateKeyPress('KeyQ')} />
+          <${TouchTapButton} label="🔨" cls="touch-btn-sm" onTap=${() => simulateKeyPress('KeyB')} />
+        </div>
+        <div class="touch-row">
+          <${TouchHoldButton} label="🐾" code="ControlLeft" cls="touch-btn-sm" />
+          <${TouchHoldButton} label="💨" code="ShiftLeft" cls="touch-btn-sm" />
+          <${TouchHoldButton} label="⬆️" code="Space" cls="touch-btn-sm" />
+        </div>
+        <div class="touch-row touch-row-main">
+          <${TouchTapButton} label=${interactLabel} cls="touch-btn-lg" onTap=${() => {
+            const near = useGame.getState().nearInteractable;
+            if (near) near.onInteract();
+          }} />
+          <${TouchTapButton} label="🗡️" cls="touch-btn-lg" onTap=${() => simulateKeyPress('Slash')} />
+          <${TouchTapButton} label="⚔️" cls="touch-btn-lg touch-btn-attack" onTap=${() => touchInput.attack()} />
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function Hud() {
   const meters = useGame((s) => s.meters);
   const coins = useGame((s) => s.coins);
@@ -3314,6 +3600,8 @@ function Hud() {
       ${activePanel === 'shop' && html`<${ShopPanel} />`}
       ${activePanel === 'crafting' && html`<${CraftingPanel} />`}
       ${activePanel === 'build' && html`<${BuildPanel} />`}
+
+      ${isTouchDevice && !activePanel && html`<${TouchControls} />`}
     </div>
   `;
 }
@@ -3340,6 +3628,7 @@ function StartScreen() {
         &middot; Ctrl crouch &middot; F gather / drink &middot; E talk to Kito / shop / pick up weapon &middot; R craft at workbench
         &middot; B build menu &middot; Tab inventory &middot; Q cycle hotbar &middot; C toggle camera &middot; Scroll zoom &middot; Esc close menus
         &middot; Left Click attack (throws spear, swings other weapons) &middot; / poke with spear
+        &middot; On touch devices: drag the left joystick to move, drag anywhere to look, and use the on-screen buttons
       </div>
     </div>
   `;
