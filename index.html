@@ -15,7 +15,8 @@
     "@react-three/fiber": "https://esm.sh/@react-three/fiber@8.15.16?external=react,react-dom,three",
     "@react-three/drei": "https://esm.sh/@react-three/drei@9.99.0?external=react,react-dom,three,@react-three/fiber",
     "zustand": "https://esm.sh/zustand@4.5.2?external=react",
-    "htm": "https://esm.sh/htm@3.1.1"
+    "htm": "https://esm.sh/htm@3.1.1",
+    "peerjs": "https://esm.sh/peerjs@1.5.4"
   }
 }
 </script>
@@ -86,6 +87,24 @@ canvas {
   border-radius: 10px;
   padding: 6px 14px;
   font-size: 14px;
+}
+
+.mp-button {
+  position: absolute;
+  top: 16px;
+  right: 20px;
+  background: rgba(20, 20, 40, 0.6);
+  border: 2px solid #6a8fd8;
+  border-radius: 10px;
+  padding: 6px 14px;
+  font-size: 14px;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.mp-button.mp-connected {
+  border-color: #4a9c4a;
+  background: rgba(20, 50, 20, 0.6);
 }
 
 .raid-banner {
@@ -362,6 +381,44 @@ canvas {
   text-align: center;
 }
 
+.panel p.desc {
+  font-size: 13px;
+  color: #d8c8a8;
+  margin-bottom: 12px;
+  line-height: 1.4;
+}
+
+.mp-error {
+  color: #ff7a6a !important;
+}
+
+.mp-code-input {
+  margin-top: 6px;
+  width: 90px;
+  padding: 6px 8px;
+  font-size: 18px;
+  letter-spacing: 4px;
+  text-transform: uppercase;
+  text-align: center;
+  border-radius: 6px;
+  border: 1px solid #6a5224;
+  background: rgba(0,0,0,0.3);
+  color: #fdf3da;
+}
+
+.mp-code-display {
+  font-size: 42px;
+  font-weight: bold;
+  letter-spacing: 8px;
+  text-align: center;
+  color: #ffe27a;
+  background: rgba(0,0,0,0.3);
+  border: 2px solid #c9a227;
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 12px;
+}
+
 .inv-section {
   font-size: 12px;
   color: #ffe27a;
@@ -504,6 +561,7 @@ import * as THREE from 'three';
 import { useFrame, useThree, Canvas } from '@react-three/fiber';
 import { create } from 'zustand';
 import htm from 'htm';
+import { Peer } from 'peerjs';
 
 // JSX-like template tag, no build step required.
 // Usage: html`<mesh position=${[0,1,0]}><boxGeometry /></mesh>`
@@ -555,6 +613,115 @@ const touchInput = {
   lookDX: 0, lookDY: 0, // accumulated look-drag delta (pixels) since last frame
   attack: () => {}, // wired up by Player to throw/swing the equipped weapon
 };
+
+// ============================================================
+// multiplayer.js - optional 2-player peer-to-peer link via PeerJS
+// (uses PeerJS's free public broker only to help the two devices find
+// each other; gameplay data flows directly between the two browsers)
+// ============================================================
+const MP_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I
+function randomMpCode() {
+  let code = '';
+  for (let i = 0; i < 4; i++) code += MP_CODE_CHARS[Math.floor(Math.random() * MP_CODE_CHARS.length)];
+  return code;
+}
+
+// Live connection objects (not React state - these are imperative singletons).
+const mpState = { peer: null, conn: null };
+
+// Latest known state of the other player, read every frame by RemotePlayer.
+// position/yaw are interpolation targets; lerped toward in useFrame.
+const remotePlayer = {
+  active: false,
+  position: [0, 1, 8],
+  yaw: 0,
+  moving: false,
+  sprinting: false,
+  crouching: false,
+  equippedWeaponId: null,
+  attackSeq: 0,
+};
+
+function mpSetupConnection(conn) {
+  mpState.conn = conn;
+  conn.on('open', () => {
+    useGame.getState().setMpStatus('connected');
+    remotePlayer.active = true;
+  });
+  conn.on('data', (msg) => {
+    if (!msg || typeof msg !== 'object') return;
+    if (msg.t === 'state') {
+      remotePlayer.position = msg.position;
+      remotePlayer.yaw = msg.yaw;
+      remotePlayer.moving = msg.moving;
+      remotePlayer.sprinting = msg.sprinting;
+      remotePlayer.crouching = msg.crouching;
+      remotePlayer.equippedWeaponId = msg.equippedWeaponId;
+    } else if (msg.t === 'attack') {
+      remotePlayer.attackSeq++;
+    }
+  });
+  const onClose = () => {
+    remotePlayer.active = false;
+    if (mpState.conn === conn) {
+      mpState.conn = null;
+      useGame.getState().setMpStatus('offline');
+    }
+  };
+  conn.on('close', onClose);
+  conn.on('error', onClose);
+}
+
+function mpHost() {
+  mpDisconnect();
+  const code = randomMpCode();
+  const peer = new Peer(`jungleking-${code}`);
+  mpState.peer = peer;
+  useGame.getState().setMpStatus('hosting');
+  useGame.getState().setMpCode(code);
+  useGame.getState().setMpError(null);
+  peer.on('connection', (conn) => mpSetupConnection(conn));
+  peer.on('error', (err) => {
+    useGame.getState().setMpError(err && err.type === 'unavailable-id'
+      ? 'That code is in use, try hosting again for a new one.'
+      : 'Connection error: ' + (err && err.type || 'unknown'));
+    useGame.getState().setMpStatus('offline');
+  });
+}
+
+function mpJoin(code) {
+  mpDisconnect();
+  const peer = new Peer();
+  mpState.peer = peer;
+  useGame.getState().setMpStatus('connecting');
+  useGame.getState().setMpError(null);
+  peer.on('open', () => {
+    const conn = peer.connect(`jungleking-${code.trim().toUpperCase()}`);
+    mpSetupConnection(conn);
+  });
+  peer.on('error', (err) => {
+    useGame.getState().setMpError(err && err.type === 'peer-unavailable'
+      ? 'No game found with that code.'
+      : 'Connection error: ' + (err && err.type || 'unknown'));
+    useGame.getState().setMpStatus('offline');
+  });
+}
+
+function mpDisconnect() {
+  if (mpState.conn) { try { mpState.conn.close(); } catch (e) {} }
+  if (mpState.peer) { try { mpState.peer.destroy(); } catch (e) {} }
+  mpState.conn = null;
+  mpState.peer = null;
+  remotePlayer.active = false;
+  useGame.getState().setMpStatus('offline');
+  useGame.getState().setMpCode('');
+}
+
+function mpSend(msg) {
+  if (mpState.conn && mpState.conn.open) {
+    try { mpState.conn.send(msg); } catch (e) {}
+  }
+}
 
 // Lazily-created shared audio context for tiny procedural sound effects
 // (no audio assets in this project - everything is synthesized).
@@ -1227,6 +1394,14 @@ const useGame = create((set, get) => ({
   activeHotbarSlot: 0,
   setActiveHotbarSlot: (i) => set({ activeHotbarSlot: i }),
 
+  // --- multiplayer (P2P) ---
+  mpStatus: 'offline', // 'offline' | 'hosting' | 'connecting' | 'connected'
+  setMpStatus: (v) => set({ mpStatus: v }),
+  mpCode: '',
+  setMpCode: (v) => set({ mpCode: v }),
+  mpError: null,
+  setMpError: (v) => set({ mpError: v }),
+
   // --- toasts ---
   toasts: [],
   addToast: (msg) => {
@@ -1771,6 +1946,7 @@ function Player() {
   const lastNearId = useRef(null);
   const inWater = useRef(false);
   const attackTimer = useRef(0);
+  const mpSendTimer = useRef(0);
 
   const equippedWeaponId = useGame((s) => {
     const slot = s.hotbarSlots[s.activeHotbarSlot];
@@ -1802,6 +1978,7 @@ function Player() {
       attackTimer.current = ATTACK_DURATION;
       if (weapon.throwable) s.throwWeapon(slot);
       else { s.meleeAttack(slot); triggerWeaponFx(slot); }
+      mpSend({ t: 'attack' });
     };
     const onMouseDown = (e) => {
       if (e.button !== 0) return;
@@ -1885,6 +2062,7 @@ function Player() {
           attackTimer.current = ATTACK_DURATION;
           s.meleeAttack(slot);
           triggerWeaponFx(slot);
+          mpSend({ t: 'attack' });
         }
       }
     });
@@ -2130,6 +2308,21 @@ function Player() {
     }
 
     s.tickRespawns();
+
+    // ---- multiplayer: broadcast our transform a few times a second ----
+    mpSendTimer.current += delta;
+    if (mpSendTimer.current > 0.08) {
+      mpSendTimer.current = 0;
+      mpSend({
+        t: 'state',
+        position: [pos.x, pos.y, pos.z],
+        yaw: group.current.rotation.y,
+        moving,
+        sprinting,
+        crouching,
+        equippedWeaponId,
+      });
+    }
   });
 
   return html`
@@ -2185,6 +2378,113 @@ function Player() {
       </group>
     </group>
     <//>
+  `;
+}
+
+// ============================================================
+// RemotePlayer.js - visual representation of the other player (P2P multiplayer)
+// ============================================================
+function RemotePlayer() {
+  const group = useRef();
+  const leftArm = useRef();
+  const rightArm = useRef();
+  const leftLeg = useRef();
+  const rightLeg = useRef();
+  const limbPhase = useRef(0);
+  const attackTimer = useRef(0);
+  const lastAttackSeq = useRef(0);
+  const [visible, setVisible] = useState(false);
+  const [weaponId, setWeaponId] = useState(null);
+
+  useFrame((_, rawDelta) => {
+    const delta = Math.min(rawDelta, 0.1);
+    if (!remotePlayer.active) {
+      if (visible) setVisible(false);
+      return;
+    }
+    if (!visible) setVisible(true);
+    if (remotePlayer.equippedWeaponId !== weaponId) setWeaponId(remotePlayer.equippedWeaponId);
+
+    const g = group.current;
+    const [tx, ty, tz] = remotePlayer.position;
+    g.position.x += (tx - g.position.x) * 0.25;
+    g.position.y += (ty - g.position.y) * 0.25;
+    g.position.z += (tz - g.position.z) * 0.25;
+
+    let yawDiff = remotePlayer.yaw - g.rotation.y;
+    while (yawDiff > Math.PI) yawDiff -= Math.PI * 2;
+    while (yawDiff < -Math.PI) yawDiff += Math.PI * 2;
+    g.rotation.y += yawDiff * 0.25;
+
+    if (remotePlayer.attackSeq !== lastAttackSeq.current) {
+      lastAttackSeq.current = remotePlayer.attackSeq;
+      attackTimer.current = ATTACK_DURATION;
+    }
+
+    if (remotePlayer.moving) {
+      const speedFactor = remotePlayer.sprinting ? 2.2 : remotePlayer.crouching ? 1.0 : 1.6;
+      limbPhase.current += delta * speedFactor * 2.2;
+      const swing = Math.sin(limbPhase.current) * (remotePlayer.crouching ? 0.3 : 0.6);
+      if (leftArm.current) leftArm.current.rotation.x = swing;
+      if (rightArm.current) rightArm.current.rotation.x = -swing;
+      if (leftLeg.current) leftLeg.current.rotation.x = -swing;
+      if (rightLeg.current) rightLeg.current.rotation.x = swing;
+    } else {
+      if (leftArm.current) leftArm.current.rotation.x *= 0.9;
+      if (rightArm.current) rightArm.current.rotation.x *= 0.9;
+      if (leftLeg.current) leftLeg.current.rotation.x *= 0.9;
+      if (rightLeg.current) rightLeg.current.rotation.x *= 0.9;
+    }
+
+    if (attackTimer.current > 0) {
+      attackTimer.current -= delta;
+      const progress = 1 - attackTimer.current / ATTACK_DURATION;
+      if (rightArm.current) rightArm.current.rotation.x = -Math.sin(progress * Math.PI) * 1.8;
+    }
+  });
+
+  return html`
+    <group ref=${group} visible=${visible} position=${[remotePlayer.position[0], remotePlayer.position[1], remotePlayer.position[2]]}>
+      <!-- torso -->
+      <mesh position=${[0, 1.1, 0]} castShadow=${true}>
+        <capsuleGeometry args=${[0.28, 0.6, 4, 8]} />
+        <meshStandardMaterial color="#8a5a3f" roughness=${0.7} />
+      </mesh>
+      <!-- head -->
+      <mesh position=${[0, 1.78, 0]} castShadow=${true}>
+        <sphereGeometry args=${[0.24, 12, 12]} />
+        <meshStandardMaterial color="#d8a878" roughness=${0.8} />
+      </mesh>
+      <!-- left arm -->
+      <group ref=${leftArm} position=${[0.36, 1.35, 0]}>
+        <mesh position=${[0, -0.32, 0]} castShadow=${true}>
+          <capsuleGeometry args=${[0.08, 0.5, 4, 6]} />
+          <meshStandardMaterial color="#d8a878" roughness=${0.8} />
+        </mesh>
+      </group>
+      <!-- right arm -->
+      <group ref=${rightArm} position=${[-0.36, 1.35, 0]}>
+        <mesh position=${[0, -0.32, 0]} castShadow=${true}>
+          <capsuleGeometry args=${[0.08, 0.5, 4, 6]} />
+          <meshStandardMaterial color="#d8a878" roughness=${0.8} />
+        </mesh>
+        ${weaponId && html`<${HeldWeapon} id=${weaponId} />`}
+      </group>
+      <!-- left leg -->
+      <group ref=${leftLeg} position=${[0.14, 0.75, 0]}>
+        <mesh position=${[0, -0.35, 0]} castShadow=${true}>
+          <capsuleGeometry args=${[0.1, 0.55, 4, 6]} />
+          <meshStandardMaterial color="#5a4632" roughness=${0.8} />
+        </mesh>
+      </group>
+      <!-- right leg -->
+      <group ref=${rightLeg} position=${[-0.14, 0.75, 0]}>
+        <mesh position=${[0, -0.35, 0]} castShadow=${true}>
+          <capsuleGeometry args=${[0.1, 0.55, 4, 6]} />
+          <meshStandardMaterial color="#5a4632" roughness=${0.8} />
+        </mesh>
+      </group>
+    </group>
   `;
 }
 
@@ -3409,6 +3709,65 @@ function BuildPanel() {
 }
 
 // ============================================================
+// MultiplayerPanel.js - peer-to-peer connect screen
+// ============================================================
+function MultiplayerPanel() {
+  const setActivePanel = useGame((s) => s.setActivePanel);
+  const mpStatus = useGame((s) => s.mpStatus);
+  const mpCode = useGame((s) => s.mpCode);
+  const mpError = useGame((s) => s.mpError);
+  const [joinCode, setJoinCode] = useState('');
+
+  return html`
+    <div class="panel-overlay" onClick=${() => setActivePanel(null)}>
+      <div class="panel" onClick=${(e) => e.stopPropagation()}>
+        <h2>Multiplayer</h2>
+        ${mpStatus === 'offline' && html`
+          <p class="desc">Play together over the internet - no accounts needed. One of you hosts and shares a 4-letter code, the other joins with it.</p>
+          <div class="craft-item">
+            <div>
+              <div class="name">Host a game</div>
+              <div class="desc">Creates a code for your brother to join.</div>
+            </div>
+            <button class="craft-btn" onClick=${() => mpHost()}>Host</button>
+          </div>
+          <div class="craft-item">
+            <div>
+              <div class="name">Join a game</div>
+              <div class="desc">Enter the code your brother gives you.</div>
+              <input
+                class="mp-code-input"
+                value=${joinCode}
+                maxLength=${4}
+                placeholder="CODE"
+                onChange=${(e) => setJoinCode(e.target.value.toUpperCase())}
+              />
+            </div>
+            <button class="craft-btn" disabled=${joinCode.trim().length !== 4} onClick=${() => mpJoin(joinCode)}>Join</button>
+          </div>
+          ${mpError && html`<p class="desc mp-error">${mpError}</p>`}
+        `}
+        ${mpStatus === 'hosting' && html`
+          <p class="desc">Share this code with your brother:</p>
+          <div class="mp-code-display">${mpCode}</div>
+          <p class="desc">Waiting for them to join...</p>
+          <button class="craft-btn" onClick=${() => mpDisconnect()}>Cancel</button>
+        `}
+        ${mpStatus === 'connecting' && html`
+          <p class="desc">Connecting...</p>
+          <button class="craft-btn" onClick=${() => mpDisconnect()}>Cancel</button>
+        `}
+        ${mpStatus === 'connected' && html`
+          <p class="desc">Connected! You can see and fight alongside each other in the jungle.</p>
+          <button class="craft-btn" onClick=${() => mpDisconnect()}>Disconnect</button>
+        `}
+        <p class="close-hint">Tab or Esc to close</p>
+      </div>
+    </div>
+  `;
+}
+
+// ============================================================
 // TouchControls.js - on-screen joystick + action buttons for tablets/phones
 // ============================================================
 function TouchJoystick() {
@@ -3553,6 +3912,8 @@ function Hud() {
   const hotbarSlots = useGame((s) => s.hotbarSlots);
   const activeHotbarSlot = useGame((s) => s.activeHotbarSlot);
   const inventory = useGame((s) => s.inventory);
+  const mpStatus = useGame((s) => s.mpStatus);
+  const setActivePanel = useGame((s) => s.setActivePanel);
 
   return html`
     <div id="hud">
@@ -3563,6 +3924,10 @@ function Hud() {
       </div>
       <div class="day-clock">🕐 ${formatTime(timeOfDay)}</div>
       <div class="tribe-panel">⚔️ ${warriors} warriors</div>
+
+      <div class="mp-button ${mpStatus === 'connected' ? 'mp-connected' : ''}" onClick=${() => setActivePanel(activePanel === 'multiplayer' ? null : 'multiplayer')}>
+        🌐 ${mpStatus === 'connected' ? 'Friend Online' : 'Multiplayer'}
+      </div>
 
       ${raid && html`
         <div class="raid-banner">⚠️ ${raid.tribeName} is attacking! Raiders incoming: ${raid.raiders.length}</div>
@@ -3600,6 +3965,7 @@ function Hud() {
       ${activePanel === 'shop' && html`<${ShopPanel} />`}
       ${activePanel === 'crafting' && html`<${CraftingPanel} />`}
       ${activePanel === 'build' && html`<${BuildPanel} />`}
+      ${activePanel === 'multiplayer' && html`<${MultiplayerPanel} />`}
 
       ${isTouchDevice && !activePanel && html`<${TouchControls} />`}
     </div>
@@ -3629,6 +3995,7 @@ function StartScreen() {
         &middot; B build menu &middot; Tab inventory &middot; Q cycle hotbar &middot; C toggle camera &middot; Scroll zoom &middot; Esc close menus
         &middot; Left Click attack (throws spear, swings other weapons) &middot; / poke with spear
         &middot; On touch devices: drag the left joystick to move, drag anywhere to look, and use the on-screen buttons
+        &middot; Click the 🌐 Multiplayer button (top right) to play together with a friend
       </div>
     </div>
   `;
@@ -3647,6 +4014,7 @@ function App() {
       <${Canvas} shadows=${true} camera=${{ fov: 70, near: 0.1, far: 500, position: [0, 2, 14] }}>
         <${World} />
         <${Player} />
+        <${RemotePlayer} />
         <${Resources} />
         <${LootPickups} />
         <${GroundWeapons} />
