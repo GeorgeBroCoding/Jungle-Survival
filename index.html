@@ -3493,9 +3493,9 @@ function TouchHoldButton({ label, code, cls = '' }) {
   return html`
     <div
       class="touch-btn ${cls}"
-      ontouchstart=${onStart}
-      ontouchend=${onEnd}
-      ontouchcancel=${onEnd}
+      onTouchStart=${onStart}
+      onTouchEnd=${onEnd}
+      onTouchCancel=${onEnd}
     >${label}</div>
   `;
 }
@@ -3504,7 +3504,7 @@ function TouchHoldButton({ label, code, cls = '' }) {
 function TouchTapButton({ label, onTap, cls = '' }) {
   const onStart = (e) => { e.preventDefault(); onTap(); };
   return html`
-    <div class="touch-btn ${cls}" ontouchstart=${onStart}>${label}</div>
+    <div class="touch-btn ${cls}" onTouchStart=${onStart}>${label}</div>
   `;
 }
 
