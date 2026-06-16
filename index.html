@@ -849,7 +849,7 @@ const playerTransform = { position: [0, 0, 8], yaw: 0 };
 
 // Live world positions of animals/raiders/tribe members, updated every frame
 // by their own components. Read by combat actions to avoid per-frame store churn.
-const entityRegistry = { animals: {}, raiders: {}, tribeMembers: {}, distantRaiders: {} };
+const entityRegistry = { animals: {}, raiders: {}, tribeMembers: {}, distantRaiders: {}, interTribalRaiders: {} };
 
 // ============================================================
 // interactions.js - "walk up and press a key" registry
@@ -1371,12 +1371,18 @@ const useGame = create((set, get) => ({
 
   // --- captured rival camps: become the player's once every member is defeated ---
   capturedTribes: {},
+  campOwners: {}, // { [tribeId]: ownerTribeId } — which enemy tribe currently controls this camp
+  setCampOwner: (tribeId, ownerId) => set((s) => ({ campOwners: { ...s.campOwners, [tribeId]: ownerId } })),
   checkCampCapture: (tribeId) => {
     if (get().capturedTribes[tribeId]) return;
     const state = get().tribeMemberState;
     const allDown = TRIBE_MEMBER_OFFSETS.every((_, i) => !state[`${tribeId}_m${i}`]?.alive);
     if (!allDown) return;
-    set((s) => ({ capturedTribes: { ...s.capturedTribes, [tribeId]: true } }));
+    set((s) => {
+      const campOwners = { ...s.campOwners };
+      delete campOwners[tribeId];
+      return { capturedTribes: { ...s.capturedTribes, [tribeId]: true }, campOwners };
+    });
     get().addMeters(CAMP_CAPTURE_REWARD.meters);
     get().addCoins(CAMP_CAPTURE_REWARD.coins);
     const tribe = ENEMY_TRIBES.find((t) => t.id === tribeId);
@@ -1460,12 +1466,25 @@ const useGame = create((set, get) => ({
         if (dot > Math.cos(ATTACK_CONE / 2) && dist <= bestDist) { best = { kind: 'distantRaider', id: r.id, dist }; bestDist = dist; }
       }
     }
+    const itr = get().interTribalRaid;
+    if (itr) {
+      for (const r of itr.raiders) {
+        const pos = entityRegistry.interTribalRaiders[r.id];
+        if (!pos) continue;
+        const dx = pos.x - px, dz = pos.z - pz;
+        const dist = Math.hypot(dx, dz);
+        if (dist > range || dist === 0) continue;
+        const dot = (dx / dist) * dirX + (dz / dist) * dirZ;
+        if (dot > Math.cos(ATTACK_CONE / 2) && dist <= bestDist) { best = { kind: 'interTribalRaider', id: r.id, dist }; bestDist = dist; }
+      }
+    }
     return best;
   },
   applyDamageToTarget: (target, dmg) => {
     if (target.kind === 'animal') get().damageAnimal(target.id, dmg);
     else if (target.kind === 'raider') get().damageRaider(target.id, dmg);
     else if (target.kind === 'distantRaider') get().damageDistantRaider(target.id, dmg);
+    else if (target.kind === 'interTribalRaider') get().damageInterTribalRaider(target.id, dmg);
     else if (target.kind === 'tribeMember') {
       // Rival tribe camps are simulated on the host; joiners ask the host
       // to apply the damage so health/captures stay in sync for both players.
@@ -1796,6 +1815,63 @@ const useGame = create((set, get) => ({
       get().addToast('Distant raider struck down!');
     } else {
       set({ distantRaid: { ...dr, raiders: dr.raiders.map((r) => (r.id === raiderId ? { ...r, health } : r)) } });
+    }
+  },
+
+  // --- inter-tribal warfare: enemy tribes raid each other's camps ---
+  interTribalRaid: null,
+  startInterTribalRaid: () => {
+    if (get().interTribalRaid) return;
+    const s = get();
+    const active = s.activeTribeIds;
+    if (active.length < 2) return;
+    const attackerCandidates = active.filter((id) => !s.capturedTribes[id]);
+    if (!attackerCandidates.length) return;
+    const attackerId = attackerCandidates[Math.floor(Math.random() * attackerCandidates.length)];
+    const targetCandidates = active.filter((id) => id !== attackerId);
+    if (!targetCandidates.length) return;
+    const targetId = targetCandidates[Math.floor(Math.random() * targetCandidates.length)];
+    const attacker = ENEMY_TRIBES.find((t) => t.id === attackerId);
+    const target = ENEMY_TRIBES.find((t) => t.id === targetId);
+    const count = 2 + Math.floor(Math.random() * 2);
+    const raiders = Array.from({ length: count }, (_, i) => ({
+      id: `itr_${Date.now()}_${i}`,
+      health: 30,
+      position: [attacker.campPosition[0] + (Math.random() - 0.5) * 8, 0, attacker.campPosition[2] + (Math.random() - 0.5) * 8],
+    }));
+    const targetLabel = s.capturedTribes[targetId] ? `${target.name}'s camp (yours!)` : target.name;
+    set({ interTribalRaid: { attackerId, attackerName: attacker.name, attackerColor: attacker.color, targetId, targetName: target.name, targetPos: target.campPosition, raiders } });
+    get().addToast(`⚔️ ${attacker.name} attacks ${targetLabel}!`);
+  },
+  resolveInterTribalRaider: (raiderId, raiderWon) => {
+    const itr = get().interTribalRaid;
+    if (!itr) return;
+    const raiders = itr.raiders.filter((r) => r.id !== raiderId);
+    set({ interTribalRaid: raiders.length ? { ...itr, raiders } : null });
+    if (raiderWon) {
+      if (get().capturedTribes[itr.targetId]) {
+        get().damageGarrison(itr.targetId, 30);
+      } else {
+        const prevOwner = get().campOwners[itr.targetId];
+        get().setCampOwner(itr.targetId, itr.attackerId);
+        const target = ENEMY_TRIBES.find((t) => t.id === itr.targetId);
+        const prevName = prevOwner ? ENEMY_TRIBES.find((t) => t.id === prevOwner)?.name : target.name;
+        get().addToast(`${itr.attackerName} has claimed ${prevName}'s camp!`);
+      }
+    }
+    if (!raiders.length) get().addToast(`${itr.attackerName} retreats!`);
+  },
+  damageInterTribalRaider: (raiderId, dmg) => {
+    const itr = get().interTribalRaid;
+    if (!itr) return;
+    const raider = itr.raiders.find((r) => r.id === raiderId);
+    if (!raider) return;
+    const health = (raider.health ?? 30) - dmg;
+    if (health <= 0) {
+      get().resolveInterTribalRaider(raiderId, false);
+      get().addToast('Warring tribesperson struck down!');
+    } else {
+      set({ interTribalRaid: { ...itr, raiders: itr.raiders.map((r) => (r.id === raiderId ? { ...r, health } : r)) } });
     }
   },
 
@@ -3522,11 +3598,18 @@ function TribeMember({ id, spawn, color }) {
 
 // ---------- A rival tribe's camp: tents, totem and a few wandering members ----------
 // When captured it becomes a "team" — it keeps its own colour/identity but flies a yellow
-// alliance flag and its garrison warriors also wear the team's colour.
+// alliance flag; garrison warriors are always the player's yellow.
+// Inter-tribal conquests repaint the camp in the conquering tribe's colour.
 function TribeCamp({ tribe }) {
   const [x, , z] = tribe.campPosition;
   const captured = useGame((s) => !!s.capturedTribes[tribe.id]);
+  const campOwner = useGame((s) => s.campOwners[tribe.id] ?? null);
   const garrisonHP = useGame((s) => s.garrisonHP[tribe.id] ?? 0);
+  const campColor = captured
+    ? PLAYER_TRIBE_COLOR
+    : campOwner
+    ? ENEMY_TRIBES.find((t) => t.id === campOwner)?.color ?? tribe.color
+    : tribe.color;
   const garrisonCount = captured
     ? garrisonHP <= 0 ? 0 : garrisonHP <= 34 ? 1 : garrisonHP <= 67 ? 2 : 3
     : 0;
@@ -3537,7 +3620,7 @@ function TribeCamp({ tribe }) {
           <group key=${i} position=${[p[0], 0, p[1]]}>
             <mesh position=${[0, 0.9, 0]} castShadow=${true} receiveShadow=${true}>
               <coneGeometry args=${[1.4, 1.8, 7]} />
-              <meshStandardMaterial color=${tribe.color} flatShading=${true} roughness=${0.9} />
+              <meshStandardMaterial color=${campColor} flatShading=${true} roughness=${0.9} />
             </mesh>
           </group>
         `)}
@@ -3547,7 +3630,7 @@ function TribeCamp({ tribe }) {
         </mesh>
         <mesh position=${[0, 3.2, 0]} castShadow=${true}>
           <coneGeometry args=${[0.4, 0.6, 5]} />
-          <meshStandardMaterial color=${tribe.color} flatShading=${true} />
+          <meshStandardMaterial color=${campColor} flatShading=${true} />
         </mesh>
         ${captured && html`
           <mesh position=${[0.55, 3.7, 0]} castShadow=${true}>
@@ -3557,10 +3640,10 @@ function TribeCamp({ tribe }) {
         `}
       </group>
       ${!captured && TRIBE_MEMBER_OFFSETS.map((p, i) => html`
-        <${TribeMember} key=${i} id=${`${tribe.id}_m${i}`} spawn=${[x + p[0], 0, z + p[1]]} color=${tribe.color} />
+        <${TribeMember} key=${i} id=${`${tribe.id}_m${i}`} spawn=${[x + p[0], 0, z + p[1]]} color=${campColor} />
       `)}
       ${GARRISON_OFFSETS.slice(0, garrisonCount).map((p, i) => html`
-        <${PlayerWarrior} key=${`g${i}`} spawn=${[x + p[0], 0, z + p[1]]} color=${tribe.color} />
+        <${PlayerWarrior} key=${`g${i}`} spawn=${[x + p[0], 0, z + p[1]]} />
       `)}
     <//>
   `;
@@ -3762,6 +3845,14 @@ function useEscortAI(group, index) {
         if (d < bestDist) { bestDist = d; target = { kind: 'distantRaider', id: r.id, pos: p }; }
       }
     }
+    if (s.interTribalRaid) {
+      for (const r of s.interTribalRaid.raiders) {
+        const p = entityRegistry.interTribalRaiders[r.id];
+        if (!p) continue;
+        const d = Math.hypot(p.x - pos.x, p.z - pos.z);
+        if (d < bestDist) { bestDist = d; target = { kind: 'interTribalRaider', id: r.id, pos: p }; }
+      }
+    }
 
     let tx, tz;
     if (target) {
@@ -3789,6 +3880,8 @@ function useEscortAI(group, index) {
           else s.damageTribeMember(target.id, ESCORT_ATTACK_DAMAGE);
         } else if (target.kind === 'distantRaider') {
           s.damageDistantRaider(target.id, ESCORT_ATTACK_DAMAGE);
+        } else if (target.kind === 'interTribalRaider') {
+          s.damageInterTribalRaider(target.id, ESCORT_ATTACK_DAMAGE);
         } else {
           s.damageRaider(target.id, ESCORT_ATTACK_DAMAGE);
         }
@@ -4055,6 +4148,90 @@ function DistantRaidManager() {
     if (timer.current <= 0) {
       s.startDistantRaid();
       timer.current = 150 + Math.random() * 120;
+    }
+  });
+  return null;
+}
+
+// ---------- Inter-tribal raiders: enemy tribes marching on each other's camps ----------
+function InterTribalRaider({ id, startPosition, color, targetPos }) {
+  const group = useRef();
+  const legL = useRef();
+  const legR = useRef();
+  const phase = useRef(Math.random() * 10);
+  const resolved = useRef(false);
+
+  useEffect(() => {
+    return () => { delete entityRegistry.interTribalRaiders[id]; };
+  }, [id]);
+
+  useFrame((_, rawDelta) => {
+    if (resolved.current || !group.current) return;
+    const delta = Math.min(rawDelta, 0.1);
+    const pos = group.current.position;
+    entityRegistry.interTribalRaiders[id] = pos;
+
+    const dx = targetPos[0] - pos.x;
+    const dz = targetPos[2] - pos.z;
+    const dist = Math.hypot(dx, dz);
+
+    if (dist < 3) {
+      resolved.current = true;
+      useGame.getState().resolveInterTribalRaider(id, true);
+      return;
+    }
+
+    const speed = 2.8;
+    pos.x += (dx / dist) * speed * delta;
+    pos.z += (dz / dist) * speed * delta;
+    group.current.rotation.y = Math.atan2(dx, dz);
+    phase.current += delta * speed * 3;
+    const swing = Math.sin(phase.current) * 0.4;
+    if (legL.current) legL.current.rotation.x = swing;
+    if (legR.current) legR.current.rotation.x = -swing;
+  });
+
+  return html`
+    <group ref=${group} position=${startPosition}>
+      <${TribalFigure} color=${color} />
+      <group ref=${legL} position=${[0.12, 0.55, 0]}>
+        <mesh position=${[0, -0.3, 0]} castShadow=${true}><capsuleGeometry args=${[0.09, 0.5, 4, 6]} /><meshStandardMaterial color="#5a4632" /></mesh>
+      </group>
+      <group ref=${legR} position=${[-0.12, 0.55, 0]}>
+        <mesh position=${[0, -0.3, 0]} castShadow=${true}><capsuleGeometry args=${[0.09, 0.5, 4, 6]} /><meshStandardMaterial color="#5a4632" /></mesh>
+      </group>
+      <mesh position=${[0, 1.3, 0.3]} rotation=${[Math.PI / 2.4, 0, 0]} castShadow=${true}>
+        <cylinderGeometry args=${[0.02, 0.02, 1, 5]} />
+        <meshStandardMaterial color="#5a4632" />
+      </mesh>
+    </group>
+  `;
+}
+
+function InterTribalRaiders() {
+  const itr = useGame((s) => s.interTribalRaid);
+  if (!itr) return null;
+  return html`
+    <${Fragment}>
+      ${itr.raiders.map((r) => html`
+        <${InterTribalRaider} key=${r.id} id=${r.id} startPosition=${r.position} color=${itr.attackerColor} targetPos=${itr.targetPos} />
+      `)}
+    <//>
+  `;
+}
+
+function InterTribalRaidManager() {
+  const timer = useRef(90 + Math.random() * 60);
+  useFrame((_, rawDelta) => {
+    const delta = Math.min(rawDelta, 0.1);
+    const s = useGame.getState();
+    if (s.mpRole === 'joiner') return;
+    if (s.interTribalRaid) return;
+    if (s.activeTribeIds.length < 2) return;
+    timer.current -= delta;
+    if (timer.current <= 0) {
+      s.startInterTribalRaid();
+      timer.current = 80 + Math.random() * 70;
     }
   });
   return null;
@@ -4815,6 +4992,8 @@ function App() {
         <${Buildings} />
         <${Raiders} />
         <${RaidManager} />
+        <${InterTribalRaiders} />
+        <${InterTribalRaidManager} />
         <${CoinDrops} />
         <${CoinDropManager} />
       <//>
