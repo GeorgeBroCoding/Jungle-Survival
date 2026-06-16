@@ -358,6 +358,47 @@ canvas {
   to { opacity: 1; transform: translateY(0); }
 }
 
+.notif-btn {
+  position: absolute;
+  top: 16px;
+  right: 155px;
+  background: rgba(20,15,8,0.65);
+  border: 1px solid rgba(255,255,255,0.2);
+  border-radius: 8px;
+  color: #fdf3da;
+  font-size: 14px;
+  padding: 6px 12px;
+  cursor: pointer;
+  pointer-events: auto;
+  z-index: 10;
+}
+.notif-panel {
+  position: absolute;
+  top: 50px;
+  right: 20px;
+  width: 300px;
+  max-height: 400px;
+  background: rgba(20,15,8,0.93);
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 10px;
+  padding: 10px 12px;
+  overflow-y: auto;
+  pointer-events: auto;
+  z-index: 10;
+}
+.notif-panel h3 { margin: 0 0 8px; font-size: 13px; color: #f0d060; letter-spacing: 1px; }
+.notif-entry {
+  padding: 4px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.07);
+  font-size: 12px;
+  color: #d0c8b0;
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+.notif-entry.chat { color: #8abfff; }
+.notif-time { color: rgba(255,255,255,0.3); min-width: 32px; font-size: 11px; flex-shrink: 0; }
+
 .chat-log {
   position: absolute;
   left: 20px;
@@ -1023,6 +1064,10 @@ const ENEMY_TRIBES = [
   { id: 'skullriver', name: 'Skull River Tribe', color: '#9b59b6', campPosition: [-110, 0, 100] },
   { id: 'ironvale', name: 'Ironvale Marauders', color: '#e08e2b', campPosition: [140, 0, 10] },
   { id: 'frostfang', name: 'Frostfang Horde', color: '#5bc8e0', campPosition: [-20, 0, 150] },
+  { id: 'sandriders', name: 'Sand Riders', color: '#c9a640', campPosition: [130, 0, -70] },
+  { id: 'permafrost', name: 'Permafrost Clan', color: '#a8d8e8', campPosition: [-55, 0, -150] },
+  { id: 'cinderwolves', name: 'Cinder Wolves', color: '#c04820', campPosition: [-140, 0, -85] },
+  { id: 'bogwalkers', name: 'Bogwalkers', color: '#4a7a3a', campPosition: [20, 0, 155] },
 ];
 
 const ENEMY_TRIBES_INITIAL_COUNT = 3;
@@ -1532,13 +1577,13 @@ const useGame = create((set, get) => ({
     get().addToast(target ? `Spear hit its mark! Go pick it back up.` : `Spear thrown! Go pick it back up.`);
     return true;
   },
-  landSpear: (id) => {
+  landSpear: (id, posOverride) => {
     set((s) => {
       const spear = s.flyingSpears.find((f) => f.id === id);
       if (!spear) return {};
       return {
         flyingSpears: s.flyingSpears.filter((f) => f.id !== id),
-        groundWeapons: [...s.groundWeapons, { id: spear.id, weaponId: spear.weaponId, position: spear.end }],
+        groundWeapons: [...s.groundWeapons, { id: spear.id, weaponId: spear.weaponId, position: posOverride ?? spear.end }],
       };
     });
   },
@@ -1603,6 +1648,7 @@ const useGame = create((set, get) => ({
   addToast: (msg) => {
     const id = ++toastId;
     set((s) => ({ toasts: [...s.toasts, { id, msg }] }));
+    get().addNotification(msg, 'game');
     setTimeout(() => {
       set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));
     }, 3000);
@@ -1615,10 +1661,22 @@ const useGame = create((set, get) => ({
   addChatMessage: (from, text) => {
     const id = ++chatId;
     set((s) => ({ chatMessages: [...s.chatMessages, { id, from, text }] }));
+    get().addNotification(`${from === 'me' ? 'You' : 'Friend'}: ${text}`, 'chat');
     setTimeout(() => {
       set((s) => ({ chatMessages: s.chatMessages.filter((m) => m.id !== id) }));
     }, 8000);
   },
+
+  // --- notifications (persistent log) ---
+  notifications: [],
+  notifUnread: 0,
+  addNotification: (msg, type = 'game') => {
+    set((s) => ({
+      notifications: [...s.notifications.slice(-99), { id: Date.now() + Math.random(), msg, type, time: Date.now() }],
+      notifUnread: s.notifUnread + 1,
+    }));
+  },
+  clearNotifUnread: () => set({ notifUnread: 0 }),
 
   // --- coins (separate currency, collected from sky drops) ---
   coins: 0,
@@ -2099,6 +2157,26 @@ function getTerrainHeight(x, z) {
   return h;
 }
 
+// ---------- Biomes ----------
+const BIOME_ZONES = [
+  { cx: 0,    cz: 0,    r: 65,  color: [0.28, 0.52, 0.18] }, // jungle (center)
+  { cx: 155,  cz: -50,  r: 115, color: [0.80, 0.66, 0.24] }, // desert (NE)
+  { cx: -45,  cz: -175, r: 115, color: [0.82, 0.88, 0.92] }, // snow (N)
+  { cx: -155, cz: -100, r: 110, color: [0.15, 0.10, 0.07] }, // volcanic (W)
+  { cx: 30,   cz: 175,  r: 110, color: [0.18, 0.34, 0.16] }, // swamp (S)
+];
+function getBiomeColor(x, z) {
+  let tw = 0, r = 0, g = 0, b = 0;
+  for (const zone of BIOME_ZONES) {
+    const dx = x - zone.cx, dz = z - zone.cz;
+    const w = Math.exp(-(dx * dx + dz * dz) / (2 * zone.r * zone.r));
+    tw += w; r += zone.color[0] * w; g += zone.color[1] * w; b += zone.color[2] * w;
+  }
+  if (tw > 0) { r /= tw; g /= tw; b /= tw; }
+  const n = Math.sin(x * 3.73 + z * 2.31) * Math.sin(z * 4.17 - x * 1.91) * 0.04;
+  return [Math.min(1, Math.max(0, r + n)), Math.min(1, Math.max(0, g + n * 1.1)), Math.min(1, Math.max(0, b + n * 0.9))];
+}
+
 // ---------- Ground ----------
 const TERRAIN_SIZE = 600;
 const TERRAIN_SEGMENTS = 100;
@@ -2109,6 +2187,7 @@ function createTerrainGeometry() {
   const seg = TERRAIN_SEGMENTS;
   const positions = [];
   const uvs = [];
+  const colors = [];
   const indices = [];
   for (let iz = 0; iz <= seg; iz++) {
     for (let ix = 0; ix <= seg; ix++) {
@@ -2116,6 +2195,8 @@ function createTerrainGeometry() {
       const z = -half + (iz / seg) * TERRAIN_SIZE;
       positions.push(x, getTerrainHeight(x, z), z);
       uvs.push(ix / seg, iz / seg);
+      const [cr, cg, cb] = getBiomeColor(x, z);
+      colors.push(cr, cg, cb);
     }
   }
   for (let iz = 0; iz < seg; iz++) {
@@ -2130,16 +2211,16 @@ function createTerrainGeometry() {
   geo.setIndex(indices);
   geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
   geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
   geo.computeVertexNormals();
   return geo;
 }
 
 function Ground() {
-  const tex = useMemo(() => createGrassTexture(), []);
   const geo = useMemo(() => createTerrainGeometry(), []);
   return html`
     <mesh geometry=${geo} receiveShadow=${true}>
-      <meshStandardMaterial map=${tex} roughness=${1} />
+      <meshStandardMaterial vertexColors=${true} roughness=${0.9} />
     </mesh>
   `;
 }
@@ -2673,6 +2754,7 @@ function Player() {
       camPos.x -= forward.x * dist * Math.cos(pitch.current);
       camPos.z -= forward.z * dist * Math.cos(pitch.current);
       camPos.y += 1.6 + Math.sin(pitch.current) * dist * -1 + dist * 0.5;
+      camPos.y = Math.max(camPos.y, getTerrainHeight(camPos.x, camPos.z) + 0.5);
       camera.position.lerp(camPos, 0.25);
       camera.lookAt(pos.x, pos.y + 1.4, pos.z);
       bodyVisual.current && (bodyVisual.current.visible = true);
@@ -3047,11 +3129,12 @@ function FlyingSpear({ spear }) {
     const t = Math.min(1, (Date.now() - spear.startedAt) / 1000 / duration.current);
     const x = spear.start[0] + (spear.end[0] - spear.start[0]) * t;
     const z = spear.start[2] + (spear.end[2] - spear.start[2]) * t;
-    const y = spear.start[1] + (spear.end[1] - spear.start[1]) * t + Math.sin(t * Math.PI) * 1.2;
-    group.current.position.set(x, y, z);
-    if (t >= 1) {
+    const arcY = spear.start[1] + (spear.end[1] - spear.start[1]) * t + Math.sin(t * Math.PI) * 1.2;
+    const terrY = getTerrainHeight(x, z);
+    group.current.position.set(x, Math.max(arcY, terrY + 0.05), z);
+    if (t >= 1 || (arcY < terrY + 0.1 && t > 0.05)) {
       landed.current = true;
-      useGame.getState().landSpear(spear.id);
+      useGame.getState().landSpear(spear.id, [x, terrY + 0.05, z]);
     }
   });
 
@@ -4854,6 +4937,11 @@ function Hud() {
   const setChatOpen = useGame((s) => s.setChatOpen);
   const addChatMessage = useGame((s) => s.addChatMessage);
   const [chatText, setChatText] = useState('');
+  const notifications = useGame((s) => s.notifications);
+  const notifUnread = useGame((s) => s.notifUnread);
+  const clearNotifUnread = useGame((s) => s.clearNotifUnread);
+  const [notifOpen, setNotifOpen] = useState(false);
+  const toggleNotif = () => { if (!notifOpen) clearNotifUnread(); setNotifOpen((v) => !v); };
 
   const sendChat = () => {
     const text = chatText.trim();
@@ -4880,6 +4968,25 @@ function Hud() {
       <div class="mp-button ${mpStatus === 'connected' ? 'mp-connected' : ''}" onClick=${() => setActivePanel(activePanel === 'multiplayer' ? null : 'multiplayer')}>
         🌐 ${mpStatus === 'connected' ? 'Friend Online' : 'Multiplayer'}
       </div>
+
+      <button class="notif-btn" onClick=${toggleNotif}>
+        🔔${notifUnread > 0 ? ` ${notifUnread}` : ''}
+      </button>
+
+      ${notifOpen && html`
+        <div class="notif-panel">
+          <h3>NOTIFICATIONS</h3>
+          ${notifications.length === 0 && html`<div style="color:rgba(255,255,255,0.3);font-size:12px;">No notifications yet.</div>`}
+          ${[...notifications].reverse().map((n) => {
+            const age = Math.floor((Date.now() - n.time) / 60000);
+            const ts = age < 1 ? 'now' : age < 60 ? age + 'm' : Math.floor(age / 60) + 'h';
+            return html`<div class="notif-entry ${n.type}" key=${n.id}>
+              <span class="notif-time">${ts}</span>
+              <span>${n.msg}</span>
+            </div>`;
+          })}
+        </div>
+      `}
 
       ${raid && html`
         <div class="raid-banner">⚠️ ${raid.tribeName} is attacking! Raiders incoming: ${raid.raiders.length}</div>
