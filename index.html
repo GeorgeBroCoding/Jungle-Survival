@@ -781,9 +781,20 @@ function mpSetupConnection(conn) {
       remotePlayer.attackSeq++;
     } else if (msg.t === 'tribeSync') {
       Object.assign(remoteTribeMembers, msg.members);
-      useGame.getState().setTribeMemberState(msg.tribeMemberState);
-      useGame.getState().setCapturedTribes(msg.capturedTribes);
-      useGame.getState().setActiveTribeIds(msg.activeTribeIds);
+      const gs = useGame.getState();
+      gs.setTribeMemberState(msg.tribeMemberState);
+      gs.setCapturedTribes(msg.capturedTribes);
+      gs.setActiveTribeIds(msg.activeTribeIds);
+      if (gs.mpRole === 'joiner') {
+        if (msg.raid && !gs.raid) gs.addToast(`⚠️ ${msg.raid.tribeName} is raiding!`);
+        else if (!msg.raid && gs.raid) gs.addToast(`${gs.raid.tribeName} retreats!`);
+        gs.setRaid(msg.raid ?? null);
+        if (msg.distantRaid && !gs.distantRaid) gs.addToast(`🏔️ ${msg.distantRaid.tribeName} is marching on you!`);
+        else if (!msg.distantRaid && gs.distantRaid) gs.addToast(`${gs.distantRaid.tribeName} retreats!`);
+        gs.setDistantRaid(msg.distantRaid ?? null);
+        if (msg.interTribalRaid && !gs.interTribalRaid) gs.addToast(`${msg.interTribalRaid.attackerName} raids ${msg.interTribalRaid.targetName}!`);
+        gs.setInterTribalRaid(msg.interTribalRaid ?? null);
+      }
     } else if (msg.t === 'tribeDamage') {
       if (useGame.getState().mpRole === 'host') {
         useGame.getState().damageTribeMember(msg.id, msg.dmg);
@@ -1260,6 +1271,13 @@ function generateResourceNodes() {
   return nodes;
 }
 
+// Pre-computed obstacle circles for player collision detection
+const PLAYER_COLL_R = 0.35;
+const _OBS_R = { wood: 0.72, stone: 0.55, silver: 0.32, gold: 0.32 };
+const STATIC_OBSTACLES = generateResourceNodes()
+  .filter((n) => _OBS_R[n.type])
+  .map((n) => ({ id: n.id, x: n.position[0], z: n.position[2], r: _OBS_R[n.type] }));
+
 // Deterministic PRNG so the world layout is stable across reloads
 function mulberry32(seed) {
   return function () {
@@ -1704,6 +1722,9 @@ const useGame = create((set, get) => ({
   setMpRole: (v) => set({ mpRole: v }),
   setTribeMemberState: (v) => set({ tribeMemberState: v }),
   setCapturedTribes: (v) => set({ capturedTribes: v }),
+  setRaid: (v) => set({ raid: v }),
+  setDistantRaid: (v) => set({ distantRaid: v }),
+  setInterTribalRaid: (v) => set({ interTribalRaid: v }),
 
   // --- toasts ---
   toasts: [],
@@ -2832,9 +2853,32 @@ function Player() {
 
       const stepX = (dirX / dirLen) * speed * delta;
       const stepZ = (dirZ / dirLen) * speed * delta;
-      pos.x += stepX;
-      pos.z += stepZ;
-      moved = Math.hypot(stepX, stepZ);
+      const dep = s.depletedNodes;
+      const _now = Date.now();
+      // Axis-separated collision so the player can slide along obstacles
+      const nx = pos.x + stepX;
+      let colX = false;
+      for (const o of STATIC_OBSTACLES) {
+        if (dep[o.id] && dep[o.id] > _now) continue;
+        if (Math.hypot(nx - o.x, pos.z - o.z) < o.r + PLAYER_COLL_R) { colX = true; break; }
+      }
+      if (!colX && remotePlayer.active) {
+        const [rx,,rz] = remotePlayer.position;
+        if (Math.hypot(nx - rx, pos.z - rz) < 0.45 + PLAYER_COLL_R) colX = true;
+      }
+      const nz = pos.z + stepZ;
+      let colZ = false;
+      for (const o of STATIC_OBSTACLES) {
+        if (dep[o.id] && dep[o.id] > _now) continue;
+        if (Math.hypot(pos.x - o.x, nz - o.z) < o.r + PLAYER_COLL_R) { colZ = true; break; }
+      }
+      if (!colZ && remotePlayer.active) {
+        const [rx,,rz] = remotePlayer.position;
+        if (Math.hypot(pos.x - rx, nz - rz) < 0.45 + PLAYER_COLL_R) colZ = true;
+      }
+      if (!colX) pos.x = nx;
+      if (!colZ) pos.z = nz;
+      moved = Math.hypot(colX ? 0 : stepX, colZ ? 0 : stepZ);
 
       // face movement direction
       group.current.rotation.y = Math.atan2(dirX / dirLen, dirZ / dirLen);
@@ -2999,6 +3043,9 @@ function Player() {
           tribeMemberState: s.tribeMemberState,
           capturedTribes: s.capturedTribes,
           activeTribeIds: s.activeTribeIds,
+          raid: s.raid,
+          distantRaid: s.distantRaid,
+          interTribalRaid: s.interTribalRaid,
         });
       }
     }
@@ -4359,12 +4406,14 @@ function Raider({ id, startPosition, color, targetPos = BASE_CENTER, targetTribe
 
     if (dist < 2) {
       resolved.current = true;
-      if (targetTribeId) {
-        useGame.getState().resolveRaider(id, true);
-      } else {
-        const warriors = useGame.getState().warriors;
-        const winChance = Math.min(0.9, warriors * 0.22 + 0.08);
-        useGame.getState().resolveRaider(id, Math.random() >= winChance);
+      if (useGame.getState().mpRole !== 'joiner') {
+        if (targetTribeId) {
+          useGame.getState().resolveRaider(id, true);
+        } else {
+          const warriors = useGame.getState().warriors;
+          const winChance = Math.min(0.9, warriors * 0.22 + 0.08);
+          useGame.getState().resolveRaider(id, Math.random() >= winChance);
+        }
       }
       return;
     }
@@ -4415,6 +4464,7 @@ function RaidManager() {
   useFrame((_, rawDelta) => {
     const delta = Math.min(rawDelta, 0.1);
     const s = useGame.getState();
+    if (s.mpRole === 'joiner') return;
     if (s.raid) return;
     timer.current -= delta;
     if (timer.current <= 0) {
@@ -4487,7 +4537,7 @@ function DistantRaider({ id, startPosition, color, targetPos }) {
 
     if (dist < 2.5) {
       resolved.current = true;
-      useGame.getState().resolveDistantRaider(id, true);
+      if (useGame.getState().mpRole !== 'joiner') useGame.getState().resolveDistantRaider(id, true);
       return;
     }
 
@@ -4572,7 +4622,7 @@ function InterTribalRaider({ id, startPosition, color, targetPos }) {
 
     if (dist < 3) {
       resolved.current = true;
-      useGame.getState().resolveInterTribalRaider(id, true);
+      if (useGame.getState().mpRole !== 'joiner') useGame.getState().resolveInterTribalRaider(id, true);
       return;
     }
 
