@@ -1085,6 +1085,7 @@ const DISTANT_TRIBES = [
 
 // Where the player's own tribe is based - raiders march here
 const BASE_CENTER = [0, 0, 0];
+const FRIEND_BASE_CENTER = [18, 0, 5]; // where the joining player's sub-camp appears
 const PLAYER_TRIBE_COLOR = '#f0d020'; // bright yellow — the Jungle King's home tribe
 const MAX_VISIBLE_WARRIORS = 16;
 
@@ -2159,10 +2160,10 @@ function getTerrainHeight(x, z) {
 
 // ---------- Biomes ----------
 const BIOME_ZONES = [
-  { cx: 0,    cz: 0,    r: 65,  color: [0.28, 0.52, 0.18] }, // jungle (center)
-  { cx: 155,  cz: -50,  r: 115, color: [0.80, 0.66, 0.24] }, // desert (NE)
-  { cx: -45,  cz: -175, r: 115, color: [0.82, 0.88, 0.92] }, // snow (N)
-  { cx: -155, cz: -100, r: 110, color: [0.15, 0.10, 0.07] }, // volcanic (W)
+  { cx: 0,    cz: 0,    r: 65,  color: [0.15, 0.35, 0.10] }, // woodland (center)
+  { cx: 155,  cz: -50,  r: 115, color: [0.83, 0.73, 0.42] }, // sandy desert (NE)
+  { cx: -45,  cz: -175, r: 115, color: [0.82, 0.88, 0.92] }, // snowy (N)
+  { cx: -155, cz: -100, r: 110, color: [0.50, 0.46, 0.42] }, // rocky (W)
   { cx: 30,   cz: 175,  r: 110, color: [0.18, 0.34, 0.16] }, // swamp (S)
 ];
 function getBiomeColor(x, z) {
@@ -2175,6 +2176,16 @@ function getBiomeColor(x, z) {
   if (tw > 0) { r /= tw; g /= tw; b /= tw; }
   const n = Math.sin(x * 3.73 + z * 2.31) * Math.sin(z * 4.17 - x * 1.91) * 0.04;
   return [Math.min(1, Math.max(0, r + n)), Math.min(1, Math.max(0, g + n * 1.1)), Math.min(1, Math.max(0, b + n * 0.9))];
+}
+function getDominantBiome(x, z) {
+  let bestW = -1, best = 0;
+  for (let i = 0; i < BIOME_ZONES.length; i++) {
+    const zone = BIOME_ZONES[i];
+    const dx = x - zone.cx, dz = z - zone.cz;
+    const w = Math.exp(-(dx * dx + dz * dz) / (2 * zone.r * zone.r));
+    if (w > bestW) { bestW = w; best = i; }
+  }
+  return best; // 0=woodland, 1=sandy, 2=snow, 3=rocky, 4=swamp
 }
 
 // ---------- Ground ----------
@@ -2274,6 +2285,51 @@ function useTreeBark() {
   }, []);
 }
 
+// ---------- Procedural Snow Tree (pine with snow-capped tips) ----------
+function SnowTree({ position, scale = 1 }) {
+  const barkTex = useTreeBark();
+  return html`
+    <group position=${position} scale=${scale}>
+      <mesh position=${[0, 1.5, 0]} castShadow=${true}>
+        <cylinderGeometry args=${[0.18, 0.28, 3, 6]} />
+        <meshStandardMaterial map=${barkTex} roughness=${0.9} />
+      </mesh>
+      <mesh position=${[0, 3.4, 0]} castShadow=${true}>
+        <coneGeometry args=${[1.6, 2.2, 7]} />
+        <meshStandardMaterial color="#255a38" roughness=${0.85} />
+      </mesh>
+      <mesh position=${[0, 4.6, 0]} castShadow=${true}>
+        <coneGeometry args=${[1.1, 1.6, 7]} />
+        <meshStandardMaterial color="#cce8da" roughness=${0.7} />
+      </mesh>
+      <mesh position=${[0, 5.6, 0]} castShadow=${true}>
+        <coneGeometry args=${[0.6, 1.2, 7]} />
+        <meshStandardMaterial color="#e8f4f0" roughness=${0.6} />
+      </mesh>
+    </group>
+  `;
+}
+
+// ---------- Procedural Cactus ----------
+function Cactus({ position, scale = 1 }) {
+  return html`
+    <group position=${position} scale=${scale}>
+      <mesh position=${[0, 1.2, 0]} castShadow=${true}>
+        <cylinderGeometry args=${[0.14, 0.18, 2.4, 6]} />
+        <meshStandardMaterial color="#4a7a28" roughness=${0.9} />
+      </mesh>
+      <mesh position=${[0.44, 0.9, 0]} rotation=${[0, 0, -0.35]} castShadow=${true}>
+        <cylinderGeometry args=${[0.08, 0.10, 0.75, 5]} />
+        <meshStandardMaterial color="#4a7a28" roughness=${0.9} />
+      </mesh>
+      <mesh position=${[-0.38, 1.2, 0]} rotation=${[0, 0, 0.4]} castShadow=${true}>
+        <cylinderGeometry args=${[0.08, 0.10, 0.65, 5]} />
+        <meshStandardMaterial color="#4a7a28" roughness=${0.9} />
+      </mesh>
+    </group>
+  `;
+}
+
 // ---------- Procedural Rock ----------
 function Rock({ position, scale = 1 }) {
   return html`
@@ -2304,33 +2360,40 @@ function Bush({ position, scale = 1 }) {
 function DecorativeFoliage() {
   const items = useMemo(() => {
     const rand = mulberry32(99);
-    const trees = [];
-    const bushes = [];
-    for (let i = 0; i < 70; i++) {
+    const trees = [], bushes = [], snowTrees = [], cacti = [], boulders = [];
+    for (let i = 0; i < 220; i++) {
       const angle = rand() * Math.PI * 2;
-      const dist = 12 + rand() * 130;
+      const dist = 10 + rand() * 220;
       const x = Math.cos(angle) * dist;
       const z = Math.sin(angle) * dist;
-      // keep clearing near spawn (0,0) and the pond (40,-40) clear-ish
       if (Math.hypot(x, z) < 10) continue;
       if (Math.hypot(x - 40, z + 40) < 14) continue;
-      trees.push({ position: [x, 0, z], scale: 0.8 + rand() * 0.8 });
+      const y = getTerrainHeight(x, z);
+      const s = 0.7 + rand() * 0.9;
+      const biome = getDominantBiome(x, z);
+      if (biome === 0) { // woodland — dense trees + bushes
+        if (rand() > 0.3) trees.push({ position: [x, y, z], scale: s });
+        else bushes.push({ position: [x, y, z], scale: s * 0.8 });
+      } else if (biome === 1) { // sandy — sparse cacti
+        if (rand() > 0.55) cacti.push({ position: [x, y, z], scale: 0.5 + rand() * 0.7 });
+      } else if (biome === 2) { // snowy — snow-capped pines
+        if (rand() > 0.35) snowTrees.push({ position: [x, y, z], scale: s });
+      } else if (biome === 3) { // rocky — boulders
+        if (rand() > 0.45) boulders.push({ position: [x, y, z], scale: 0.4 + rand() * 1.8 });
+      } else { // swamp — dark shrubs
+        bushes.push({ position: [x, y, z], scale: s * 0.9 });
+      }
     }
-    for (let i = 0; i < 40; i++) {
-      const angle = rand() * Math.PI * 2;
-      const dist = 8 + rand() * 120;
-      const x = Math.cos(angle) * dist;
-      const z = Math.sin(angle) * dist;
-      if (Math.hypot(x, z) < 8) continue;
-      bushes.push({ position: [x, 0, z], scale: 0.7 + rand() * 0.6 });
-    }
-    return { trees, bushes };
+    return { trees, bushes, snowTrees, cacti, boulders };
   }, []);
 
   return html`
     <${Fragment}>
       ${items.trees.map((t, i) => html`<${Tree} key=${'dt' + i} position=${t.position} scale=${t.scale} />`)}
       ${items.bushes.map((b, i) => html`<${Bush} key=${'db' + i} position=${b.position} scale=${b.scale} />`)}
+      ${items.snowTrees.map((t, i) => html`<${SnowTree} key=${'dst' + i} position=${t.position} scale=${t.scale} />`)}
+      ${items.cacti.map((c, i) => html`<${Cactus} key=${'dc' + i} position=${c.position} scale=${c.scale} />`)}
+      ${items.boulders.map((r, i) => html`<${Rock} key=${'dbr' + i} position=${r.position} scale=${r.scale} />`)}
     <//>
   `;
 }
@@ -2448,6 +2511,14 @@ function Player() {
     const slot = s.hotbarSlots[s.activeHotbarSlot];
     return WEAPONS[slot] && (s.inventory[slot] || 0) > 0 ? slot : null;
   });
+
+  const mpRole = useGame((s) => s.mpRole);
+  useEffect(() => {
+    if (mpRole === 'joiner' && group.current) {
+      group.current.position.set(FRIEND_BASE_CENTER[0], getTerrainHeight(FRIEND_BASE_CENTER[0], FRIEND_BASE_CENTER[2]), FRIEND_BASE_CENTER[2]);
+      velocityY.current = 0;
+    }
+  }, [mpRole]);
 
   useEffect(() => {
     const canvas = gl.domElement;
@@ -2958,15 +3029,20 @@ function RemotePlayer() {
 
   return html`
     <group ref=${group} visible=${visible} position=${[remotePlayer.position[0], remotePlayer.position[1], remotePlayer.position[2]]}>
-      <!-- torso -->
+      <!-- torso — yellow tribal vest like the host team -->
       <mesh position=${[0, 1.1, 0]} castShadow=${true}>
         <capsuleGeometry args=${[0.28, 0.6, 4, 8]} />
-        <meshStandardMaterial color="#8a5a3f" roughness=${0.7} />
+        <meshStandardMaterial color="#c9a020" roughness=${0.7} />
       </mesh>
       <!-- head -->
       <mesh position=${[0, 1.78, 0]} castShadow=${true}>
         <sphereGeometry args=${[0.24, 12, 12]} />
         <meshStandardMaterial color="#d8a878" roughness=${0.8} />
+      </mesh>
+      <!-- headband — tribe color -->
+      <mesh position=${[0, 1.85, 0]} castShadow=${true}>
+        <torusGeometry args=${[0.25, 0.035, 6, 12]} />
+        <meshStandardMaterial color="#f0d020" roughness=${0.6} />
       </mesh>
       <!-- left arm -->
       <group ref=${leftArm} position=${[0.36, 1.35, 0]}>
@@ -2983,18 +3059,18 @@ function RemotePlayer() {
         </mesh>
         ${weaponId && html`<${HeldWeapon} id=${weaponId} />`}
       </group>
-      <!-- left leg -->
+      <!-- left leg — yellow trousers -->
       <group ref=${leftLeg} position=${[0.14, 0.75, 0]}>
         <mesh position=${[0, -0.35, 0]} castShadow=${true}>
           <capsuleGeometry args=${[0.1, 0.55, 4, 6]} />
-          <meshStandardMaterial color="#5a4632" roughness=${0.8} />
+          <meshStandardMaterial color="#8a7010" roughness=${0.8} />
         </mesh>
       </group>
       <!-- right leg -->
       <group ref=${rightLeg} position=${[-0.14, 0.75, 0]}>
         <mesh position=${[0, -0.35, 0]} castShadow=${true}>
           <capsuleGeometry args=${[0.1, 0.55, 4, 6]} />
-          <meshStandardMaterial color="#5a4632" roughness=${0.8} />
+          <meshStandardMaterial color="#8a7010" roughness=${0.8} />
         </mesh>
       </group>
     </group>
@@ -3785,6 +3861,32 @@ function PlayerTribeBase() {
       <mesh position=${[0, 2.2, 0.05]} castShadow=${true}>
         <planeGeometry args=${[0.8, 1]} />
         <meshStandardMaterial color="#c9a227" side=${THREE.DoubleSide} />
+      </mesh>
+    </group>
+  `;
+}
+
+// ---------- Friend's sub-camp banner: visible when a second player is connected ----------
+function FriendBase() {
+  const mpStatus = useGame((s) => s.mpStatus);
+  if (mpStatus !== 'connected') return null;
+  return html`
+    <group position=${FRIEND_BASE_CENTER}>
+      <mesh position=${[0, 1.5, 0]} castShadow=${true}>
+        <cylinderGeometry args=${[0.15, 0.15, 3, 6]} />
+        <meshStandardMaterial color="#5a3c22" />
+      </mesh>
+      <mesh position=${[0, 3.2, 0]} castShadow=${true}>
+        <coneGeometry args=${[0.4, 0.6, 5]} />
+        <meshStandardMaterial color="#ffe27a" flatShading=${true} />
+      </mesh>
+      <mesh position=${[0, 2.2, 0.05]} castShadow=${true}>
+        <planeGeometry args=${[0.7, 0.9]} />
+        <meshStandardMaterial color="#c9a227" side=${THREE.DoubleSide} />
+      </mesh>
+      <mesh position=${[0, 0.05, 0]} receiveShadow=${true}>
+        <cylinderGeometry args=${[2.5, 2.5, 0.06, 16]} />
+        <meshStandardMaterial color="#b89a30" roughness=${0.9} />
       </mesh>
     </group>
   `;
@@ -5115,6 +5217,7 @@ function App() {
         <${Kito} />
         <${Workbench} />
         <${PlayerTribeBase} />
+        <${FriendBase} />
         <${PlayerWarriors} />
         <${EscortWarriors} />
         <${TribeCamps} />
