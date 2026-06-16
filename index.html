@@ -931,6 +931,8 @@ const RESOURCES = {
   fiber:  { name: 'Fiber',  color: '#9bbf5e', category: 'material' },
   stone:  { name: 'Stone',  color: '#8a8a8a', category: 'material' },
   leaves: { name: 'Leaves', color: '#3f8f3f', category: 'material' },
+  silver: { name: 'Silver', color: '#c0c0d0', category: 'material' },
+  gold:   { name: 'Gold',   color: '#ffd700', category: 'material' },
   berry:  { name: 'Berry',  color: '#c23b5a', category: 'food', hunger: 8 },
   meat:   { name: 'Meat',   color: '#a8453b', category: 'food', hunger: 30 },
   apple:  { name: 'Apple',  color: '#d23b3b', category: 'food', hunger: 15 },
@@ -980,6 +982,18 @@ const CRAFTING_RECIPES = [
     desc: 'Heavy carved wood. Slow but hits hard.',
     cost: { wood: 6 },
   },
+  {
+    id: 'axe',
+    name: 'Axe',
+    desc: 'Stone-headed hatchet. The only tool that chops trees for wood.',
+    cost: { wood: 4, stone: 2 },
+  },
+  {
+    id: 'pickaxe',
+    name: 'Pickaxe',
+    desc: 'Heavy stone pick. Mines rock and can unearth silver and gold in caves.',
+    cost: { wood: 3, stone: 4 },
+  },
 ];
 
 // Melee/throwing weapons. Whatever weapon occupies the active hotbar slot
@@ -988,6 +1002,8 @@ const WEAPONS = {
   spear:   { name: 'Spear',       damage: 25, pokeDamage: 18, range: 2.6, throwable: true },
   machete: { name: 'Machete',     damage: 35, range: 1.9, throwable: false },
   club:    { name: 'Wooden Club', damage: 22, range: 1.8, throwable: false },
+  axe:     { name: 'Axe',         damage: 30, range: 2.0, throwable: false, canChop: true },
+  pickaxe: { name: 'Pickaxe',     damage: 18, range: 2.0, throwable: false, canMine: true },
 };
 
 // Wild animals: fixed spawn points, with health/loot for combat.
@@ -1188,6 +1204,16 @@ const LOOT_SPAWNS = (() => {
   return spawns;
 })();
 
+// One cave per distant mountain, placed on the slope facing the origin
+const CAVE_LOCATIONS = [
+  { id: 'cave_ne', mx: 172.2, mz: 80.3,   r: 40 },
+  { id: 'cave_e',  mx: 180.7, mz: -58.7,  r: 45 },
+  { id: 'cave_se', mx: 55.5,  mz: 181.7,  r: 42 },
+  { id: 'cave_sw', mx: -86.3, mz: 169.3,  r: 45 },
+  { id: 'cave_w',  mx: -190,  mz: -3.3,   r: 40 },
+  { id: 'cave_n',  mx: 6.6,   mz: -189.9, r: 42 },
+];
+
 // World resource node placement (positions are fixed for now)
 function generateResourceNodes() {
   const nodes = [];
@@ -1218,6 +1244,18 @@ function generateResourceNodes() {
       type: 'stone',
       position: [Math.cos(angle) * dist, 0, Math.sin(angle) * dist],
     });
+  }
+  // Cave ore nodes — silver and gold near each cave entrance, require pickaxe
+  for (const cave of CAVE_LOCATIONS) {
+    const { mx, mz, r } = cave;
+    const len = Math.sqrt(mx * mx + mz * mz);
+    const dx = -mx / len, dz = -mz / len; // direction toward origin
+    const px = -dz, pz = dx; // perpendicular
+    const cx = mx + dx * r * 0.62;
+    const cz = mz + dz * r * 0.62;
+    nodes.push({ id: `silver_${cave.id}_1`, type: 'silver', position: [cx + px * 2.5, 0, cz + pz * 2.5] });
+    nodes.push({ id: `silver_${cave.id}_2`, type: 'silver', position: [cx - px * 2.5, 0, cz - pz * 2.5] });
+    nodes.push({ id: `gold_${cave.id}`,     type: 'gold',   position: [cx + dx * 3.5, 0, cz + dz * 3.5] });
   }
   return nodes;
 }
@@ -1297,14 +1335,37 @@ const useGame = create((set, get) => ({
     if (get().depletedNodes[id]) return false;
     const s = get();
     const activeWeapon = s.hotbarSlots[s.activeHotbarSlot];
-    const choppingLeaves = node.type === 'wood' && activeWeapon === 'machete' && (s.inventory.machete || 0) > 0;
-    if (choppingLeaves) {
-      get().addItem('leaves', 2);
-      get().addToast('+2 Leaves (chopped with Machete)');
+
+    if (node.type === 'wood') {
+      if (activeWeapon === 'axe' && (s.inventory.axe || 0) > 0) {
+        get().addItem('wood', 1);
+        get().addToast('+1 Wood (chopped with Axe)');
+      } else if (activeWeapon === 'machete' && (s.inventory.machete || 0) > 0) {
+        get().addItem('leaves', 2);
+        get().addToast('+2 Leaves (chopped with Machete)');
+      } else {
+        get().addToast('Equip an Axe to chop trees for wood!');
+        return false;
+      }
+    } else if (node.type === 'stone') {
+      if (activeWeapon !== 'pickaxe' || (s.inventory.pickaxe || 0) === 0) {
+        get().addToast('Equip a Pickaxe to mine stone!');
+        return false;
+      }
+      get().addItem('stone', 1);
+      get().addToast('+1 Stone');
+    } else if (node.type === 'silver' || node.type === 'gold') {
+      if (activeWeapon !== 'pickaxe' || (s.inventory.pickaxe || 0) === 0) {
+        get().addToast('Equip a Pickaxe to mine cave ore!');
+        return false;
+      }
+      get().addItem(node.type, 1);
+      get().addToast(`+1 ${RESOURCES[node.type].name}!`);
     } else {
       get().addItem(node.type, 1);
       get().addToast(`+1 ${RESOURCES[node.type].name}`);
     }
+
     set((st) => ({ depletedNodes: { ...st.depletedNodes, [id]: Date.now() + 30000 } }));
     return true;
   },
@@ -1628,7 +1689,7 @@ const useGame = create((set, get) => ({
   nearInteractable: null, // { type: 'gather'|'shop'|'craft', label, data }
   setNearInteractable: (v) => set({ nearInteractable: v }),
 
-  hotbarSlots: ['spear', 'machete', 'club', 'torch', 'bandage'],
+  hotbarSlots: ['spear', 'machete', 'axe', 'pickaxe', 'club', 'torch', 'bandage'],
   activeHotbarSlot: 0,
   setActiveHotbarSlot: (i) => set({ activeHotbarSlot: i }),
 
@@ -2147,6 +2208,7 @@ const TERRAIN_HILLS = [
   { x: 180.7, z: -58.7, amp: 24, r: 45 },
 ];
 
+
 function getTerrainHeight(x, z) {
   let h = 0;
   for (const hill of TERRAIN_HILLS) {
@@ -2476,6 +2538,39 @@ function HeldWeapon({ id }) {
         <mesh position=${[0, 0.68, 0]} castShadow=${true}>
           <sphereGeometry args=${[0.13, 8, 8]} />
           <meshStandardMaterial color="#5a3c22" roughness=${0.9} flatShading=${true} />
+        </mesh>
+      </group>
+    `;
+  }
+  if (id === 'axe') {
+    return html`
+      <group position=${[0, -0.5, -0.05]} rotation=${[1.1, 0, 0.15]}>
+        <mesh position=${[0, 0.32, 0]} castShadow=${true}>
+          <cylinderGeometry args=${[0.032, 0.04, 0.7, 6]} />
+          <meshStandardMaterial color="#7a5a2b" roughness=${0.85} flatShading=${true} />
+        </mesh>
+        <mesh position=${[0.08, 0.75, 0]} rotation=${[0, 0, 0.55]} castShadow=${true}>
+          <boxGeometry args=${[0.52, 0.16, 0.07]} />
+          <meshStandardMaterial color="#b8b0a8" metalness=${0.45} roughness=${0.5} flatShading=${true} />
+        </mesh>
+      </group>
+    `;
+  }
+  if (id === 'pickaxe') {
+    const halfPi = Math.PI / 2;
+    return html`
+      <group position=${[0, -0.5, -0.05]} rotation=${[1.15, 0, 0.1]}>
+        <mesh position=${[0, 0.32, 0]} castShadow=${true}>
+          <cylinderGeometry args=${[0.03, 0.036, 0.72, 6]} />
+          <meshStandardMaterial color="#7a5a2b" roughness=${0.85} flatShading=${true} />
+        </mesh>
+        <mesh position=${[0, 0.74, 0]} rotation=${[0, 0, halfPi]} castShadow=${true}>
+          <boxGeometry args=${[0.09, 0.48, 0.07]} />
+          <meshStandardMaterial color="#adb5bd" metalness=${0.5} roughness=${0.4} flatShading=${true} />
+        </mesh>
+        <mesh position=${[-0.2, 0.74, 0]} rotation=${[0, 0, halfPi - 0.3]} castShadow=${true}>
+          <coneGeometry args=${[0.05, 0.24, 6]} />
+          <meshStandardMaterial color="#adb5bd" metalness=${0.5} roughness=${0.4} flatShading=${true} />
         </mesh>
       </group>
     `;
@@ -3080,11 +3175,47 @@ function RemotePlayer() {
 // ============================================================
 // Resources.js - gatherable resource nodes
 // ============================================================
+function OreNode({ position, color }) {
+  const y = getTerrainHeight(position[0], position[2]);
+  return html`
+    <group position=${[position[0], y, position[2]]}>
+      <mesh position=${[0, 0.28, 0]} castShadow=${true}>
+        <dodecahedronGeometry args=${[0.34, 0]} />
+        <meshStandardMaterial color=${color} metalness=${0.7} roughness=${0.25} flatShading=${true} />
+      </mesh>
+      <mesh position=${[0.3, 0.16, 0.2]} castShadow=${true}>
+        <dodecahedronGeometry args=${[0.2, 0]} />
+        <meshStandardMaterial color=${color} metalness=${0.7} roughness=${0.25} flatShading=${true} />
+      </mesh>
+      <mesh position=${[-0.22, 0.14, -0.18]} castShadow=${true}>
+        <dodecahedronGeometry args=${[0.16, 0]} />
+        <meshStandardMaterial color=${color} metalness=${0.7} roughness=${0.25} flatShading=${true} />
+      </mesh>
+    </group>
+  `;
+}
+
 function ResourceNode({ node }) {
   const depleted = useGame((s) => !!s.depletedNodes[node.id]);
   const activeWeapon = useGame((s) => s.hotbarSlots[s.activeHotbarSlot]);
+  const hasAxe = useGame((s) => (s.inventory.axe || 0) > 0);
   const hasMachete = useGame((s) => (s.inventory.machete || 0) > 0);
-  const choppingLeaves = node.type === 'wood' && activeWeapon === 'machete' && hasMachete;
+  const hasPickaxe = useGame((s) => (s.inventory.pickaxe || 0) > 0);
+
+  let label;
+  if (node.type === 'wood') {
+    if (activeWeapon === 'axe' && hasAxe) label = 'Chop Wood (Axe)';
+    else if (activeWeapon === 'machete' && hasMachete) label = 'Chop Leaves (Machete)';
+    else label = 'Gather Wood (need Axe)';
+  } else if (node.type === 'stone') {
+    label = (activeWeapon === 'pickaxe' && hasPickaxe) ? 'Mine Stone (Pickaxe)' : 'Mine Stone (need Pickaxe)';
+  } else if (node.type === 'silver') {
+    label = (activeWeapon === 'pickaxe' && hasPickaxe) ? 'Mine Silver (Pickaxe)' : 'Mine Silver (need Pickaxe)';
+  } else if (node.type === 'gold') {
+    label = (activeWeapon === 'pickaxe' && hasPickaxe) ? 'Mine Gold (Pickaxe)' : 'Mine Gold (need Pickaxe)';
+  } else {
+    label = `Gather ${RESOURCES[node.type].name}`;
+  }
 
   useEffect(() => {
     if (depleted) return undefined;
@@ -3093,16 +3224,18 @@ function ResourceNode({ node }) {
       position: node.position,
       radius: 2.4,
       key: 'KeyF',
-      label: choppingLeaves ? 'Chop Leaves (Machete)' : `Gather ${RESOURCES[node.type].name}`,
+      label,
       onInteract: () => useGame.getState().gatherNode(node),
     });
-  }, [depleted, choppingLeaves]);
+  }, [depleted, label]);
 
   if (depleted) return null;
 
   if (node.type === 'wood') return html`<${Tree} position=${node.position} scale=${1.1} />`;
   if (node.type === 'fiber') return html`<${Bush} position=${node.position} scale=${1.2} />`;
   if (node.type === 'stone') return html`<${Rock} position=${node.position} scale=${1.5} />`;
+  if (node.type === 'silver') return html`<${OreNode} position=${node.position} color="#c0c0d0" />`;
+  if (node.type === 'gold') return html`<${OreNode} position=${node.position} color="#ffd700" />`;
   return null;
 }
 
@@ -3111,6 +3244,58 @@ function Resources() {
   return html`
     <${Fragment}>
       ${nodes.map((n) => html`<${ResourceNode} key=${n.id} node=${n} />`)}
+    <//>
+  `;
+}
+
+// ============================================================
+// Caves — dark rocky entrances on mountain slopes, guarding ore deposits
+// ============================================================
+function Cave({ id, mx, mz, r }) {
+  const len = Math.sqrt(mx * mx + mz * mz);
+  const dx = -mx / len, dz = -mz / len; // direction toward origin (player-facing)
+  const cx = mx + dx * r * 0.58;
+  const cz = mz + dz * r * 0.58;
+  const y = getTerrainHeight(cx, cz);
+  const yaw = Math.atan2(-dx, -dz);
+  return html`
+    <group position=${[cx, y, cz]} rotation=${[0, yaw, 0]}>
+      <mesh position=${[-1.25, 0.85, 0]} castShadow=${true}>
+        <boxGeometry args=${[0.85, 2.3, 1.3]} />
+        <meshStandardMaterial color="#4a4545" roughness=${0.95} flatShading=${true} />
+      </mesh>
+      <mesh position=${[1.25, 0.85, 0]} castShadow=${true}>
+        <boxGeometry args=${[0.85, 2.3, 1.3]} />
+        <meshStandardMaterial color="#4a4545" roughness=${0.95} flatShading=${true} />
+      </mesh>
+      <mesh position=${[0, 2.25, 0]} castShadow=${true}>
+        <boxGeometry args=${[3.1, 0.95, 1.3]} />
+        <meshStandardMaterial color="#3e3a3a" roughness=${0.95} flatShading=${true} />
+      </mesh>
+      <mesh position=${[0, 1.05, 0.38]}>
+        <boxGeometry args=${[2.1, 1.9, 0.15]} />
+        <meshStandardMaterial color="#080606" roughness=${1} />
+      </mesh>
+      <mesh position=${[-1.85, 0.28, 0.75]} castShadow=${true}>
+        <dodecahedronGeometry args=${[0.52, 0]} />
+        <meshStandardMaterial color="#57504e" roughness=${0.9} flatShading=${true} />
+      </mesh>
+      <mesh position=${[1.65, 0.24, 0.6]} castShadow=${true}>
+        <dodecahedronGeometry args=${[0.43, 0]} />
+        <meshStandardMaterial color="#524d4b" roughness=${0.9} flatShading=${true} />
+      </mesh>
+      <mesh position=${[0.3, 0.18, 1.1]} castShadow=${true}>
+        <dodecahedronGeometry args=${[0.35, 0]} />
+        <meshStandardMaterial color="#4e4a48" roughness=${0.9} flatShading=${true} />
+      </mesh>
+    </group>
+  `;
+}
+
+function Caves() {
+  return html`
+    <${Fragment}>
+      ${CAVE_LOCATIONS.map((c) => html`<${Cave} key=${c.id} id=${c.id} mx=${c.mx} mz=${c.mz} r=${c.r} />`)}
     <//>
   `;
 }
@@ -4627,7 +4812,7 @@ function InventoryPanel() {
     <div class="panel-overlay" onClick=${() => setActivePanel(null)}>
       <div class="panel" onClick=${(e) => e.stopPropagation()}>
         <h2>Inventory</h2>
-        ${entries.length === 0 && html`<p>Empty. Gather resources with F, hunt animals, chop leaves with a machete, or scavenge loot with E.</p>`}
+        ${entries.length === 0 && html`<p>Empty. Use F near trees (Axe for wood, Machete for leaves), rocks (Pickaxe), cave ore (Pickaxe), or bush/fiber. Hunt animals or scavenge loot with E.</p>`}
         ${sections.map((sec) => grouped[sec].length === 0 ? null : html`
           <${Fragment} key=${sec}>
             <h3 class="inv-section">${sec}</h3>
@@ -4730,7 +4915,7 @@ function TribePanel() {
           Home camp (yellow) + ${defeatedCount} conquered team${defeatedCount === 1 ? '' : 's'}.
           ${activeTribeIds.length < ENEMY_TRIBES.length ? ' More rival tribes will arrive.' : ''}
         </p>
-        ${myTeams.length > 0 && html`
+        ${myTeams.length > 0 ? html`
           <div class="shop-item" style="flex-direction:column;gap:4px;">
             <div class="name">Your Teams</div>
             ${myTeams.map((t) => html`
@@ -4741,7 +4926,7 @@ function TribePanel() {
               </div>
             `)}
           </div>
-        `}
+        ` : null}
         <div class="shop-item">
           <div>
             <div class="name">Warriors with you</div>
@@ -5115,7 +5300,7 @@ function Hud() {
       <div class="hotbar">
         ${hotbarSlots.map((id, i) => html`
           <div class="slot ${i === activeHotbarSlot ? 'active' : ''}" key=${id + i}>
-            ${RESOURCES[id]?.name?.[0] || CRAFTING_RECIPES.find((r) => r.id === id)?.name?.[0] || SHOP_ITEMS.find((it) => it.id === id)?.name?.[0] || '?'}
+            ${RESOURCES[id]?.name?.[0] || WEAPONS[id]?.name?.[0] || CRAFTING_RECIPES.find((r) => r.id === id)?.name?.[0] || SHOP_ITEMS.find((it) => it.id === id)?.name?.[0] || '?'}
             <span class="count">${inventory[id] || 0}</span>
           </div>
         `)}
@@ -5195,6 +5380,31 @@ function StartScreen() {
 }
 
 // ============================================================
+// Error boundary — prevents React crashes from showing a black screen
+// ============================================================
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(e) {
+    return { hasError: true, error: e };
+  }
+  render() {
+    if (this.state.hasError) {
+      return React.createElement('div', {
+        style: { position: 'fixed', inset: 0, background: '#1b150f', color: '#ffe27a', display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', zIndex: 999, padding: '20px' }
+      },
+        React.createElement('h2', null, 'Something crashed!'),
+        React.createElement('pre', { style: { fontSize: '11px', color: '#aaa', maxWidth: '80%', overflow: 'auto', marginTop: '12px', whiteSpace: 'pre-wrap' } }, this.state.error?.message),
+        React.createElement('button', { onClick: () => location.reload(), style: { marginTop: '20px', padding: '8px 24px', background: '#c9a227', border: 'none', borderRadius: '8px', cursor: 'pointer', fontSize: '15px' } }, 'Reload Game')
+      );
+    }
+    return this.props.children;
+  }
+}
+
+// ============================================================
 // App.js - top-level composition
 // ============================================================
 function App() {
@@ -5209,6 +5419,7 @@ function App() {
         <${Player} />
         <${RemotePlayer} />
         <${Resources} />
+        <${Caves} />
         <${LootPickups} />
         <${GroundWeapons} />
         <${FlyingSpears} />
@@ -5242,7 +5453,7 @@ function App() {
 // main.js - mount
 // ============================================================
 const root = createRoot(document.getElementById('root'));
-root.render(html`<${App} />`);
+root.render(html`<${ErrorBoundary}><${App} /><//>`);
   </script>
 </body>
 </html>
