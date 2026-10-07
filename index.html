@@ -946,6 +946,13 @@ canvas {
     radial-gradient(ellipse 72% 72% at 50% 48%, rgba(0,0,0,0) 55%, rgba(4,8,14,0.42) 100%),
     radial-gradient(ellipse 120% 90% at 50% 100%, rgba(32,20,8,0.12), rgba(0,0,0,0) 60%);
 }
+.perf-stats {
+  position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
+  display: flex; gap: 10px; padding: 4px 10px;
+  background: rgba(0, 0, 0, 0.55); border: 1px solid rgba(255, 226, 122, 0.25);
+  border-radius: 6px; font: 600 12px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #ffe27a; letter-spacing: 0.3px; pointer-events: none; z-index: 3;
+}
 .gfx-presets {
   display: flex;
   gap: 6px;
@@ -1239,32 +1246,110 @@ const GRAPHICS_KEY = 'jungleking.graphics.v1';
 const GRAPHICS_PRESETS = {
   low: {
     label: 'Low', grassRadius: 0, grassPerCell: 0, foliage: 150,
-    shadowMap: 1024, shadowExtent: 55, envSeconds: 0, dpr: 1.0,
+    shadowMap: 1024, shadowExtent: 48, envSeconds: 0, dpr: 1.0,
     vines: false, treeDetail: 0, waterSegments: 24,
+    fireLights: 1, fireShadows: false, contactShadows: false, eyeAdapt: false,
   },
   medium: {
     label: 'Medium', grassRadius: 20, grassPerCell: 5, foliage: 220,
-    shadowMap: 2048, shadowExtent: 50, envSeconds: 4, dpr: 1.35,
+    shadowMap: 2048, shadowExtent: 40, envSeconds: 4, dpr: 1.35,
     vines: false, treeDetail: 1, waterSegments: 48,
+    fireLights: 2, fireShadows: false, contactShadows: true, eyeAdapt: true,
   },
   high: {
     label: 'High', grassRadius: 30, grassPerCell: 8, foliage: 300,
-    shadowMap: 2048, shadowExtent: 45, envSeconds: 2, dpr: 1.6,
+    shadowMap: 2048, shadowExtent: 34, envSeconds: 2, dpr: 1.6,
     vines: true, treeDetail: 2, waterSegments: 72,
+    fireLights: 2, fireShadows: true, contactShadows: true, eyeAdapt: true,
   },
   ultra: {
     label: 'Ultra', grassRadius: 42, grassPerCell: 12, foliage: 380,
-    shadowMap: 4096, shadowExtent: 42, envSeconds: 1.2, dpr: 2.0,
+    shadowMap: 4096, shadowExtent: 30, envSeconds: 1.2, dpr: 2.0,
     vines: true, treeDetail: 2, waterSegments: 96,
+    fireLights: 3, fireShadows: true, contactShadows: true, eyeAdapt: true,
   },
 };
+
+// The shadow box is pushed this far forward along the view direction (as a
+// fraction of its half-size) instead of being centred on the player. You can
+// only see shadows in front of you, so spending the map on what is behind you
+// is waste: the shift buys ~1.4x the forward reach from a box ~30% smaller,
+// which is where the extra sharpness comes from.
+const SHADOW_FORWARD_BIAS = 0.4;
+
+// ---------- Canopy cover field ----------
+// A coarse 2.5m grid of "how much leaf is overhead", splatted once when the
+// foliage is placed. The eye-adaptation code needs to know when you have
+// walked under a tree, and asking the GPU is not an option - this answers it
+// in a bilinear lookup. Also quality-dependent on purpose: fewer trees really
+// does mean a brighter jungle.
+const CANOPY_HALF = 250;
+const CANOPY_CELLS = 200;
+const CANOPY_CELL = (CANOPY_HALF * 2) / CANOPY_CELLS;
+const canopyField = { grid: new Float32Array(CANOPY_CELLS * CANOPY_CELLS), ready: false };
+
+function canopyReset() {
+  canopyField.grid.fill(0);
+  canopyField.ready = false;
+}
+function canopySplat(x, z, radius, weight) {
+  const g = canopyField.grid;
+  const fx = (x + CANOPY_HALF) / CANOPY_CELL;
+  const fz = (z + CANOPY_HALF) / CANOPY_CELL;
+  const rad = Math.max(0.5, radius / CANOPY_CELL);
+  const i0 = Math.max(0, Math.floor(fx - rad)), i1 = Math.min(CANOPY_CELLS - 1, Math.ceil(fx + rad));
+  const j0 = Math.max(0, Math.floor(fz - rad)), j1 = Math.min(CANOPY_CELLS - 1, Math.ceil(fz + rad));
+  for (let j = j0; j <= j1; j++) {
+    for (let i = i0; i <= i1; i++) {
+      const dx = (i + 0.5 - fx) / rad, dz = (j + 0.5 - fz) / rad;
+      const d2 = dx * dx + dz * dz;
+      if (d2 >= 1) continue;
+      g[j * CANOPY_CELLS + i] += weight * (1 - d2);
+    }
+  }
+}
+function canopyAt(ix, iz) {
+  if (ix < 0 || iz < 0 || ix >= CANOPY_CELLS || iz >= CANOPY_CELLS) return 0;
+  return canopyField.grid[iz * CANOPY_CELLS + ix];
+}
+function canopyCoverAt(x, z) {
+  if (!canopyField.ready) return 0;
+  const fx = (x + CANOPY_HALF) / CANOPY_CELL - 0.5;
+  const fz = (z + CANOPY_HALF) / CANOPY_CELL - 0.5;
+  const i = Math.floor(fx), j = Math.floor(fz);
+  const tx = fx - i, tz = fz - j;
+  const v = canopyAt(i, j) * (1 - tx) * (1 - tz)
+    + canopyAt(i + 1, j) * tx * (1 - tz)
+    + canopyAt(i, j + 1) * (1 - tx) * tz
+    + canopyAt(i + 1, j + 1) * tx * tz;
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+// ---------- Fire light pool ----------
+// Every campfire draws its own flame, but point lights are not free and the
+// light count has to stay constant or three.js recompiles every material the
+// moment a camp comes into range. So the fires register their positions here
+// and DayNightSystem hands the nearest few a light out of a fixed pool.
+const fireRegistry = {}; // { [id]: [x, y, z] }
 const GRAPHICS_ORDER = ['low', 'medium', 'high', 'ultra'];
 
-const graphicsSettings = { quality: 'high' };
+// `brightness` is a plain multiplier on the exposure the lighting code settles
+// on. Monitors and eyes differ more than any amount of tuning can allow for,
+// so this is the one knob that is a slider rather than a preset.
+const graphicsSettings = { quality: 'high', brightness: 1.0, showStats: false };
 try {
   const saved = JSON.parse(localStorage.getItem(GRAPHICS_KEY) || 'null');
   if (saved && GRAPHICS_PRESETS[saved.quality]) graphicsSettings.quality = saved.quality;
+  if (saved && typeof saved.brightness === 'number' && isFinite(saved.brightness)) {
+    graphicsSettings.brightness = Math.max(0.6, Math.min(1.8, saved.brightness));
+  }
+  if (saved && typeof saved.showStats === 'boolean') graphicsSettings.showStats = saved.showStats;
 } catch (e) {}
+
+// Live renderer counters, refreshed twice a second by PerfProbe. There is no
+// profiler in a page like this, so the only way to answer "is it holding 60?"
+// is to measure it and put the number on screen.
+const perfStats = { fps: 0, ms: 0, draws: 0, tris: 0 };
 function saveGraphicsSettings() {
   try { localStorage.setItem(GRAPHICS_KEY, JSON.stringify(graphicsSettings)); } catch (e) {}
 }
@@ -2368,6 +2453,19 @@ const useGame = create((set, get) => ({
     saveGraphicsSettings();
     set({ graphicsQuality: q });
   },
+  brightness: graphicsSettings.brightness,
+  setBrightness: (v) => {
+    const b = Math.max(0.6, Math.min(1.8, v));
+    graphicsSettings.brightness = b;
+    saveGraphicsSettings();
+    set({ brightness: b });
+  },
+  showStats: graphicsSettings.showStats,
+  setShowStats: (v) => {
+    graphicsSettings.showStats = !!v;
+    saveGraphicsSettings();
+    set({ showStats: !!v });
+  },
 
   // Rebinding is a swap, never a steal: if `code` already belongs to another
   // action, that action inherits the key this one is giving up. So no action is
@@ -3280,21 +3378,25 @@ function bladeAlphaTexture() {
 // ============================================================
 const DAY_LENGTH_SECONDS = 600; // full 24h cycle takes 10 real minutes
 
-// Each keyframe is a complete lighting setup for one moment of the day: the
-// three sky bands, the sun's colour and strength, how much bounce light fills
-// the shadows, how far you can see, and how visible the stars are. Everything
-// in between is interpolated, so dawn actually sweeps across the sky.
+// Each keyframe is what the scattering model can't tell us: how dark the night
+// sky is, how strong the sunlight is, how much bounce light fills the shadows,
+// how far you can see, and how visible the stars are. The sky's own colour is
+// no longer keyframed - it comes out of atmoSky() - so `zen`/`hor` here are the
+// *night* sky, which only shows through as `star` rises.
+//
+//   sunI  direct sunlight             ambI  flat fill         hemiI  sky/ground bounce
+//   fogN/fogF  haze distances         star  how much night    glow   sun's share of the env map
 const SKY_STATES = [
-  { t: 0,    zen: '#030615', hor: '#0a1026', grd: '#05080f', sunC: '#4a62a8', sunI: 0.07, ambI: 0.10, hemiI: 0.17, fogN: 14, fogF: 125, star: 1.00, glow: 0.25, cloud: '#121a33' },
-  { t: 4.6,  zen: '#06102c', hor: '#1b2442', grd: '#0a1020', sunC: '#5e6fae', sunI: 0.10, ambI: 0.13, hemiI: 0.23, fogN: 14, fogF: 135, star: 0.80, glow: 0.30, cloud: '#1e2644' },
-  { t: 6.0,  zen: '#2b3f72', hor: '#e8915c', grd: '#4a3a34', sunC: '#ff9d55', sunI: 0.60, ambI: 0.20, hemiI: 0.40, fogN: 12, fogF: 155, star: 0.22, glow: 1.00, cloud: '#f0a877' },
-  { t: 7.6,  zen: '#4a8ad0', hor: '#cfe2ef', grd: '#6f7a63', sunC: '#ffd6a8', sunI: 1.45, ambI: 0.30, hemiI: 0.62, fogN: 24, fogF: 235, star: 0.00, glow: 0.70, cloud: '#ffffff' },
-  { t: 12,   zen: '#2a79d2', hor: '#bcdaef', grd: '#8a9478', sunC: '#fff6e4', sunI: 2.25, ambI: 0.36, hemiI: 0.78, fogN: 40, fogF: 305, star: 0.00, glow: 0.45, cloud: '#ffffff' },
-  { t: 16.6, zen: '#4683c7', hor: '#ddd2bb', grd: '#7f8468', sunC: '#ffe3b4', sunI: 1.60, ambI: 0.30, hemiI: 0.60, fogN: 28, fogF: 255, star: 0.00, glow: 0.65, cloud: '#fff1dc' },
-  { t: 18.3, zen: '#36407e', hor: '#f08a52', grd: '#50392c', sunC: '#ff8441', sunI: 0.65, ambI: 0.20, hemiI: 0.40, fogN: 16, fogF: 175, star: 0.18, glow: 1.00, cloud: '#ef9765' },
-  { t: 19.6, zen: '#141a44', hor: '#7a4663', grd: '#20182c', sunC: '#a05a7a', sunI: 0.22, ambI: 0.15, hemiI: 0.27, fogN: 14, fogF: 145, star: 0.55, glow: 0.50, cloud: '#4b3450' },
-  { t: 21,   zen: '#050a1c', hor: '#0d142c', grd: '#060a14', sunC: '#4a62a8', sunI: 0.08, ambI: 0.11, hemiI: 0.19, fogN: 14, fogF: 125, star: 1.00, glow: 0.25, cloud: '#141c35' },
-  { t: 24,   zen: '#030615', hor: '#0a1026', grd: '#05080f', sunC: '#4a62a8', sunI: 0.07, ambI: 0.10, hemiI: 0.17, fogN: 14, fogF: 125, star: 1.00, glow: 0.25, cloud: '#121a33' },
+  { t: 0,    zen: '#0a1430', hor: '#101c38', grd: '#070b16', sunC: '#2d3a6a', sunI: 0.015, ambI: 0.038, hemiI: 0.088, fogN: 10, fogF: 95,  star: 1.00, glow: 0.10, cloud: '#0b1124' },
+  { t: 4.6,  zen: '#0d1838', hor: '#1a2446', grd: '#0a0f1c', sunC: '#3f4d82', sunI: 0.030, ambI: 0.048, hemiI: 0.110, fogN: 11, fogF: 105, star: 0.88, glow: 0.14, cloud: '#141b33' },
+  { t: 6.0,  zen: '#1b2a56', hor: '#8a5a44', grd: '#3a2d26', sunC: '#ff9d55', sunI: 0.55,  ambI: 0.075, hemiI: 0.26,  fogN: 12, fogF: 150, star: 0.40, glow: 0.60, cloud: '#f0a877' },
+  { t: 7.6,  zen: '#1b2c58', hor: '#2d3a5e', grd: '#6f7a63', sunC: '#ffd6a8', sunI: 1.55,  ambI: 0.145, hemiI: 0.52,  fogN: 24, fogF: 235, star: 0.00, glow: 0.80, cloud: '#ffffff' },
+  { t: 12,   zen: '#1b2c58', hor: '#2d3a5e', grd: '#8a9478', sunC: '#fff6e4', sunI: 2.45,  ambI: 0.175, hemiI: 0.68,  fogN: 40, fogF: 305, star: 0.00, glow: 1.00, cloud: '#ffffff' },
+  { t: 16.6, zen: '#1b2c58', hor: '#2d3a5e', grd: '#7f8468', sunC: '#ffe3b4', sunI: 1.70,  ambI: 0.145, hemiI: 0.50,  fogN: 28, fogF: 255, star: 0.00, glow: 0.80, cloud: '#fff1dc' },
+  { t: 18.3, zen: '#1b2550', hor: '#8a5440', grd: '#40302a', sunC: '#ff8441', sunI: 0.58,  ambI: 0.075, hemiI: 0.26,  fogN: 16, fogF: 165, star: 0.45, glow: 0.60, cloud: '#ef9765' },
+  { t: 19.6, zen: '#0f1838', hor: '#30203a', grd: '#14101c', sunC: '#6a3f58', sunI: 0.10,  ambI: 0.060, hemiI: 0.150, fogN: 13, fogF: 125, star: 0.72, glow: 0.24, cloud: '#33243a' },
+  { t: 21,   zen: '#0a1432', hor: '#111d3a', grd: '#070b16', sunC: '#2d3a6a', sunI: 0.018, ambI: 0.040, hemiI: 0.092, fogN: 10, fogF: 95,  star: 1.00, glow: 0.10, cloud: '#0c1226' },
+  { t: 24,   zen: '#0a1430', hor: '#101c38', grd: '#070b16', sunC: '#2d3a6a', sunI: 0.015, ambI: 0.038, hemiI: 0.088, fogN: 10, fogF: 95,  star: 1.00, glow: 0.10, cloud: '#0b1124' },
 ];
 // Pre-parsed so the per-frame blend never touches a hex string.
 for (const st of SKY_STATES) {
@@ -3338,15 +3440,6 @@ function sampleSky(t) {
   return skyNow;
 }
 
-// Kept for the map/minimap tint and anything else that just wants "what colour
-// is the sky right now".
-function getSkyColor(t) {
-  return sampleSky(t).hor.clone();
-}
-function getSunIntensity(t) {
-  return sampleSky(t).sunI;
-}
-
 // Where the sun sits for a given hour. Noon is overhead-ish rather than dead
 // vertical, which gives everything a readable shadow all day.
 function sunDirectionAt(t, out) {
@@ -3355,10 +3448,140 @@ function sunDirectionAt(t, out) {
   return out;
 }
 
+// ---------- Sky radiance, read back on the CPU ----------
+// Fog, ambient fill and the environment map all sample the same scattering the
+// dome draws, so the distance never reads as a painted backdrop behind the
+// terrain. Allocation-free; the Colors are reused scratch.
+const _atmoRGB = [0, 0, 0];
+const atmoLook = {
+  zenith: new THREE.Color(),
+  horizon: new THREE.Color(),  // toward whatever direction was asked for
+  sunward: new THREE.Color(),
+  average: new THREE.Color(),  // crude irradiance estimate for the ambient fill
+};
+function atmoColor(dx, dy, dz, sunDir, outColor) {
+  const len = Math.hypot(dx, dy, dz) || 1;
+  atmoSkyJS(dx / len, dy / len, dz / len, sunDir.x, sunDir.y, sunDir.z, _atmoRGB);
+  return outColor.setRGB(_atmoRGB[0], _atmoRGB[1], _atmoRGB[2]);
+}
+// hx/hz: which way the player is looking, so the haze reddens when you face a
+// sunset instead of staying a uniform grey all the way round.
+function sampleAtmosphere(sunDir, hx, hz) {
+  atmoColor(0, 1, 0, sunDir, atmoLook.zenith);
+  atmoColor(hx, 0.055, hz, sunDir, atmoLook.horizon);
+  atmoColor(sunDir.x, Math.max(0.04, sunDir.y * 0.35), sunDir.z, sunDir, atmoLook.sunward);
+  atmoLook.average.copy(atmoLook.zenith).lerp(atmoLook.horizon, 0.55).lerp(atmoLook.sunward, 0.2);
+  return atmoLook;
+}
+
+
+// ---------- Atmosphere ----------
+// The sky is no longer a painted gradient: it is a single-scattering
+// atmosphere (Preetham/Hoffman), the same model three.js ships in its Sky
+// example. Rayleigh scattering off air molecules is what makes the zenith blue
+// and the sunset red (short wavelengths scatter out of the long sightline near
+// the horizon); Mie scattering off dust and water droplets is what puts the
+// white haze around the sun and along the horizon. Turbidity is how dusty the
+// air is - a jungle is humid, so it sits a little above the clear-sky default.
+//
+// Everything below the horizon, the stars, the moon and the clouds are still
+// art-directed through SKY_STATES, because scattering has nothing to say about
+// any of them.
+const ATMO = {
+  turbidity: 3.2,
+  rayleigh: 2.0,
+  mieCoefficient: 0.0055,
+  mieDirectionalG: 0.80,
+  // Scales the model's radiance into the renderer's exposure range. Dropping
+  // the internal gamma above means this is now the only brightness knob, and
+  // it is set so a noon zenith lands on a saturated blue rather than clipping.
+  gain: 0.22,
+};
+
+// Shared between the GLSL and the JS twin below, so the fog, the environment
+// map and the dome can never drift apart.
+const ATMO_GLSL = `
+  const vec3 ATMO_UP = vec3(0.0, 1.0, 0.0);
+  const float ATMO_PI = 3.141592653589793;
+  const float ATMO_E = 2.718281828459045;
+  // Rayleigh scattering at sea level for the three Preetham primaries
+  // (680/550/450nm). Blue is five times stronger than red - that ratio is the
+  // whole reason the sky is blue.
+  const vec3 TOTAL_RAYLEIGH = vec3(5.804542996261093E-6, 1.3562911419845635E-5, 3.0265902468824876E-5);
+  const vec3 MIE_CONST = vec3(1.8399918514433978E14, 2.7798023919660528E14, 4.0790479543861094E14);
+  const float RAYLEIGH_ZENITH = 8.4E3;   // scale height of the air column, metres
+  const float MIE_ZENITH = 1.25E3;       // aerosols sit much lower down
+  const float CUTOFF_ANGLE = 1.6110731556870734;
+  const float STEEPNESS = 1.5;
+  const float SUN_EE = 1000.0;
+  const float SUN_DISC_COS = 0.9999566769464485;
+  const float ONE_OVER_FOURPI = 0.07957747154594767;
+
+  // Fades the sun out as it sinks below the horizon - the "earth shadow" hack
+  // that turns sunset into night without a second model.
+  float atmoSunIntensity(float zenithCos) {
+    zenithCos = clamp(zenithCos, -1.0, 1.0);
+    return SUN_EE * max(0.0, 1.0 - pow(ATMO_E, -((CUTOFF_ANGLE - acos(zenithCos)) / STEEPNESS)));
+  }
+  vec3 atmoTotalMie(float T) {
+    return 0.434 * ((0.2 * T) * 10E-18) * MIE_CONST;
+  }
+  // Rayleigh is near-isotropic with a mild forward/backward lobe...
+  float atmoRayleighPhase(float cosTheta) {
+    return (3.0 / (16.0 * ATMO_PI)) * (1.0 + cosTheta * cosTheta);
+  }
+  // ...while Mie is sharply forward-scattering, which is the glare round the sun.
+  float atmoHgPhase(float cosTheta, float g) {
+    float g2 = g * g;
+    return ONE_OVER_FOURPI * ((1.0 - g2) / pow(max(0.0, 1.0 - 2.0 * g * cosTheta + g2), 1.5));
+  }
+
+  vec3 atmoSky(vec3 dir, vec3 sunDir, float turbidity, float rayleighC, float mieC, float mieG, float withSun) {
+    float sunE = atmoSunIntensity(dot(sunDir, ATMO_UP));
+    vec3 betaR = TOTAL_RAYLEIGH * rayleighC;
+    vec3 betaM = atmoTotalMie(turbidity) * mieC;
+
+    // Optical depth along the sightline. Looking up you punch straight through
+    // the thin part of the atmosphere; looking at the horizon you travel
+    // through forty times as much air, which is why the horizon is pale.
+    float zenithAngle = acos(max(0.0, dot(ATMO_UP, dir)));
+    float denom = cos(zenithAngle) + 0.15 * pow(max(0.0001, 93.885 - ((zenithAngle * 180.0) / ATMO_PI)), -1.253);
+    float inv = 1.0 / max(0.0001, denom);
+    float sR = RAYLEIGH_ZENITH * inv;
+    float sM = MIE_ZENITH * inv;
+
+    vec3 Fex = exp(-(betaR * sR + betaM * sM));   // extinction along the path
+
+    float cosTheta = dot(dir, sunDir);
+    vec3 betaRTheta = betaR * atmoRayleighPhase(cosTheta * 0.5 + 0.5);
+    vec3 betaMTheta = betaM * atmoHgPhase(cosTheta, mieG);
+
+    vec3 scatter = (betaRTheta + betaMTheta) / (betaR + betaM);
+    vec3 Lin = pow(sunE * scatter * (1.0 - Fex), vec3(1.5));
+    Lin *= mix(vec3(1.0),
+               pow(sunE * scatter * Fex, vec3(0.5)),
+               clamp(pow(1.0 - dot(ATMO_UP, sunDir), 5.0), 0.0, 1.0));
+
+    // Preetham carries a constant ambient term for the night sky. It is a flat
+    // grey, which is fine in a model that never shows night and ruinous in one
+    // that does, so it fades out over the ten degrees below the horizon and
+    // hands the night over to the art-directed gradient instead.
+    float dayWeight = clamp((sunDir.y + 0.10) / 0.16, 0.0, 1.0);
+    vec3 L0 = vec3(0.1) * Fex * dayWeight;
+    float disc = smoothstep(SUN_DISC_COS, SUN_DISC_COS + 0.00002, cosTheta);
+    L0 += (sunE * 19000.0 * Fex) * disc * withSun;
+
+    // Stock Preetham ends on pow(tex, 1/2.4) and expects the viewer to apply a
+    // display gamma on top. We tone map and encode the dome ourselves, so that
+    // step would be applied twice - which is exactly what flattens the zenith
+    // from blue to pale grey. Returned as linear radiance instead.
+    return max((Lin + L0) * 0.04 + vec3(0.0, 0.0003, 0.00075), vec3(0.0));
+  }
+`;
+
 // ---------- Sky dome ----------
-// A gradient dome with a real sun disc, drifting cloud layer and stars, instead
-// of a flat background colour. Drawn on the inside of a big sphere with
-// depthWrite off so it never occludes anything.
+// Drawn on the inside of a big sphere with depthWrite off so it never occludes
+// anything, and ridden along with the camera so it is effectively infinite.
 const SKY_VERT = `
   varying vec3 vDir;
   void main() {
@@ -3368,51 +3591,77 @@ const SKY_VERT = `
 `;
 
 const SKY_FRAG = `
-  uniform vec3 zenith;
-  uniform vec3 horizon;
+  uniform vec3 nightZenith;
+  uniform vec3 nightHorizon;
   uniform vec3 ground;
-  uniform vec3 sunColor;
+  uniform vec3 moonColor;
   uniform vec3 cloudColor;
   uniform vec3 sunDir;
-  uniform float glow;
-  uniform float starAmount;
+  uniform vec3 sunTint;
+  uniform float nightAmount;
   uniform float cloudAmount;
   uniform float time;
+  uniform float uExposure;
+  uniform float uTurbidity;
+  uniform float uRayleigh;
+  uniform float uMieC;
+  uniform float uMieG;
+  uniform float uGain;
   uniform sampler2D cloudTex;
   varying vec3 vDir;
 
+${ATMO_GLSL}
+
   float hash(vec3 p) {
     return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+  }
+
+  // Narkowicz's ACES fit. The dome does its own tone mapping and sRGB encode
+  // rather than relying on three.js's output chunks, so a shader-chunk rename
+  // in a future three.js can't silently break the sky.
+  vec3 aces(vec3 x) {
+    return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+  }
+  vec3 lin2srgb(vec3 c) {
+    c = max(c, vec3(0.0));
+    return mix(c * 12.92, 1.055 * pow(c, vec3(0.4166666667)) - 0.055, step(vec3(0.0031308), c));
   }
 
   void main() {
     vec3 dir = normalize(vDir);
     float h = dir.y;
 
-    // Two-stage vertical blend: a tight haze band at the horizon, then a slow
-    // fade to the zenith. pow() keeps the haze thin like real atmosphere.
-    vec3 col = mix(horizon, zenith, pow(clamp(h, 0.0, 1.0), 0.42));
-    col = mix(col, ground, smoothstep(0.0, -0.18, h));
+    vec3 col = atmoSky(dir, sunDir, uTurbidity, uRayleigh, uMieC, uMieG, 1.0) * uGain;
+
+    // Night sky underneath. By the time nightAmount is 1 the scattering term
+    // has already gone to black on its own, so this is an addition, not a
+    // fight: it puts back the deep blue that single scattering can't produce.
+    if (nightAmount > 0.001) {
+      vec3 night = mix(nightHorizon, nightZenith, pow(clamp(h, 0.0, 1.0), 0.42));
+      col = mix(col, col * 0.12 + night, nightAmount);
+    }
+
+    // Below the horizon the dome carries the haze colour, slightly dimmed. It
+    // is only ever visible past the edge of the terrain, so it has to match the
+    // fog or there is a hard band out there. (Fed with edges in ascending order
+    // because GLSL leaves smoothstep undefined when edge0 >= edge1.)
+    col = mix(col, ground, smoothstep(0.0, 0.18, -h));
 
     float sd = max(dot(dir, sunDir), 0.0);
-    // Broad atmospheric scatter around the sun, strongest near the horizon.
-    col += sunColor * pow(sd, 6.0) * 0.35 * glow;
-    col += sunColor * pow(sd, 90.0) * 0.9 * glow;
-    // The disc itself.
-    col += sunColor * smoothstep(0.9975, 0.9990, sd) * 3.2;
 
     // Moon sits opposite the sun so there is always something up there.
     float md = max(dot(dir, -sunDir), 0.0);
-    col += vec3(0.75, 0.79, 0.92) * smoothstep(0.9988, 0.9995, md) * starAmount * 2.2;
-    col += vec3(0.35, 0.40, 0.55) * pow(md, 200.0) * starAmount * 0.5;
+    float moonVis = pow(nightAmount, 1.2);
+    col += moonColor * smoothstep(0.9988, 0.9995, md) * moonVis * 6.0;
+    col += moonColor * 0.35 * pow(md, 200.0) * moonVis;
 
-    if (starAmount > 0.01 && h > 0.0) {
+    if (nightAmount > 0.01 && h > 0.0) {
       // Quantise the direction into a grid and light up a sparse few cells.
       vec3 cell = floor(dir * 260.0);
       float s = hash(cell);
       float star = smoothstep(0.9972, 0.9999, s);
       float twinkle = 0.65 + 0.35 * sin(time * 2.4 + s * 90.0);
-      col += vec3(0.85, 0.88, 1.0) * star * twinkle * starAmount * smoothstep(0.0, 0.25, h);
+      col += vec3(0.85, 0.88, 1.0) * star * twinkle * pow(nightAmount, 1.5) * 1.8 * smoothstep(0.0, 0.25, h);
     }
 
     if (h > 0.03 && cloudAmount > 0.01) {
@@ -3423,15 +3672,64 @@ const SKY_FRAG = `
       float c2 = texture2D(cloudTex, uv * 0.10 - vec2(time * 0.0052, time * 0.0021)).r;
       float cover = smoothstep(0.52, 0.92, c1 * 0.68 + c2 * 0.42);
       cover *= smoothstep(0.03, 0.30, h) * cloudAmount;
-      // Lit rim where the cloud faces the sun.
-      vec3 lit = mix(cloudColor * 0.55, cloudColor, smoothstep(0.0, 1.0, c2));
-      lit += sunColor * pow(sd, 12.0) * 0.5 * glow;
+      // Lit rim where the cloud faces the sun, plus a silver lining when you
+      // look straight through one at the sun.
+      vec3 lit = mix(cloudColor * 0.42, cloudColor, smoothstep(0.0, 1.0, c2)) * 2.3;
+      lit += sunTint * pow(sd, 12.0) * 1.4;
       col = mix(col, lit, cover);
     }
 
-    gl_FragColor = vec4(col, 1.0);
+    gl_FragColor = vec4(lin2srgb(aces(col * uExposure)), 1.0);
   }
 `;
+
+// ---------- The same scattering, on the CPU ----------
+// The fog colour, the ambient fill and the environment map all have to agree
+// with what the dome is drawing, or the distance reads as a painted backdrop
+// stuck behind the terrain. Rather than guess, this is a line-for-line port of
+// atmoSky() above. Allocation-free: the caller passes the output in.
+const _atmoFex = [0, 0, 0];
+const _atmoBetaR = [0, 0, 0];
+const _atmoBetaM = [0, 0, 0];
+const MIE_CONST_JS = [1.8399918514433978e14, 2.7798023919660528e14, 4.0790479543861094e14];
+const TOTAL_RAYLEIGH_JS = [5.804542996261093e-6, 1.3562911419845635e-5, 3.0265902468824876e-5];
+
+function atmoSkyJS(dx, dy, dz, sx, sy, sz, out) {
+  const E = Math.E, PI = Math.PI;
+  const zc = Math.max(-1, Math.min(1, sy)); // sun elevation cosine against up
+  const sunE = 1000 * Math.max(0, 1 - Math.pow(E, -((1.6110731556870734 - Math.acos(zc)) / 1.5)));
+  const mie = 0.434 * ((0.2 * ATMO.turbidity) * 10e-18);
+  for (let i = 0; i < 3; i++) {
+    _atmoBetaR[i] = TOTAL_RAYLEIGH_JS[i] * ATMO.rayleigh;
+    _atmoBetaM[i] = mie * MIE_CONST_JS[i] * ATMO.mieCoefficient;
+  }
+  const zenithAngle = Math.acos(Math.max(0, dy));
+  const denom = Math.cos(zenithAngle) + 0.15 * Math.pow(Math.max(0.0001, 93.885 - ((zenithAngle * 180) / PI)), -1.253);
+  const inv = 1 / Math.max(0.0001, denom);
+  const sR = 8.4e3 * inv, sM = 1.25e3 * inv;
+  for (let i = 0; i < 3; i++) _atmoFex[i] = Math.exp(-(_atmoBetaR[i] * sR + _atmoBetaM[i] * sM));
+
+  const cosTheta = dx * sx + dy * sy + dz * sz;
+  const rPhase = (3 / (16 * PI)) * (1 + Math.pow(cosTheta * 0.5 + 0.5, 2));
+  const g = ATMO.mieDirectionalG, g2 = g * g;
+  const mPhase = 0.07957747154594767 * ((1 - g2) / Math.pow(Math.max(0, 1 - 2 * g * cosTheta + g2), 1.5));
+  const sunUp = Math.max(0, Math.min(1, Math.pow(1 - sy, 5)));
+
+  for (let i = 0; i < 3; i++) {
+    const bR = _atmoBetaR[i], bM = _atmoBetaM[i];
+    const scatter = (bR * rPhase + bM * mPhase) / (bR + bM);
+    let Lin = Math.pow(Math.max(0, sunE * scatter * (1 - _atmoFex[i])), 1.5);
+    const horizonMix = Math.pow(Math.max(0, sunE * scatter * _atmoFex[i]), 0.5);
+    Lin *= 1 + (horizonMix - 1) * sunUp;
+    // Same night-term fade as the shader, or the fog would stay grey after dark.
+    const dayWeight = Math.max(0, Math.min(1, (sy + 0.10) / 0.16));
+    const L0 = 0.1 * _atmoFex[i] * dayWeight; // no sun disc: this is for ambient/fog, not the dome
+    const bias = i === 0 ? 0 : i === 1 ? 0.0003 : 0.00075;
+    // Linear radiance, same as the shader - see the note in ATMO_GLSL.
+    out[i] = Math.max(0, (Lin + L0) * 0.04 + bias) * ATMO.gain;
+  }
+  return out;
+}
 
 // Greyscale fbm used as the cloud mask. Seamless, so the sky plane can scroll
 // forever without a visible join.
@@ -3474,59 +3772,136 @@ function SkyDome({ uniforms }) {
 
 // ---------- Environment map ----------
 // Materials need something to reflect or the water and any metal read as flat
-// paint. This paints a tiny equirectangular sky from the current colours and
-// runs it through PMREM so roughness-aware reflections work. Rebuilt a few
-// times a minute, not per frame.
-function paintEnvCanvas(cv, sky, sunDir) {
+// paint. This paints a small equirectangular sky by evaluating the *same*
+// scattering the dome draws, at a handful of elevations, then runs it through
+// PMREM so roughness-aware reflections work. Rebuilt a few times a minute.
+const ENV_ROWS = [1.0, 0.72, 0.45, 0.26, 0.12, 0.04, 0.0];
+const _envColor = new THREE.Color();
+
+// Narkowicz ACES, matching the dome's own tone mapper. Used anywhere an HDR
+// radiance has to be written into an 8-bit sink - the environment canvas and
+// the clear colour - because both would otherwise clip straight to white.
+function acesToneMap(c, exposure) {
+  const f = (v) => {
+    const x = Math.max(0, v * exposure);
+    return Math.min(1, (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14));
+  };
+  return c.setRGB(f(c.r), f(c.g), f(c.b));
+}
+
+function paintEnvCanvas(cv, sky, sunDir, exposure) {
   const ctx = cv.getContext('2d');
   const w = cv.width, h = cv.height;
   const grad = ctx.createLinearGradient(0, 0, 0, h);
-  grad.addColorStop(0, '#' + sky.zen.getHexString());
-  grad.addColorStop(0.46, '#' + sky.hor.getHexString());
-  grad.addColorStop(0.54, '#' + sky.hor.getHexString());
-  grad.addColorStop(1, '#' + sky.grd.getHexString());
+  // Top half of an equirect map is the sky, bottom half the ground.
+  for (let i = 0; i < ENV_ROWS.length; i++) {
+    const elev = ENV_ROWS[i];                     // 1 = straight up, 0 = horizon
+    const horiz = Math.sqrt(Math.max(0, 1 - elev * elev));
+    atmoColor(horiz, elev, 0, sunDir, _envColor);
+    _envColor.lerp(sky.zen, sky.star * (0.35 + 0.65 * elev));
+    acesToneMap(_envColor, exposure);
+    grad.addColorStop(i / (ENV_ROWS.length - 1) * 0.5, _envColor.getStyle());
+  }
+  _envColor.copy(sky.grd);
+  grad.addColorStop(0.56, _envColor.getStyle());
+  grad.addColorStop(1, _envColor.getStyle());
   ctx.fillStyle = grad;
   ctx.fillRect(0, 0, w, h);
   // Equirect: longitude across, latitude down. Put a soft sun blob where the
   // light actually is so reflections have a highlight to catch.
-  const lon = Math.atan2(-sunDir.z, sunDir.x);
-  const lat = Math.asin(Math.max(-1, Math.min(1, sunDir.y)));
-  const sx = ((lon / (Math.PI * 2)) + 0.5) * w;
-  const sy = (0.5 - lat / Math.PI) * h;
-  const r = h * 0.3;
-  const blob = ctx.createRadialGradient(sx, sy, 0, sx, sy, r);
-  const sc = sky.sunColor;
-  blob.addColorStop(0, `rgba(${Math.round(sc.r * 255)},${Math.round(sc.g * 255)},${Math.round(sc.b * 255)},${0.95 * sky.glow})`);
-  blob.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.fillStyle = blob;
-  ctx.fillRect(0, 0, w, h);
+  if (sunDir.y > -0.05) {
+    const lon = Math.atan2(-sunDir.z, sunDir.x);
+    const lat = Math.asin(Math.max(-1, Math.min(1, sunDir.y)));
+    const sx = ((lon / (Math.PI * 2)) + 0.5) * w;
+    const sy = (0.5 - lat / Math.PI) * h;
+    const r = h * 0.3;
+    const blob = ctx.createRadialGradient(sx, sy, 0, sx, sy, r);
+    const sc = sky.sunColor;
+    const a = 0.95 * sky.glow;
+    blob.addColorStop(0, `rgba(${Math.round(Math.min(1, sc.r) * 255)},${Math.round(Math.min(1, sc.g) * 255)},${Math.round(Math.min(1, sc.b) * 255)},${a})`);
+    blob.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = blob;
+    ctx.fillRect(0, 0, w, h);
+  }
   return cv;
 }
 
+// A light's colour is a multiplier on its intensity, so any hue lifted out of
+// the sky has to be scaled back up to full brightness first - otherwise tinting
+// the ambient toward a dark night sky silently darkens it a second time. The
+// pull toward white keeps it a tint rather than a colour filter: a pure-blue
+// ambient turns skin cyan.
+const _white = new THREE.Color('#ffffff');
+function normaliseHue(c, towardWhite) {
+  const m = Math.max(c.r, c.g, c.b, 1e-4);
+  c.multiplyScalar(1 / m);
+  if (towardWhite > 0) c.lerp(_white, towardWhite);
+  return c;
+}
+
+// How bright the renderer is before eye adaptation moves it. Calibrated so a
+// noon sky sits just under clipping and sunlit ground lands on a mid-tone.
+const EXPOSURE_BASE = 0.52;
+// Three slots is the most any preset uses; unused ones sit at zero intensity
+// rather than unmounting, because changing the light count recompiles every
+// material in the scene.
+const FIRE_SLOTS = 3;
+
 function DayNightSystem() {
-  const { scene, gl } = useThree();
+  const { scene, gl, camera } = useThree();
+  // Only needed at render time, to decide which lights cast shadows. The frame
+  // loop reads gfx() directly so it always sees the live preset.
+  const quality = useGame((s) => s.graphicsQuality);
+  const qRender = GRAPHICS_PRESETS[quality] || gfx();
   const sunRef = useRef();
   const moonRef = useRef();
   const ambRef = useRef();
   const hemiRef = useRef();
+  const fire0 = useRef(); const fire1 = useRef(); const fire2 = useRef();
+  const fireRefs = [fire0, fire1, fire2];
+  // Firelight shadows come from a single spotlight hung above the nearest fire
+  // rather than from the point light itself. A shadow-casting point light has
+  // to render the scene six times, once per cube face, and three.js filters
+  // shadow casters by the *view* camera's layers, so there is no way to show it
+  // only the handful of things that matter. One spotlight is one pass, and
+  // light coming from above a fire throws shadows outward from it much the way
+  // the fire does.
+  const fireSpot = useRef();
+  const fireSpotTarget = useMemo(() => new THREE.Object3D(), []);
   const clockAccum = useRef(0);
   const localTime = useRef(8); // hours
   const sunDir = useRef(new THREE.Vector3(0, 1, 0));
   const sunTarget = useMemo(() => new THREE.Object3D(), []);
   const shadowSetup = useRef({ map: 0, extent: 0 });
   const envAge = useRef(1e9);
+  const expo = useRef(EXPOSURE_BASE);
+  // Per-frame scratch, so none of this allocates inside useFrame.
+  const tmp = useMemo(() => ({
+    fwd: new THREE.Vector3(), centre: new THREE.Vector3(),
+    right: new THREE.Vector3(), up: new THREE.Vector3(),
+    fog: new THREE.Color(), hue: new THREE.Color(), clear: new THREE.Color(),
+    night: new THREE.Color(), ground: new THREE.Color(),
+    jungle: new THREE.Color('#3f5a28'),
+    picks: [],
+  }), []);
 
   const uniforms = useMemo(() => ({
-    zenith: { value: new THREE.Color('#2a79d2') },
-    horizon: { value: new THREE.Color('#bcdaef') },
+    nightZenith: { value: new THREE.Color('#01030c') },
+    nightHorizon: { value: new THREE.Color('#040814') },
     ground: { value: new THREE.Color('#8a9478') },
-    sunColor: { value: new THREE.Color('#fff6e4') },
+    moonColor: { value: new THREE.Color('#aebbd8') },
     cloudColor: { value: new THREE.Color('#ffffff') },
     sunDir: { value: new THREE.Vector3(0, 1, 0) },
-    glow: { value: 0.5 },
-    starAmount: { value: 0 },
+    sunTint: { value: new THREE.Color('#fff6e4') },
+    nightAmount: { value: 0 },
     cloudAmount: { value: 1 },
     time: { value: 0 },
+    uExposure: { value: EXPOSURE_BASE },
+    uTurbidity: { value: ATMO.turbidity },
+    uRayleigh: { value: ATMO.rayleigh },
+    uMieC: { value: ATMO.mieCoefficient },
+    uMieG: { value: ATMO.mieDirectionalG },
+    uGain: { value: ATMO.gain },
     cloudTex: { value: cloudTexture() },
   }), []);
 
@@ -3559,55 +3934,108 @@ function DayNightSystem() {
     localTime.current = (8 + (clockAccum.current / DAY_LENGTH_SECONDS) * 24) % 24;
     const t = localTime.current;
     const sky = sampleSky(t);
-    sunDirectionAt(t, sunDir.current);
+    const dir = sunDirectionAt(t, sunDir.current);
+    const px = playerTransform.position[0];
+    const py = playerTransform.position[1];
+    const pz = playerTransform.position[2];
+
+    // Which way the player is facing, flattened - used both to aim the haze
+    // and to push the shadow box toward what is actually on screen.
+    camera.getWorldDirection(tmp.fwd);
+    tmp.fwd.y = 0;
+    if (tmp.fwd.lengthSq() < 1e-6) tmp.fwd.set(0, 0, -1);
+    tmp.fwd.normalize();
+
+    sampleAtmosphere(dir, tmp.fwd.x, tmp.fwd.z);
+
+    // --- eye adaptation ---
+    // Walking under the canopy cuts the light by up to ~80%; the eye opens up
+    // to compensate, but slowly, so the jungle reads dark for a second or two
+    // before it resolves. Coming back out is much faster, the way squinting is.
+    let targetExpo = EXPOSURE_BASE * graphicsSettings.brightness;
+    if (q.eyeAdapt) {
+      const dayF = 1 - sky.star;
+      const occl = 1 - 0.78 * canopyCoverAt(px, pz) * dayF;
+      targetExpo *= Math.pow(1 / Math.max(0.1, occl), 0.45) * (1 + 0.30 * (1 - dayF));
+    }
+    const tau = targetExpo > expo.current ? 2.2 : 0.7;
+    expo.current += (targetExpo - expo.current) * (1 - Math.exp(-delta / tau));
+    if (!isFinite(expo.current)) expo.current = EXPOSURE_BASE;
+    gl.toneMappingExposure = expo.current;
+
+    // --- haze: the fog colour is the sky the player is looking at, so the
+    // distance goes blue-grey by day and reddens if you face a sunset ---
+    tmp.fog.copy(atmoLook.horizon).lerp(sky.hor, sky.star);
 
     // --- sky dome ---
-    uniforms.zenith.value.copy(sky.zen);
-    uniforms.horizon.value.copy(sky.hor);
-    uniforms.ground.value.copy(sky.grd);
-    uniforms.sunColor.value.copy(sky.sunColor);
+    uniforms.nightZenith.value.copy(sky.zen);
+    uniforms.nightHorizon.value.copy(sky.hor);
+    // Everything below the horizon line is the haze colour, a little dimmer -
+    // that band is only ever seen beyond the edge of the terrain, and if it
+    // disagreed with the fog you would see exactly where the world stops.
+    uniforms.ground.value.copy(tmp.fog).multiplyScalar(0.72);
+    uniforms.sunTint.value.copy(sky.sunColor);
     uniforms.cloudColor.value.copy(sky.cloud);
-    uniforms.sunDir.value.copy(sunDir.current);
-    uniforms.glow.value = sky.glow;
-    uniforms.starAmount.value = sky.star;
+    uniforms.sunDir.value.copy(dir);
+    uniforms.nightAmount.value = sky.star;
     uniforms.time.value = clockAccum.current;
+    uniforms.uExposure.value = expo.current;
+    uniforms.uTurbidity.value = ATMO.turbidity;
+    uniforms.uRayleigh.value = ATMO.rayleigh;
+    uniforms.uMieC.value = ATMO.mieCoefficient;
+    uniforms.uMieG.value = ATMO.mieDirectionalG;
+    uniforms.uGain.value = ATMO.gain;
 
-    // --- fog + fallback background ---
-    scene.background = sky.hor;
+    // The clear colour is never actually seen (the dome covers it and is drawn
+    // first) but it is an 8-bit sink, so give it a tone-mapped copy rather than
+    // an HDR one that would clip to white if the dome ever failed to draw.
+    tmp.clear.copy(tmp.fog);
+    scene.background = acesToneMap(tmp.clear, expo.current);
     if (scene.fog) {
-      scene.fog.color.copy(sky.hor);
+      scene.fog.color.copy(tmp.fog);
       scene.fog.near = sky.fogN;
       scene.fog.far = sky.fogF;
     }
 
     // --- sun ---
-    const px = playerTransform.position[0];
-    const pz = playerTransform.position[2];
     if (sunRef.current) {
       const sun = sunRef.current;
-      // Keep the light rigged to the player. The shadow frustum is small so
-      // shadows stay sharp; parking it at the world origin instead would make
-      // everything mushy once you walked away from camp.
-      sun.position.set(px + sunDir.current.x * 90, Math.max(2, sunDir.current.y * 90), pz + sunDir.current.z * 90);
-      sunTarget.position.set(px, 0, pz);
+      const e = q.shadowExtent;
+      // Fit the box to what you can see rather than wrapping the player: push
+      // it forward along the view direction, then snap the centre to whole
+      // shadow texels so the edges stop crawling as you walk.
+      tmp.centre.set(px, py, pz).addScaledVector(tmp.fwd, e * SHADOW_FORWARD_BIAS);
+      const texel = (2 * e) / Math.max(1, q.shadowMap);
+      tmp.right.set(0, 1, 0).cross(dir);
+      if (tmp.right.lengthSq() < 1e-6) tmp.right.set(1, 0, 0);
+      tmp.right.normalize();
+      tmp.up.copy(dir).cross(tmp.right).normalize();
+      const ar = Math.round(tmp.centre.dot(tmp.right) / texel) * texel;
+      const au = Math.round(tmp.centre.dot(tmp.up) / texel) * texel;
+      const ad = tmp.centre.dot(dir);
+      tmp.centre.copy(tmp.right).multiplyScalar(ar).addScaledVector(tmp.up, au).addScaledVector(dir, ad);
+
+      sun.position.copy(tmp.centre).addScaledVector(dir, 110);
+      sunTarget.position.copy(tmp.centre);
       sun.target = sunTarget;
       sun.color.copy(sky.sunColor);
       sun.intensity = sky.sunI;
-      sun.visible = sky.sunI > 0.03;
+      sun.visible = sky.sunI > 0.02;
 
       const setup = shadowSetup.current;
-      if (setup.map !== q.shadowMap || setup.extent !== q.shadowExtent) {
+      if (setup.map !== q.shadowMap || setup.extent !== e) {
         setup.map = q.shadowMap;
-        setup.extent = q.shadowExtent;
+        setup.extent = e;
         sun.shadow.mapSize.set(q.shadowMap, q.shadowMap);
         const c = sun.shadow.camera;
-        c.left = -q.shadowExtent;
-        c.right = q.shadowExtent;
-        c.top = q.shadowExtent;
-        c.bottom = -q.shadowExtent;
+        c.left = -e; c.right = e; c.top = e; c.bottom = -e;
         c.near = 1;
-        c.far = 260;
+        c.far = 240;
         c.updateProjectionMatrix();
+        // Smaller texels need less bias; too much and small objects detach
+        // from their own shadow.
+        sun.shadow.bias = -(0.00008 + texel * 0.008);
+        sun.shadow.normalBias = Math.max(0.02, texel * 1.2);
         // Force the shadow map to be reallocated at the new resolution.
         if (sun.shadow.map) {
           sun.shadow.map.dispose();
@@ -3616,24 +4044,104 @@ function DayNightSystem() {
       }
     }
 
-    // --- moon fill: a cold directional opposite the sun, so night reads as
-    // moonlit rather than pitch black. No shadows; it's a fill light. ---
+    // --- moon fill: faint and cold, opposite the sun. No shadows; it is a
+    // fill light, and the point is that night is genuinely dark. ---
     if (moonRef.current) {
       const m = moonRef.current;
-      m.position.set(px - sunDir.current.x * 80, Math.max(6, -sunDir.current.y * 80), pz - sunDir.current.z * 80);
+      m.position.set(px - dir.x * 80, Math.max(6, -dir.y * 80), pz - dir.z * 80);
       m.target = sunTarget;
-      m.intensity = 0.42 * sky.star;
+      m.intensity = 0.30 * sky.star;
       m.visible = sky.star > 0.02;
     }
 
+    // --- ambient and sky bounce take their hue from the scattering, their
+    // strength from the keyframes ---
     if (ambRef.current) {
+      normaliseHue(tmp.hue.copy(atmoLook.average), 0.30);
+      normaliseHue(tmp.night.copy(uniforms.nightZenith.value), 0.25);
+      ambRef.current.color.copy(tmp.hue).lerp(tmp.night, sky.star * 0.8);
       ambRef.current.intensity = sky.ambI;
-      ambRef.current.color.copy(sky.hor).lerp(new THREE.Color('#ffffff'), 0.35);
     }
     if (hemiRef.current) {
+      normaliseHue(tmp.hue.copy(atmoLook.zenith), 0.22);
+      normaliseHue(tmp.night.copy(uniforms.nightZenith.value), 0.25);
+      hemiRef.current.color.copy(tmp.hue).lerp(tmp.night, sky.star * 0.8);
+      // The ground half of the hemisphere light is the jungle bouncing back up.
+      normaliseHue(tmp.ground.copy(sky.grd).lerp(tmp.jungle, 0.5), 0.1);
+      hemiRef.current.groundColor.copy(tmp.ground);
       hemiRef.current.intensity = sky.hemiI;
-      hemiRef.current.color.copy(sky.hor);
-      hemiRef.current.groundColor.copy(sky.grd).lerp(new THREE.Color('#3f5a28'), 0.5);
+    }
+
+    // --- campfires: a fixed pool of lights, handed to the nearest fires ---
+    const picks = tmp.picks;
+    picks.length = 0;
+    for (const id in fireRegistry) {
+      const p = fireRegistry[id];
+      if (!p) continue;
+      const d2 = (p[0] - px) * (p[0] - px) + (p[2] - pz) * (p[2] - pz);
+      if (d2 > 4900) continue; // 70m
+      picks.push(p, d2);
+    }
+    // Tiny list (a dozen at most), so a selection sort beats allocating.
+    for (let s = 0; s < q.fireLights && s * 2 < picks.length; s++) {
+      let best = s;
+      for (let i = s + 1; i * 2 < picks.length; i++) {
+        if (picks[i * 2 + 1] < picks[best * 2 + 1]) best = i;
+      }
+      if (best !== s) {
+        const p0 = picks[s * 2], d0 = picks[s * 2 + 1];
+        picks[s * 2] = picks[best * 2]; picks[s * 2 + 1] = picks[best * 2 + 1];
+        picks[best * 2] = p0; picks[best * 2 + 1] = d0;
+      }
+    }
+    const tt = clockAccum.current;
+    // A fire is the brightest thing in a jungle at night and barely noticeable
+    // at noon, so its strength rides the day cycle. Left at its night value it
+    // would put a hot orange pool in the middle of a sunlit camp.
+    const fireBase = 2.0 + 7.5 * sky.star;
+    let nearestFire = null;
+    let nearestFlicker = 0;
+    for (let s = 0; s < FIRE_SLOTS; s++) {
+      const light = fireRefs[s].current;
+      if (!light) continue;
+      const p = (s < q.fireLights) ? picks[s * 2] : null;
+      if (!p) { light.intensity = 0; continue; }
+      // Three detuned sines plus a slow drift: a fire never settles, and
+      // whatever it lights should never settle either.
+      const k = s * 2.3;
+      const flick = Math.max(0, 0.78
+        + 0.16 * Math.sin(tt * 11.3 + k)
+        + 0.10 * Math.sin(tt * 23.7 + k * 2.1)
+        + 0.06 * Math.sin(tt * 47.0 + k * 3.7));
+      light.position.set(
+        p[0] + Math.sin(tt * 5.1 + k) * 0.07,
+        p[1] + 0.35 + Math.sin(tt * 7.3 + k) * 0.05,
+        p[2] + Math.cos(tt * 4.3 + k) * 0.07,
+      );
+      // The nearest fire gives up part of its light to the shadow-casting
+      // spotlight; the rest keep all of theirs, since nothing shadows for them.
+      const share = (s === 0 && q.fireShadows) ? 0.6 : 1;
+      light.intensity = flick * fireBase * share;
+      if (s === 0) { nearestFire = p; nearestFlicker = flick; }
+    }
+    if (fireSpot.current) {
+      const spot = fireSpot.current;
+      if (nearestFire && q.fireShadows && spot.parent) {
+        // Hung above the fire and aimed down at it, so shadows splay outward
+        // from the flames. The jitter is what makes them crawl.
+        spot.position.set(
+          nearestFire[0] + Math.sin(tt * 3.7) * 0.12,
+          nearestFire[1] + 2.6,
+          nearestFire[2] + Math.cos(tt * 3.1) * 0.12,
+        );
+        fireSpotTarget.position.set(nearestFire[0], nearestFire[1], nearestFire[2]);
+        spot.target = fireSpotTarget;
+        // Scaled up by ~2.6 because it is 2.6m further away than the point
+        // light it is standing in for, and both fall off with the square.
+        spot.intensity = nearestFlicker * fireBase * 0.5 * 2.6;
+      } else {
+        spot.intensity = 0;
+      }
     }
 
     // --- environment map, throttled ---
@@ -3641,7 +4149,7 @@ function DayNightSystem() {
     if (q.envSeconds > 0 && env.pmrem && envAge.current >= q.envSeconds) {
       envAge.current = 0;
       try {
-        paintEnvCanvas(env.cv, sky, sunDir.current);
+        paintEnvCanvas(env.cv, sky, dir, expo.current);
         env.tex.needsUpdate = true;
         const next = env.pmrem.fromEquirectangular(env.tex);
         if (env.rt) env.rt.dispose();
@@ -3667,9 +4175,28 @@ function DayNightSystem() {
       <directionalLight ref=${sunRef} position=${[50, 80, 40]} intensity=${2} castShadow=${true}
         shadow-mapSize-width=${2048} shadow-mapSize-height=${2048}
         shadow-bias=${-0.0004} shadow-normalBias=${0.035} />
-      <directionalLight ref=${moonRef} position=${[-50, 60, -40]} intensity=${0} color="#8fa6d8" />
-      <ambientLight ref=${ambRef} intensity=${0.35} color="#bcd4ff" />
-      <hemisphereLight ref=${hemiRef} args=${['#bcd4ff', '#3a5a30', 0.7]} />
+      <directionalLight ref=${moonRef} position=${[-50, 60, -40]} intensity=${0} color="#7d93c8" />
+      <ambientLight ref=${ambRef} intensity=${0.18} color="#bcd4ff" />
+      <hemisphereLight ref=${hemiRef} args=${['#bcd4ff', '#3a5a30', 0.6]} />
+      <!-- Only as many lights as the preset actually uses get mounted: every
+           light in the scene is evaluated per fragment on every lit material,
+           whether or not it is switched on. Changing the count recompiles the
+           materials, which is why it follows the preset and not the player's
+           distance from the nearest camp. -->
+      ${fireRefs.slice(0, qRender.fireLights).map((r, i) => html`
+        <pointLight key=${i} ref=${r} color="#ff9a42" intensity=${0} distance=${17} decay=${2} />
+      `)}
+      ${!!qRender.fireShadows && html`
+        <${Fragment}>
+          <primitive object=${fireSpotTarget} />
+          <spotLight ref=${fireSpot} color="#ff9a42" intensity=${0}
+            distance=${16} decay=${2} angle=${1.15} penumbra=${0.85}
+            castShadow=${true}
+            shadow-mapSize-width=${1024} shadow-mapSize-height=${1024}
+            shadow-bias=${-0.0015} shadow-normalBias=${0.03}
+            shadow-camera-near=${0.4} shadow-camera-far=${14} />
+        <//>
+      `}
     <//>
   `;
 }
@@ -4855,7 +5382,14 @@ function DecorativeFoliage() {
     const rand = mulberry32(99);
     const detail = q.treeDetail;
     const out = [];
-    const add = (model, x, y, z, scale) => out.push({ model, position: [x, y, z], scale, rotY: rand() * Math.PI * 2 });
+    // Each plant also stamps its canopy into the cover field, which is what
+    // the eye-adaptation code reads to know you have walked into shade.
+    // `shade` is the radius of leaf it actually puts over your head.
+    canopyReset();
+    const add = (model, x, y, z, scale, shade) => {
+      out.push({ model, position: [x, y, z], scale, rotY: rand() * Math.PI * 2 });
+      if (shade > 0) canopySplat(x, z, shade * scale, 1.15);
+    };
     for (let i = 0; i < q.foliage; i++) {
       const angle = rand() * Math.PI * 2;
       const dist = 10 + rand() * 220;
@@ -4871,24 +5405,25 @@ function DecorativeFoliage() {
         // Woodland: mostly broadleaf jungle trees, palms near the water, bushes
         // filling the gaps between.
         const roll = rand();
-        if (pondDist < 32 && roll > 0.55) add(buildPalmModel(rand, detail), x, y, z, 0.8 + rand() * 0.5);
-        else if (roll > 0.34) add(buildJungleTreeModel(rand, detail), x, y, z, s);
-        else add(buildBushModel(rand, detail, false), x, y, z, s * 0.95);
+        if (pondDist < 32 && roll > 0.55) add(buildPalmModel(rand, detail), x, y, z, 0.8 + rand() * 0.5, 3.1);
+        else if (roll > 0.34) add(buildJungleTreeModel(rand, detail), x, y, z, s, 4.6);
+        else add(buildBushModel(rand, detail, false), x, y, z, s * 0.95, 1.2);
       } else if (biome === 1) {
-        if (rand() > 0.5) add(buildCactusModel(rand, detail), x, y, z, 0.7 + rand() * 0.7);
-        else if (rand() > 0.7) add(buildRockModel(rand, detail), x, y, z, 0.4 + rand() * 0.8);
+        if (rand() > 0.5) add(buildCactusModel(rand, detail), x, y, z, 0.7 + rand() * 0.7, 0);
+        else if (rand() > 0.7) add(buildRockModel(rand, detail), x, y, z, 0.4 + rand() * 0.8, 0);
       } else if (biome === 2) {
-        if (rand() > 0.3) add(buildPineModel(rand, detail, true), x, y, z, s);
-        else if (rand() > 0.6) add(buildRockModel(rand, detail), x, y, z, 0.35 + rand() * 0.6);
+        if (rand() > 0.3) add(buildPineModel(rand, detail, true), x, y, z, s, 2.6);
+        else if (rand() > 0.6) add(buildRockModel(rand, detail), x, y, z, 0.35 + rand() * 0.6, 0);
       } else if (biome === 3) {
-        if (rand() > 0.35) add(buildRockModel(rand, detail), x, y, z, 0.45 + rand() * 1.7);
-        else if (rand() > 0.6) add(buildPineModel(rand, detail, false), x, y, z, s * 0.85);
+        if (rand() > 0.35) add(buildRockModel(rand, detail), x, y, z, 0.45 + rand() * 1.7, 0);
+        else if (rand() > 0.6) add(buildPineModel(rand, detail, false), x, y, z, s * 0.85, 2.4);
       } else {
         // Swamp: low dark growth with the occasional palm standing out of it.
-        if (rand() > 0.72) add(buildPalmModel(rand, detail), x, y, z, 0.75 + rand() * 0.5);
-        else add(buildBushModel(rand, detail, true), x, y, z, s * 1.05);
+        if (rand() > 0.72) add(buildPalmModel(rand, detail), x, y, z, 0.75 + rand() * 0.5, 3.1);
+        else add(buildBushModel(rand, detail, true), x, y, z, s * 1.05, 1.4);
       }
     }
+    canopyField.ready = true;
     return out;
   }, [q.foliage, q.treeDetail]);
 
@@ -6004,6 +6539,7 @@ function Player() {
   return html`
     <${Fragment}>
     <group ref=${group} position=${[0, 0, 8]}>
+      <${ContactShadow} radius=${0.44} />
       <group ref=${bodyVisual}>
         <${HumanFigure}
           skinKey="skinPale"
@@ -6093,6 +6629,7 @@ function RemotePlayer() {
 
   return html`
     <group ref=${group} visible=${visible} position=${[remotePlayer.position[0], remotePlayer.position[1], remotePlayer.position[2]]}>
+      <${ContactShadow} radius=${0.44} />
       <${HumanFigure}
         skinKey="skinPale"
         clothColor="#c9a020"
@@ -6167,11 +6704,13 @@ function ResourceNode({ node }) {
 
   if (depleted) return null;
 
-  if (node.type === 'wood') return html`<${Tree} position=${node.position} scale=${1.1} />`;
-  if (node.type === 'fiber') return html`<${Bush} position=${node.position} scale=${1.2} />`;
-  if (node.type === 'stone') return html`<${Rock} position=${node.position} scale=${1.5} />`;
-  if (node.type === 'silver') return html`<${OreNode} position=${node.position} color="#c0c0d0" />`;
-  if (node.type === 'gold') return html`<${OreNode} position=${node.position} color="#ffd700" />`;
+  // Each of these gets a contact shadow as well: they are small enough that
+  // the sun's shadow map alone leaves them looking stuck on rather than sat on.
+  if (node.type === 'wood') return html`<${Fragment}><${ContactShadow} position=${node.position} radius=${1.3} /><${Tree} position=${node.position} scale=${1.1} /><//>`;
+  if (node.type === 'fiber') return html`<${Fragment}><${ContactShadow} position=${node.position} radius=${0.85} /><${Bush} position=${node.position} scale=${1.2} /><//>`;
+  if (node.type === 'stone') return html`<${Fragment}><${ContactShadow} position=${node.position} radius=${0.95} /><${Rock} position=${node.position} scale=${1.5} /><//>`;
+  if (node.type === 'silver') return html`<${Fragment}><${ContactShadow} position=${node.position} radius=${0.8} /><${OreNode} position=${node.position} color="#c0c0d0" /><//>`;
+  if (node.type === 'gold') return html`<${Fragment}><${ContactShadow} position=${node.position} radius=${0.8} /><${OreNode} position=${node.position} color="#ffd700" /><//>`;
   return null;
 }
 
@@ -6429,6 +6968,7 @@ function Kito() {
 
   return html`
     <group position=${KITO_POS}>
+      <${ContactShadow} radius=${0.5} />
       <!-- Kito himself: the same anatomy as everyone else, a touch bigger, in a
            trader's red vest with braided hair and a feather. -->
       <group scale=${1.06}>
@@ -6709,6 +7249,7 @@ function Boar({ id, position }) {
 
   return html`
     <group ref=${group} position=${position}>
+      <${ContactShadow} radius=${0.5} />
       <!-- barrel body: a lathed drum, heavier at the shoulder than the rump -->
       <mesh geometry=${humanGeo('torso')} material=${furMat('boarFur')}
         position=${[0, 0.70, 0.40]} rotation=${[Math.PI / 2, 0, 0]}
@@ -6786,6 +7327,7 @@ function Monkey({ id, position }) {
 
   return html`
     <group ref=${group} position=${position}>
+      <${ContactShadow} radius=${0.34} />
       <!-- hunched torso -->
       <mesh geometry=${humanGeo('torso')} material=${furMat('monkeyFur')}
         position=${[0, 0.72, 0]} rotation=${[0.18, 0, 0]}
@@ -6945,6 +7487,7 @@ function TribeMember({ id, spawn, color }) {
 
   return html`
     <group ref=${group} position=${spawn}>
+      <${ContactShadow} radius=${0.42} />
       <${TribalFigure} color=${color} armL=${armL} armR=${armR}
         legL=${legL} legR=${legR} weapon=${weaponForEntity(id)} />
     </group>
@@ -6955,6 +7498,191 @@ function TribeMember({ id, spawn, color }) {
 // When captured it becomes a "team" — it keeps its own colour/identity but flies a yellow
 // alliance flag; garrison warriors are always the player's yellow.
 // Inter-tribal conquests repaint the camp in the conquering tribe's colour.
+// ---------- Contact shadows ----------
+// A shadow map can only resolve so much, and the first thing it loses is the
+// tight dark patch right where something touches the ground. Without it
+// everything looks like it is hovering a few centimetres up. This is the old
+// trick and still the cheapest one: a soft dark disc, laid flat under the
+// object, drawn without writing depth. One geometry and one material shared by
+// every single one of them, so the whole effect is one draw state.
+let _contactGeo = null;
+let _contactMat = null;
+function contactShadowGeo() {
+  if (!_contactGeo) {
+    _contactGeo = new THREE.PlaneGeometry(1, 1);
+    _contactGeo.rotateX(-Math.PI / 2);
+  }
+  return _contactGeo;
+}
+function contactShadowMat() {
+  if (!_contactMat) {
+    _contactMat = new THREE.MeshBasicMaterial({
+      // buildSoftDisc is white with a soft alpha falloff, so tinting it black
+      // gives a blob that fades out at the edge instead of a hard circle.
+      map: texFrom(buildSoftDisc(64), [1, 1], false),
+      color: '#000000',
+      transparent: true,
+      opacity: 0.5,
+      depthWrite: false,
+      toneMapped: false,
+    });
+  }
+  return _contactMat;
+}
+
+function ContactShadow({ radius = 0.5, y = 0.05, position = null }) {
+  const quality = useGame((s) => s.graphicsQuality);
+  if (!(GRAPHICS_PRESETS[quality] || gfx()).contactShadows) return null;
+  const at = position ? [position[0], position[1] + y, position[2]] : [0, y, 0];
+  return html`<mesh geometry=${contactShadowGeo()} material=${contactShadowMat()}
+    position=${at} scale=${[radius * 2, 1, radius * 2]}
+    renderOrder=${1} frustumCulled=${true} />`;
+}
+
+// ---------- Campfire ----------
+// Purely a prop - nothing to pick up, nothing to interact with. It exists
+// because a camp with no fire in it looks abandoned, and because a jungle
+// night needs one warm thing in it to read as dark. The light itself is not
+// here: the fire registers its position and DayNightSystem hands the nearest
+// few a light out of a fixed pool, so walking into a valley full of camps can
+// never trip a shader recompile.
+const FIRE_GEO = {};
+function fireGeo(key) {
+  if (FIRE_GEO[key]) return FIRE_GEO[key];
+  let g;
+  if (key === 'ash') {
+    g = new THREE.CircleGeometry(1.05, 18);
+    g.rotateX(-Math.PI / 2);
+  } else if (key === 'stones') {
+    // A lumpy torus reads as a ring of stones once the rock normal map is on
+    // it, and costs one draw instead of seven.
+    g = new THREE.TorusGeometry(0.62, 0.14, 5, 9);
+    g.rotateX(Math.PI / 2);
+    const pos = g.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+      const n = Math.sin(x * 9.1 + z * 7.3) * 0.5 + Math.sin(z * 13.7 - x * 5.1) * 0.5;
+      pos.setXYZ(i, x * (1 + n * 0.09), y + n * 0.045, z * (1 + n * 0.09));
+    }
+    g.computeVertexNormals();
+  } else if (key === 'log') {
+    g = new THREE.CylinderGeometry(0.052, 0.07, 0.95, 7);
+  } else if (key === 'flame') {
+    g = new THREE.ConeGeometry(0.21, 0.8, 7, 1, true);
+  } else if (key === 'flameInner') {
+    g = new THREE.ConeGeometry(0.12, 0.5, 6, 1, true);
+  } else if (key === 'glow') {
+    g = new THREE.PlaneGeometry(2.6, 2.6);
+  } else {
+    throw new Error('unknown fire geo ' + key);
+  }
+  FIRE_GEO[key] = g;
+  return g;
+}
+
+function fireMat(key) {
+  if (key === 'ash') {
+    return surfaceMat('fireAsh', 'ground', [2.2, 2.2], {
+      color: '#241e18', roughness: 0.98, metalness: 0,
+    });
+  }
+  if (key === 'stones') {
+    return surfaceMat('fireStones', 'rock', [2.4, 1.2], {
+      color: '#8e8a80', roughness: 0.82, metalness: 0.02, envMapIntensity: 0.5,
+    });
+  }
+  if (key === 'log') {
+    return surfaceMat('fireLog', 'bark', [1.2, 2.4], {
+      color: '#3a2c20', roughness: 0.92, metalness: 0,
+    });
+  }
+  // The flames and the halo are emissive, not lit: additive, no depth write,
+  // and deliberately left out of tone mapping so they stay hot-looking however
+  // far the eye-adaptation exposure has drifted.
+  if (key === 'flame') {
+    return stdMat('fireFlame', () => new THREE.MeshBasicMaterial({
+      color: '#ff7a1e', transparent: true, opacity: 0.75,
+      blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
+      toneMapped: false,
+    }));
+  }
+  if (key === 'flameInner') {
+    return stdMat('fireCore', () => new THREE.MeshBasicMaterial({
+      color: '#ffd88a', transparent: true, opacity: 0.9,
+      blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
+      toneMapped: false,
+    }));
+  }
+  if (key === 'glow') {
+    return stdMat('fireGlow', () => new THREE.MeshBasicMaterial({
+      map: texFrom(buildSoftDisc(64), [1, 1], false),
+      color: '#ff8c3a', transparent: true, opacity: 0.42,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+      toneMapped: false,
+    }));
+  }
+  throw new Error('unknown fire mat ' + key);
+}
+
+const FIRE_LOGS = [
+  { p: [0.0, 0.2, -0.17], r: [0.95, 0.0, 0.0] },
+  { p: [0.16, 0.2, 0.1], r: [-0.48, 0.0, -0.82] },
+  { p: [-0.16, 0.2, 0.1], r: [-0.48, 0.0, 0.82] },
+];
+
+function Campfire({ id, position, scale = 1 }) {
+  const flame = useRef();
+  const core = useRef();
+  const glow = useRef();
+  const phase = useMemo(() => Math.random() * 100, []);
+  const px = position[0], py = position[1], pz = position[2];
+
+  useEffect(() => {
+    fireRegistry[id] = [px, py, pz];
+    return () => { delete fireRegistry[id]; };
+  }, [id, px, py, pz]);
+
+  useFrame((state) => {
+    const t = state.clock.elapsedTime + phase;
+    // Same three-sine recipe the light uses, so the flame and the light it
+    // casts breathe together instead of fighting each other.
+    const f = 0.82 + 0.14 * Math.sin(t * 11.3) + 0.09 * Math.sin(t * 23.7) + 0.05 * Math.sin(t * 47.0);
+    if (flame.current) {
+      flame.current.scale.set(0.9 + f * 0.2, f, 0.9 + f * 0.2);
+      flame.current.rotation.y = t * 1.6;
+      flame.current.position.x = Math.sin(t * 6.1) * 0.025;
+      flame.current.position.z = Math.cos(t * 5.3) * 0.025;
+    }
+    if (core.current) {
+      core.current.scale.set(1, 0.85 + f * 0.3, 1);
+      core.current.rotation.y = -t * 2.3;
+    }
+    if (glow.current) {
+      // The halo material is shared by every fire in the world, so flickering
+      // its opacity would make them all flicker in lockstep. Scale is per-mesh.
+      const g = 0.82 + f * 0.26;
+      glow.current.scale.set(g, g, 1);
+      // Billboard it so it always faces the camera.
+      glow.current.quaternion.copy(state.camera.quaternion);
+    }
+  });
+
+  return html`
+    <group position=${[px, py, pz]} scale=${scale}>
+      <mesh geometry=${fireGeo('ash')} material=${fireMat('ash')} position=${[0, 0.015, 0]} receiveShadow=${true} />
+      <mesh geometry=${fireGeo('stones')} material=${fireMat('stones')} position=${[0, 0.09, 0]}
+        castShadow=${true} receiveShadow=${true} />
+      ${FIRE_LOGS.map((l, i) => html`
+        <mesh key=${i} geometry=${fireGeo('log')} material=${fireMat('log')}
+          position=${l.p} rotation=${l.r} castShadow=${true} />
+      `)}
+      <mesh ref=${glow} geometry=${fireGeo('glow')} material=${fireMat('glow')} position=${[0, 0.5, 0]} renderOrder=${2} />
+      <mesh ref=${flame} geometry=${fireGeo('flame')} material=${fireMat('flame')} position=${[0, 0.52, 0]} renderOrder=${3} />
+      <mesh ref=${core} geometry=${fireGeo('flameInner')} material=${fireMat('flameInner')} position=${[0, 0.4, 0]} renderOrder=${4} />
+    </group>
+  `;
+}
+
 function TribeCamp({ tribe }) {
   const [x, , z] = tribe.campPosition;
   const captured = useGame((s) => !!s.capturedTribes[tribe.id]);
@@ -6994,6 +7722,7 @@ function TribeCamp({ tribe }) {
           </mesh>
         `}
       </group>
+      <${Campfire} id=${`fire_${tribe.id}`} position=${[x + 1.8, 0, z + 1.6]} />
       ${!captured && TRIBE_MEMBER_OFFSETS.map((p, i) => html`
         <${TribeMember} key=${i} id=${`${tribe.id}_m${i}`} spawn=${[x + p[0], 0, z + p[1]]} color=${campColor} />
       `)}
@@ -7033,20 +7762,23 @@ function TribeSpawnManager() {
 // ---------- The player's own tribe banner, marks the raid target ----------
 function PlayerTribeBase() {
   return html`
-    <group position=${BASE_CENTER}>
-      <mesh position=${[0, 1.5, 0]} castShadow=${true}>
-        <cylinderGeometry args=${[0.15, 0.15, 3, 6]} />
-        <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#5a3c22" />
-      </mesh>
-      <mesh position=${[0, 3.2, 0]} castShadow=${true}>
-        <coneGeometry args=${[0.45, 0.7, 5]} />
-        <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#ffe27a" />
-      </mesh>
-      <mesh position=${[0, 2.2, 0.05]} castShadow=${true}>
-        <planeGeometry args=${[0.8, 1]} />
-        <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#c9a227" side=${THREE.DoubleSide} />
-      </mesh>
-    </group>
+    <${Fragment}>
+      <${Campfire} id="fire_base" position=${[BASE_CENTER[0] + 2.4, BASE_CENTER[1], BASE_CENTER[2] + 1.2]} />
+      <group position=${BASE_CENTER}>
+        <mesh position=${[0, 1.5, 0]} castShadow=${true}>
+          <cylinderGeometry args=${[0.15, 0.15, 3, 6]} />
+          <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#5a3c22" />
+        </mesh>
+        <mesh position=${[0, 3.2, 0]} castShadow=${true}>
+          <coneGeometry args=${[0.45, 0.7, 5]} />
+          <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#ffe27a" />
+        </mesh>
+        <mesh position=${[0, 2.2, 0.05]} castShadow=${true}>
+          <planeGeometry args=${[0.8, 1]} />
+          <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#c9a227" side=${THREE.DoubleSide} />
+        </mesh>
+      </group>
+    <//>
   `;
 }
 
@@ -7055,24 +7787,27 @@ function FriendBase() {
   const mpStatus = useGame((s) => s.mpStatus);
   if (mpStatus !== 'connected') return null;
   return html`
-    <group position=${FRIEND_BASE_CENTER}>
-      <mesh position=${[0, 1.5, 0]} castShadow=${true}>
-        <cylinderGeometry args=${[0.15, 0.15, 3, 6]} />
-        <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#5a3c22" />
-      </mesh>
-      <mesh position=${[0, 3.2, 0]} castShadow=${true}>
-        <coneGeometry args=${[0.4, 0.6, 5]} />
-        <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#ffe27a" />
-      </mesh>
-      <mesh position=${[0, 2.2, 0.05]} castShadow=${true}>
-        <planeGeometry args=${[0.7, 0.9]} />
-        <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#c9a227" side=${THREE.DoubleSide} />
-      </mesh>
-      <mesh position=${[0, 0.05, 0]} receiveShadow=${true}>
-        <cylinderGeometry args=${[2.5, 2.5, 0.06, 16]} />
-        <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#b89a30" roughness=${0.9} />
-      </mesh>
-    </group>
+    <${Fragment}>
+      <${Campfire} id="fire_friend" position=${[FRIEND_BASE_CENTER[0] + 2.4, FRIEND_BASE_CENTER[1], FRIEND_BASE_CENTER[2] + 1.2]} />
+      <group position=${FRIEND_BASE_CENTER}>
+        <mesh position=${[0, 1.5, 0]} castShadow=${true}>
+          <cylinderGeometry args=${[0.15, 0.15, 3, 6]} />
+          <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#5a3c22" />
+        </mesh>
+        <mesh position=${[0, 3.2, 0]} castShadow=${true}>
+          <coneGeometry args=${[0.4, 0.6, 5]} />
+          <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#ffe27a" />
+        </mesh>
+        <mesh position=${[0, 2.2, 0.05]} castShadow=${true}>
+          <planeGeometry args=${[0.7, 0.9]} />
+          <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#c9a227" side=${THREE.DoubleSide} />
+        </mesh>
+        <mesh position=${[0, 0.05, 0]} receiveShadow=${true}>
+          <cylinderGeometry args=${[2.5, 2.5, 0.06, 16]} />
+          <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#b89a30" roughness=${0.9} />
+        </mesh>
+      </group>
+    <//>
   `;
 }
 
@@ -7158,6 +7893,7 @@ function PlayerWarrior({ spawn, color = PLAYER_TRIBE_COLOR }) {
 
   return html`
     <group ref=${group} position=${spawn}>
+      <${ContactShadow} radius=${0.42} />
       <${WarriorFigure} legL=${legL} legR=${legR} armL=${armL} armR=${armR} weapon=${weaponForEntity('guard' + spawn[0].toFixed(1) + spawn[2].toFixed(1))} color=${color} />
     </group>
   `;
@@ -7302,6 +8038,7 @@ function EscortWarrior({ index }) {
 
   return html`
     <group ref=${group} position=${spawn}>
+      <${ContactShadow} radius=${0.42} />
       <${WarriorFigure} legL=${legL} legR=${legR} armL=${armL} armR=${armR} weapon=${weaponForEntity('escort' + index)} />
     </group>
   `;
@@ -7394,6 +8131,7 @@ function Raider({ id, startPosition, color, targetPos = BASE_CENTER, targetTribe
 
   return html`
     <group ref=${group} position=${startPosition}>
+      <${ContactShadow} radius=${0.42} />
       <${TribalFigure} color=${color} armL=${armL} armR=${armR}
         legL=${legL} legR=${legR} weapon=${weaponForEntity(id)} />
     </group>
@@ -7450,6 +8188,7 @@ function DistantTribeCamp({ tribe }) {
           <meshStandardMaterial color=${tribe.color} flatShading=${true} />
         </mesh>
       </group>
+      <${Campfire} id=${`fire_dt_${tribe.id}`} position=${[x + 2.1, 0, z + 1.9]} scale=${1.15} />
       ${TRIBE_MEMBER_OFFSETS.map((p, i) => html`
         <${TribeMember} key=${i} id=${`dt_${tribe.id}_m${i}`} spawn=${[x + p[0], 0, z + p[1]]} color=${tribe.color} />
       `)}
@@ -7511,6 +8250,7 @@ function DistantRaider({ id, startPosition, color, targetPos }) {
 
   return html`
     <group ref=${group} position=${startPosition}>
+      <${ContactShadow} radius=${0.42} />
       <${TribalFigure} color=${color} armL=${armL} armR=${armR}
         legL=${legL} legR=${legR} weapon=${weaponForEntity(id)} />
       <mesh position=${[0, 1.3, 0.3]} rotation=${[Math.PI / 2.4, 0, 0]} castShadow=${true}>
@@ -7596,6 +8336,7 @@ function InterTribalRaider({ id, startPosition, color, targetPos }) {
 
   return html`
     <group ref=${group} position=${startPosition}>
+      <${ContactShadow} radius=${0.42} />
       <${TribalFigure} color=${color} armL=${armL} armR=${armR}
         legL=${legL} legR=${legR} weapon=${weaponForEntity(id)} />
     </group>
@@ -8655,6 +9396,10 @@ function SettingsPanel() {
   const setInvertY = useGame((s) => s.setInvertY);
   const graphicsQuality = useGame((s) => s.graphicsQuality);
   const setGraphicsQuality = useGame((s) => s.setGraphicsQuality);
+  const brightness = useGame((s) => s.brightness);
+  const setBrightness = useGame((s) => s.setBrightness);
+  const showStats = useGame((s) => s.showStats);
+  const setShowStats = useGame((s) => s.setShowStats);
   const [tab, setTab] = useState('controls');
   const [listening, setListening] = useState(null); // action id waiting for a key
   const cancelRef = useRef(null);
@@ -8801,10 +9546,58 @@ function SettingsPanel() {
         <span class="set-label">Sky reflections refresh</span>
         <strong class="set-value">${preset.envSeconds > 0 ? 'every ' + preset.envSeconds + 's' : 'off'}</strong>
       </div>
+      <div class="set-row">
+        <span class="set-label">Shadow sharpness</span>
+        <strong class="set-value">${(((preset.shadowExtent * 2) / preset.shadowMap) * 100).toFixed(1)}cm / texel</strong>
+      </div>
+      <div class="set-row">
+        <span class="set-label">Contact shadows</span>
+        <strong class="set-value">${preset.contactShadows ? 'on' : 'off'}</strong>
+      </div>
+      <div class="set-row">
+        <span class="set-label">Firelight</span>
+        <strong class="set-value">
+          ${preset.fireLights} ${preset.fireLights === 1 ? 'fire' : 'fires'}${preset.fireShadows ? ', casting shadows' : ''}
+        </strong>
+      </div>
+      <div class="set-row">
+        <span class="set-label">Eye adaptation</span>
+        <strong class="set-value">${preset.eyeAdapt ? 'on' : 'off'}</strong>
+      </div>
       <p class="set-hint">
         If the game feels heavy, <strong>Grass</strong> and <strong>Render scale</strong> are
         the two that cost the most — drop a preset and both come down together.
       </p>
+      <h3 class="inv-section">Lighting</h3>
+      <div class="set-row">
+        <span class="set-label">Brightness</span>
+        <div class="set-slider">
+          <input
+            type="range" min="0.6" max="1.8" step="0.05"
+            value=${brightness}
+            onChange=${(e) => setBrightness(parseFloat(e.target.value))}
+          />
+          <strong style=${{ minWidth: '38px', color: '#ffe27a' }}>${brightness.toFixed(2)}x</strong>
+        </div>
+      </div>
+      <p class="set-hint">
+        The jungle is lit by a real scattering sky and the exposure drifts on its own as you
+        move between clearings and shade, the way an eye does. This is a multiplier on top of
+        all that — nudge it if the whole picture reads too dark or too washed out on your screen.
+      </p>
+      <h3 class="inv-section">Performance readout</h3>
+      <div class="set-row">
+        <span class="set-label">Show frame rate on screen</span>
+        <input type="checkbox" checked=${showStats} onChange=${(e) => setShowStats(e.target.checked)} />
+      </div>
+      <div class="set-row">
+        <span class="set-label">Right now</span>
+        <strong class="set-value">
+          ${perfStats.fps > 0
+            ? `${perfStats.fps.toFixed(0)} fps · ${perfStats.draws} draws · ${(perfStats.tris / 1000).toFixed(0)}k tris`
+            : 'not measured yet'}
+        </strong>
+      </div>
     <//>
   `;
 
@@ -9003,6 +9796,7 @@ function Hud() {
 
   return html`
     <div id="hud">
+      <${StatsOverlay} />
       <${Minimap} />
 
       <div class="hud-top-right">
@@ -9210,7 +10004,9 @@ class ErrorBoundary extends React.Component {
 function onCanvasCreated(state) {
   const gl = state.gl;
   gl.toneMapping = THREE.ACESFilmicToneMapping;
-  gl.toneMappingExposure = 1.05;
+  // DayNightSystem drives this every frame from here on (eye adaptation); this
+  // is just so the very first frame isn't blown out.
+  gl.toneMappingExposure = EXPOSURE_BASE * graphicsSettings.brightness;
   gl.outputColorSpace = THREE.SRGBColorSpace;
   gl.shadowMap.enabled = true;
   gl.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -9222,6 +10018,48 @@ function onCanvasCreated(state) {
 // Render resolution follows the quality preset. Changing it live (rather than
 // remounting the Canvas) matters because a remount would reset the scene and
 // teleport the player back to spawn.
+// Samples the renderer's own counters half a second at a time. Reading
+// gl.info is free; the averaging is what makes the number readable.
+function PerfProbe() {
+  const { gl } = useThree();
+  const acc = useRef({ t: 0, n: 0 });
+  useFrame((_, delta) => {
+    const a = acc.current;
+    a.t += delta;
+    a.n += 1;
+    if (a.t >= 0.5) {
+      perfStats.fps = a.n / a.t;
+      perfStats.ms = (a.t / a.n) * 1000;
+      perfStats.draws = gl.info.render.calls;
+      perfStats.tris = gl.info.render.triangles;
+      a.t = 0;
+      a.n = 0;
+    }
+  });
+  return null;
+}
+
+// A deliberately plain readout. It re-renders twice a second and only while
+// it is switched on, so it can't itself be the reason the frame rate drops.
+function StatsOverlay() {
+  const showStats = useGame((s) => s.showStats);
+  const [, bump] = useState(0);
+  useEffect(() => {
+    if (!showStats) return undefined;
+    const timer = setInterval(() => bump((n) => n + 1), 500);
+    return () => clearInterval(timer);
+  }, [showStats]);
+  if (!showStats) return null;
+  return html`
+    <div class="perf-stats">
+      <span>${perfStats.fps.toFixed(0)} fps</span>
+      <span>${perfStats.ms.toFixed(1)} ms</span>
+      <span>${perfStats.draws} draws</span>
+      <span>${(perfStats.tris / 1000).toFixed(0)}k tris</span>
+    </div>
+  `;
+}
+
 function RendererTuning() {
   const { gl } = useThree();
   const quality = useGame((s) => s.graphicsQuality);
@@ -9248,6 +10086,7 @@ function App() {
         onCreated=${onCanvasCreated}
       >
         <${RendererTuning} />
+      <${PerfProbe} />
         <${World} />
         <${Player} />
         <${RemotePlayer} />
