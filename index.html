@@ -51,10 +51,29 @@ canvas {
   user-select: none;
 }
 
-.meters-counter {
+/* Everything in the top-right lives in this single column, laid out by flexbox
+   rather than by absolute coordinates, so items can't land on top of each other. */
+.hud-top-right {
   position: absolute;
   top: 16px;
   right: 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  max-width: calc(100vw - 40px);
+}
+
+.hud-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.meters-counter {
+  text-align: right;
   background: rgba(20, 40, 20, 0.65);
   border: 2px solid #c9a227;
   border-radius: 10px;
@@ -79,9 +98,6 @@ canvas {
 }
 
 .tribe-panel {
-  position: absolute;
-  top: 60px;
-  left: 20px;
   background: rgba(40, 20, 10, 0.6);
   border: 2px solid #c2453b;
   border-radius: 10px;
@@ -89,6 +105,7 @@ canvas {
   font-size: 14px;
   pointer-events: auto;
   cursor: pointer;
+  white-space: nowrap;
 }
 
 .stepper {
@@ -104,9 +121,6 @@ canvas {
 }
 
 .mp-button {
-  position: absolute;
-  top: 16px;
-  right: 20px;
   background: rgba(20, 20, 40, 0.6);
   border: 2px solid #6a8fd8;
   border-radius: 10px;
@@ -114,6 +128,7 @@ canvas {
   font-size: 14px;
   cursor: pointer;
   pointer-events: auto;
+  white-space: nowrap;
 }
 
 .mp-button.mp-connected {
@@ -121,11 +136,21 @@ canvas {
   background: rgba(20, 50, 20, 0.6);
 }
 
-.raid-banner {
+/* Banners stack under the minimap rather than floating at top-centre: left-anchored
+   means only the right edge can ever reach the top-right column, and max-width
+   handles that, so two simultaneous raids can't land on top of each other. */
+.raid-banners {
   position: absolute;
-  top: 16px;
-  left: 50%;
-  transform: translateX(-50%);
+  top: 196px;
+  left: 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  max-width: min(560px, calc(100vw - 420px));
+}
+
+.raid-banner {
   background: rgba(120, 20, 20, 0.85);
   border: 2px solid #ff5a5a;
   border-radius: 10px;
@@ -290,14 +315,12 @@ canvas {
 }
 
 .day-clock {
-  position: absolute;
-  top: 16px;
-  left: 20px;
   background: rgba(20, 20, 40, 0.6);
   border: 2px solid #6a8fd8;
   border-radius: 10px;
   padding: 6px 14px;
   font-size: 14px;
+  white-space: nowrap;
 }
 
 .hotbar {
@@ -335,9 +358,6 @@ canvas {
 }
 
 .toasts {
-  position: absolute;
-  top: 70px;
-  right: 20px;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -359,9 +379,6 @@ canvas {
 }
 
 .notif-btn {
-  position: absolute;
-  top: 16px;
-  right: 155px;
   background: rgba(20,15,8,0.65);
   border: 1px solid rgba(255,255,255,0.2);
   border-radius: 8px;
@@ -371,11 +388,9 @@ canvas {
   cursor: pointer;
   pointer-events: auto;
   z-index: 10;
+  white-space: nowrap;
 }
 .notif-panel {
-  position: absolute;
-  top: 50px;
-  right: 20px;
   width: 300px;
   max-height: 400px;
   background: rgba(20,15,8,0.93);
@@ -613,6 +628,240 @@ canvas {
   margin-bottom: 10px;
 }
 
+/* ---------- HUD quick buttons (map / settings) ---------- */
+.hud-btn {
+  background: rgba(20,15,8,0.65);
+  border: 1px solid rgba(255,255,255,0.22);
+  border-radius: 8px;
+  color: #fdf3da;
+  font-family: inherit;
+  font-size: 13px;
+  padding: 6px 11px;
+  cursor: pointer;
+  pointer-events: auto;
+  white-space: nowrap;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+}
+
+.hud-btn:hover {
+  background: rgba(60,45,20,0.8);
+  border-color: #c9a227;
+}
+
+/* ---------- Circular minimap (top-left) ---------- */
+.minimap {
+  position: absolute;
+  top: 16px;
+  left: 20px;
+  width: 168px;
+  height: 168px;
+  border-radius: 50%;
+  border: 3px solid #c9a227;
+  background: #0d1a0d;
+  overflow: hidden;
+  pointer-events: auto;
+  cursor: pointer;
+  box-shadow: 0 4px 18px rgba(0,0,0,0.55);
+}
+
+.minimap canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.minimap .mm-tick {
+  position: absolute;
+  top: 1px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 10px;
+  font-weight: bold;
+  color: #ffe27a;
+  text-shadow: 0 1px 3px #000;
+  pointer-events: none;
+}
+
+.minimap .mm-coords {
+  position: absolute;
+  bottom: 3px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 9px;
+  color: #ffe27a;
+  background: rgba(0,0,0,0.5);
+  padding: 0 5px;
+  border-radius: 3px;
+  pointer-events: none;
+}
+
+.minimap:hover {
+  border-color: #ffe27a;
+}
+
+/* ---------- World map ---------- */
+.panel.panel-wide {
+  width: min(640px, 94vw);
+}
+
+.map-wrap {
+  position: relative;
+  line-height: 0;
+}
+
+/* Scaled by width only, so the canvas stays exactly square (1:1 intrinsic size)
+   and MapPanel can map client coords straight onto canvas pixels. */
+.map-canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 2px solid #6a5224;
+  border-radius: 8px;
+  background: #0d1a0d;
+  cursor: grab;
+  touch-action: none;
+}
+
+.map-canvas.dragging {
+  cursor: grabbing;
+}
+
+.map-compass {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  font-size: 11px;
+  letter-spacing: 1px;
+  color: #ffe27a;
+  background: rgba(0,0,0,0.45);
+  padding: 2px 7px;
+  border-radius: 4px;
+  line-height: 1.4;
+}
+
+.map-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 10px 0 2px;
+  font-size: 12px;
+  color: #d8c8a8;
+}
+
+.map-toolbar .spacer {
+  margin-left: auto;
+}
+
+.map-toolbar label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+}
+
+.map-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 14px;
+  margin-top: 8px;
+  font-size: 11px;
+  color: #cdbfa0;
+}
+
+.map-legend span {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.map-legend i {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+  border: 1px solid rgba(0,0,0,0.5);
+}
+
+/* ---------- Settings / control rebinding ---------- */
+.set-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  margin-bottom: 4px;
+  background: rgba(255,255,255,0.04);
+}
+
+.set-row:hover {
+  background: rgba(255,255,255,0.08);
+}
+
+.set-row .set-label {
+  flex: 1;
+  font-size: 13px;
+}
+
+.key-btn {
+  min-width: 90px;
+  background: rgba(0,0,0,0.35);
+  border: 1px solid #6a5224;
+  color: #ffe27a;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: bold;
+  padding: 5px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.key-btn:hover {
+  border-color: #c9a227;
+  background: rgba(201,162,39,0.18);
+}
+
+.key-btn.listening {
+  background: #c9a227;
+  border-color: #ffe27a;
+  color: #1b150f;
+  animation: keyPulse 1s ease-in-out infinite;
+}
+
+.key-btn.fixed {
+  cursor: default;
+  color: #b8a98a;
+  border-style: dashed;
+}
+
+.key-btn.fixed:hover {
+  border-color: #6a5224;
+  background: rgba(0,0,0,0.35);
+}
+
+@keyframes keyPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+
+.set-hint {
+  font-size: 11px;
+  color: #b8a98a;
+  margin: 2px 0 10px;
+  line-height: 1.5;
+}
+
+.set-slider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.set-slider input[type=range] {
+  width: 170px;
+}
+
 .start-screen {
   position: fixed;
   inset: 0;
@@ -681,6 +930,8 @@ const html = htm.bind(React.createElement);
 // ============================================================
 const keys = {};
 const pressHandlers = new Set();
+// When the settings panel is waiting for a rebind, it parks a grabber here.
+let keyCapture = null;
 
 function isTypingInField() {
   const el = document.activeElement;
@@ -688,6 +939,15 @@ function isTypingInField() {
 }
 
 window.addEventListener('keydown', (e) => {
+  // A pending rebind swallows the key completely, so binding (say) B to jump
+  // doesn't also pop the build menu on the way through.
+  if (keyCapture) {
+    e.preventDefault();
+    const grab = keyCapture;
+    keyCapture = null;
+    grab(e.code);
+    return;
+  }
   if (isTypingInField()) return;
   if (!keys[e.code]) {
     for (const h of pressHandlers) h(e.code);
@@ -713,6 +973,146 @@ function onKeyPress(handler) {
 // Lets on-screen touch buttons trigger the same one-shot actions as a key press.
 function simulateKeyPress(code) {
   for (const h of pressHandlers) h(code);
+}
+
+// Lets the settings panel grab the very next physical key press for rebinding.
+// Returns a cancel function.
+function captureNextKey(grab) {
+  keyCapture = grab;
+  return () => { if (keyCapture === grab) keyCapture = null; };
+}
+
+// ============================================================
+// keybinds.js - remappable action <-> key bindings
+// ============================================================
+// Every rebindable action lives here, and nothing else in the game refers to a
+// raw key code. `held` actions are polled each frame via keyHeld(); the rest
+// fire once per press and are routed through actionForCode().
+const KEYBIND_ACTIONS = [
+  { id: 'moveForward', group: 'Movement',  label: 'Move forward',        def: 'KeyW',        held: true },
+  { id: 'moveBack',    group: 'Movement',  label: 'Move backward',       def: 'KeyS',        held: true },
+  { id: 'moveLeft',    group: 'Movement',  label: 'Strafe left',         def: 'KeyA',        held: true },
+  { id: 'moveRight',   group: 'Movement',  label: 'Strafe right',        def: 'KeyD',        held: true },
+  { id: 'jump',        group: 'Movement',  label: 'Jump',                def: 'Space',       held: true },
+  { id: 'sprint',      group: 'Movement',  label: 'Sprint',              def: 'ShiftLeft',   held: true },
+  { id: 'crouch',      group: 'Movement',  label: 'Crouch',              def: 'ControlLeft', held: true },
+  { id: 'lookLeft',    group: 'Camera',    label: 'Look left',           def: 'ArrowLeft',   held: true },
+  { id: 'lookRight',   group: 'Camera',    label: 'Look right',          def: 'ArrowRight',  held: true },
+  { id: 'lookUp',      group: 'Camera',    label: 'Look up',             def: 'ArrowUp',     held: true },
+  { id: 'lookDown',    group: 'Camera',    label: 'Look down',           def: 'ArrowDown',   held: true },
+  { id: 'camera',      group: 'Camera',    label: 'First / third person', def: 'KeyC' },
+  { id: 'gather',      group: 'Actions',   label: 'Gather / drink water', def: 'KeyF' },
+  { id: 'interact',    group: 'Actions',   label: 'Interact, shop, pick up', def: 'KeyE' },
+  { id: 'craft',       group: 'Actions',   label: 'Craft at workbench',  def: 'KeyR' },
+  { id: 'build',       group: 'Actions',   label: 'Build menu',          def: 'KeyB' },
+  { id: 'poke',        group: 'Actions',   label: 'Poke (keep weapon)',  def: 'Digit0' },
+  { id: 'cycleHotbar', group: 'Interface', label: 'Cycle hotbar slot',   def: 'KeyQ' },
+  { id: 'inventory',   group: 'Interface', label: 'Inventory',           def: 'Tab' },
+  { id: 'map',         group: 'Interface', label: 'World map',           def: 'KeyM' },
+  { id: 'settings',    group: 'Interface', label: 'Settings',            def: 'KeyO' },
+  { id: 'tribe',       group: 'Interface', label: 'Tribe panel',         def: 'KeyG' },
+  { id: 'chat',        group: 'Interface', label: 'Chat with friend',    def: 'KeyT' },
+];
+const KEYBIND_GROUPS = ['Movement', 'Camera', 'Actions', 'Interface'];
+
+// Esc is the universal close/cancel key, so it can never be bound to an action.
+const RESERVED_CODES = new Set(['Escape']);
+
+// The map is a heads-up panel, not a modal: you keep walking while it's open so the
+// marker tracks you live. Every other panel freezes movement as before.
+function panelBlocksMovement(panel) {
+  return panel !== null && panel !== 'map';
+}
+
+const DEFAULT_KEYBINDS = Object.fromEntries(KEYBIND_ACTIONS.map((a) => [a.id, a.def]));
+const KEYBINDS_STORAGE_KEY = 'jungleking.keybinds.v1';
+
+// Plain-object mirrors of the store's bindings. The player's frame loop reads
+// these directly so polling movement keys never costs a store lookup.
+let activeBinds = { ...DEFAULT_KEYBINDS };
+let codeToAction = {};
+function setActiveBinds(binds) {
+  activeBinds = binds;
+  codeToAction = {};
+  for (const id in binds) codeToAction[binds[id]] = id;
+}
+
+function loadKeybinds() {
+  const binds = { ...DEFAULT_KEYBINDS };
+  try {
+    const saved = JSON.parse(localStorage.getItem(KEYBINDS_STORAGE_KEY) || 'null');
+    // Only trust ids we still ship, so an old save can't resurrect a dead action.
+    if (saved) {
+      for (const id in binds) {
+        if (typeof saved[id] === 'string' && saved[id] && !RESERVED_CODES.has(saved[id])) binds[id] = saved[id];
+      }
+    }
+  } catch (e) { /* storage disabled or corrupt: defaults are fine */ }
+  return binds;
+}
+
+function saveKeybinds(binds) {
+  try { localStorage.setItem(KEYBINDS_STORAGE_KEY, JSON.stringify(binds)); } catch (e) {}
+}
+
+setActiveBinds(loadKeybinds());
+
+function bind(actionId) { return activeBinds[actionId]; }
+function keyHeld(actionId) { const code = activeBinds[actionId]; return !!code && isKeyDown(code); }
+
+// Which action a pressed key triggers. Numpad digits fall through to the
+// matching number-row digit, so Numpad 0 still pokes while poke sits on 0.
+function actionForCode(code) {
+  if (codeToAction[code]) return codeToAction[code];
+  const numpad = /^Numpad(\d)$/.exec(code);
+  if (numpad) return codeToAction['Digit' + numpad[1]] || null;
+  return null;
+}
+
+// Touch buttons fire actions rather than raw keys, so they follow any rebinding.
+function simulateAction(actionId) {
+  const code = activeBinds[actionId];
+  if (code) simulateKeyPress(code);
+}
+
+const KEY_LABEL_OVERRIDES = {
+  Space: 'Space', Tab: 'Tab', Escape: 'Esc', Enter: 'Enter', Backspace: 'Backspace',
+  ShiftLeft: 'L Shift', ShiftRight: 'R Shift', ControlLeft: 'L Ctrl', ControlRight: 'R Ctrl',
+  AltLeft: 'L Alt', AltRight: 'R Alt', MetaLeft: 'Cmd', MetaRight: 'Cmd', CapsLock: 'Caps',
+  ArrowLeft: '←', ArrowRight: '→', ArrowUp: '↑', ArrowDown: '↓',
+  Minus: '-', Equal: '=', BracketLeft: '[', BracketRight: ']', Backslash: '\\',
+  Semicolon: ';', Quote: "'", Comma: ',', Period: '.', Slash: '/', Backquote: '`',
+  NumpadAdd: 'Num +', NumpadSubtract: 'Num -', NumpadMultiply: 'Num *',
+  NumpadDivide: 'Num /', NumpadEnter: 'Num Enter', NumpadDecimal: 'Num .',
+};
+function keyLabel(code) {
+  if (!code) return '—';
+  if (KEY_LABEL_OVERRIDES[code]) return KEY_LABEL_OVERRIDES[code];
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3);
+  if (/^Digit\d$/.test(code)) return code.slice(5);
+  if (/^Numpad\d$/.test(code)) return 'Num ' + code.slice(6);
+  return code;
+}
+function actionLabel(actionId) {
+  const action = KEYBIND_ACTIONS.find((a) => a.id === actionId);
+  return action ? action.label : actionId;
+}
+
+// Mouse look tuning, also set from the settings panel. Kept as a plain object so
+// the pointer-move handler reads the live value instead of a stale closure.
+const INPUT_SETTINGS_KEY = 'jungleking.input.v1';
+const inputSettings = { lookSens: 1, invertY: false };
+try {
+  const saved = JSON.parse(localStorage.getItem(INPUT_SETTINGS_KEY) || 'null');
+  if (saved) {
+    if (typeof saved.lookSens === 'number' && isFinite(saved.lookSens)) {
+      inputSettings.lookSens = Math.max(0.3, Math.min(3, saved.lookSens));
+    }
+    if (typeof saved.invertY === 'boolean') inputSettings.invertY = saved.invertY;
+  }
+} catch (e) {}
+function saveInputSettings() {
+  try { localStorage.setItem(INPUT_SETTINGS_KEY, JSON.stringify(inputSettings)); } catch (e) {}
 }
 
 // ============================================================
@@ -906,7 +1306,8 @@ const entityRegistry = { animals: {}, raiders: {}, tribeMembers: {}, distantRaid
 // ============================================================
 // interactions.js - "walk up and press a key" registry
 // ============================================================
-// Each entry: { id, position: [x,y,z], radius, key: 'KeyE'|'KeyF'|'KeyR', label, onInteract: fn }
+// Each entry: { id, position: [x,y,z], radius, action: 'interact'|'gather'|'craft', label, onInteract: fn }
+// `action` is a rebindable action id (see keybinds.js), never a raw key code.
 const interactables = [];
 
 function registerInteractable(entry) {
@@ -1111,6 +1512,19 @@ const DISTANT_TRIBES = [
 ];
 
 // Where the player's own tribe is based - raiders march here
+// ---------- The pond ----------
+// The terrain is shaped to match the water disc (see getTerrainHeight): the ground
+// near the pond is levelled to a common shore height so the flat disc meets it all
+// the way round, then a bowl is carved below that. Without the levelling the natural
+// hill tails run from 0.06 up to 0.72 around the rim — all of it above the surface —
+// so the water's edge was buried in a rising bank.
+const POND_CENTER = [40, -40]; // x, z
+const POND_RADIUS = 18;
+const POND_SURFACE_Y = 0.05;
+const POND_SHORE_Y = -0.05;  // ground at the waterline, just under the surface
+const POND_DEPTH = 2.2;      // below the shore at the centre, tapering to 0 at the rim
+const POND_BLEND_R = 30;     // natural terrain has fully resumed by here
+
 const BASE_CENTER = [0, 0, 0];
 const FRIEND_BASE_CENTER = [18, 0, 5]; // where the joining player's sub-camp appears
 const PLAYER_TRIBE_COLOR = '#f0d020'; // bright yellow — the Jungle King's home tribe
@@ -1267,6 +1681,18 @@ function generateResourceNodes() {
     nodes.push({ id: `silver_${cave.id}_1`, type: 'silver', position: [cx + px * 2.5, 0, cz + pz * 2.5] });
     nodes.push({ id: `silver_${cave.id}_2`, type: 'silver', position: [cx - px * 2.5, 0, cz - pz * 2.5] });
     nodes.push({ id: `gold_${cave.id}`,     type: 'gold',   position: [cx + dx * 3.5, 0, cz + dz * 3.5] });
+  }
+  // Nudge anything that landed in the pond out past the waterline. Two of the seeded
+  // positions (a fiber bush and a rock) fall inside it, and now that the basin is
+  // carved they would otherwise sit a couple of metres under the surface.
+  for (const node of nodes) {
+    const dx = node.position[0] - POND_CENTER[0];
+    const dz = node.position[2] - POND_CENTER[1];
+    const d = Math.hypot(dx, dz);
+    if (d >= POND_RADIUS + 1) continue;
+    const k = (POND_RADIUS + 2) / (d || 1);
+    node.position[0] = POND_CENTER[0] + (d ? dx : 1) * k;
+    node.position[2] = POND_CENTER[1] + (d ? dz : 0) * k;
   }
   return nodes;
 }
@@ -1701,11 +2127,51 @@ const useGame = create((set, get) => ({
   },
 
   // --- UI state ---
-  activePanel: null, // null | 'inventory' | 'shop' | 'crafting'
+  activePanel: null, // null | 'inventory' | 'shop' | 'crafting' | 'build' | 'tribe' | 'multiplayer' | 'map' | 'settings'
   setActivePanel: (panel) => set({ activePanel: panel }),
 
   nearInteractable: null, // { type: 'gather'|'shop'|'craft', label, data }
   setNearInteractable: (v) => set({ nearInteractable: v }),
+
+  // --- controls / settings ---
+  keybinds: { ...activeBinds },
+  lookSens: inputSettings.lookSens,
+  invertY: inputSettings.invertY,
+  setLookSens: (v) => { inputSettings.lookSens = v; saveInputSettings(); set({ lookSens: v }); },
+  setInvertY: (v) => { inputSettings.invertY = v; saveInputSettings(); set({ invertY: v }); },
+
+  // Rebinding is a swap, never a steal: if `code` already belongs to another
+  // action, that action inherits the key this one is giving up. So no action is
+  // ever left keyless, and binding cycle-hotbar to P moves build (or whatever
+  // held P) onto Q.
+  setKeybind: (actionId, code) => {
+    if (!code) return false;
+    if (RESERVED_CODES.has(code)) {
+      get().addToast(`${keyLabel(code)} is reserved for closing menus`);
+      return false;
+    }
+    const binds = { ...get().keybinds };
+    if (!(actionId in binds)) return false;
+    const prev = binds[actionId];
+    if (prev === code) return false;
+    const displaced = Object.keys(binds).find((id) => id !== actionId && binds[id] === code);
+    binds[actionId] = code;
+    if (displaced) binds[displaced] = prev;
+    setActiveBinds(binds);
+    saveKeybinds(binds);
+    set({ keybinds: binds });
+    get().addToast(displaced
+      ? `${actionLabel(actionId)} → ${keyLabel(code)}, swapped ${actionLabel(displaced)} → ${keyLabel(prev)}`
+      : `${actionLabel(actionId)} → ${keyLabel(code)}`);
+    return true;
+  },
+  resetKeybinds: () => {
+    const binds = { ...DEFAULT_KEYBINDS };
+    setActiveBinds(binds);
+    saveKeybinds(binds);
+    set({ keybinds: binds });
+    get().addToast('Controls reset to defaults');
+  },
 
   hotbarSlots: ['spear', 'machete', 'axe', 'pickaxe', 'club', 'torch', 'bandage'],
   activeHotbarSlot: 0,
@@ -2230,6 +2696,24 @@ const TERRAIN_HILLS = [
 ];
 
 
+const smoothstep = (t) => t * t * (3 - 2 * t);
+
+// How strongly the pond overrides the natural hills: fully inside the waterline,
+// easing back to untouched terrain by POND_BLEND_R so the bank has no seam.
+function pondShoreWeight(d) {
+  if (d >= POND_BLEND_R) return 0;
+  if (d <= POND_RADIUS) return 1;
+  return smoothstep(1 - (d - POND_RADIUS) / (POND_BLEND_R - POND_RADIUS));
+}
+
+// Depth of the bowl below the shore level. Smoothstepped to exactly zero at the
+// waterline, so the shore meets the water instead of the basin continuing outward
+// and leaving a dry pit ringing the pond.
+function pondDepth(d) {
+  if (d >= POND_RADIUS) return 0;
+  return POND_DEPTH * smoothstep(1 - d / POND_RADIUS);
+}
+
 function getTerrainHeight(x, z) {
   let h = 0;
   for (const hill of TERRAIN_HILLS) {
@@ -2237,6 +2721,12 @@ function getTerrainHeight(x, z) {
     const dz = z - hill.z;
     const d2 = dx * dx + dz * dz;
     h += hill.amp * Math.exp(-d2 / (2 * hill.r * hill.r));
+  }
+  const pd = Math.hypot(x - POND_CENTER[0], z - POND_CENTER[1]);
+  if (pd < POND_BLEND_R) {
+    const w = pondShoreWeight(pd);
+    h = h * (1 - w) + POND_SHORE_Y * w;
+    h -= pondDepth(pd);
   }
   return h;
 }
@@ -2273,7 +2763,9 @@ function getDominantBiome(x, z) {
 
 // ---------- Ground ----------
 const TERRAIN_SIZE = 600;
-const TERRAIN_SEGMENTS = 100;
+// 200 segments over 600 units is a 3-unit grid, enough for the 18-unit pond basin
+// to read as round. At 100 the basin spanned only three quads and looked faceted.
+const TERRAIN_SEGMENTS = 200;
 
 function createTerrainGeometry() {
   const geo = new THREE.BufferGeometry();
@@ -2328,8 +2820,13 @@ function Water() {
     tex.offset.y += delta * 0.01;
   });
   return html`
-    <mesh ref=${ref} position=${[40, 0.05, -40]} rotation=${[-Math.PI / 2, 0, 0]} receiveShadow=${true}>
-      <circleGeometry args=${[18, 48]} />
+    <mesh
+      ref=${ref}
+      position=${[POND_CENTER[0], POND_SURFACE_Y, POND_CENTER[1]]}
+      rotation=${[-Math.PI / 2, 0, 0]}
+      receiveShadow=${true}
+    >
+      <circleGeometry args=${[POND_RADIUS, 48]} />
       <meshStandardMaterial map=${tex} transparent=${true} opacity=${0.85} roughness=${0.2} metalness=${0.1} />
     </mesh>
   `;
@@ -2501,9 +2998,8 @@ const SPRINT_MULT = 1.8;
 const CROUCH_MULT = 0.5;
 const JUMP_SPEED = 6.5;
 const GRAVITY = 22;
-
-const POND_CENTER = [40, -40];
-const POND_RADIUS = 18;
+// How far below the water's surface a swimming player's feet settle.
+const SWIM_SUBMERSION = 0.35;
 
 const UP = new THREE.Vector3(0, 1, 0);
 
@@ -2638,13 +3134,20 @@ function Player() {
 
   useEffect(() => {
     const canvas = gl.domElement;
-    const onClick = () => {
-      if (useGame.getState().activePanel === null && canvas.requestPointerLock) canvas.requestPointerLock();
+    // Camera look is a middle-mouse drag: hold the wheel button and move the mouse.
+    // That leaves the left button free for attacking and the cursor free for the HUD,
+    // so the game never silently swallows the pointer.
+    const looking = { active: false };
+    const stopLooking = () => {
+      if (!looking.active) return;
+      looking.active = false;
+      if (document.pointerLockElement === canvas && document.exitPointerLock) document.exitPointerLock();
     };
     const onMouseMove = (e) => {
-      if (document.pointerLockElement !== canvas) return;
-      yaw.current -= e.movementX * 0.0022;
-      pitch.current -= e.movementY * 0.0022;
+      if (!looking.active) return;
+      const sens = 0.0022 * inputSettings.lookSens;
+      yaw.current -= e.movementX * sens;
+      pitch.current -= e.movementY * sens * (inputSettings.invertY ? -1 : 1);
       pitch.current = Math.max(-1.2, Math.min(0.9, pitch.current));
     };
     const onWheel = (e) => {
@@ -2664,9 +3167,25 @@ function Player() {
       mpSend({ t: 'attack' });
     };
     const onMouseDown = (e) => {
-      if (e.button !== 0) return;
-      if (document.pointerLockElement !== canvas) return;
-      doAttack();
+      if (useGame.getState().activePanel !== null) return;
+      if (e.button === 1) {
+        // Middle button: start looking. preventDefault stops middle-click autoscroll.
+        e.preventDefault();
+        looking.active = true;
+        // Pointer lock makes the drag unbounded and hides the cursor for the duration;
+        // if the browser refuses it, movementX/Y still drive the look unlocked.
+        if (canvas.requestPointerLock) canvas.requestPointerLock();
+        return;
+      }
+      if (e.button === 0) doAttack();
+    };
+    const onMouseUp = (e) => {
+      if (e.button === 1) stopLooking();
+    };
+    // If the lock drops for any other reason (Esc, tab switch), stop looking too,
+    // otherwise the next mouse move would keep spinning the camera.
+    const onPointerLockChange = () => {
+      if (looking.active && document.pointerLockElement !== canvas) looking.active = false;
     };
     touchInput.attack = doAttack;
 
@@ -2696,10 +3215,14 @@ function Player() {
       }
     };
 
-    canvas.addEventListener('click', onClick);
     document.addEventListener('mousemove', onMouseMove);
     canvas.addEventListener('wheel', onWheel, { passive: true });
+    // mousedown is non-passive so the middle button can cancel browser autoscroll.
     canvas.addEventListener('mousedown', onMouseDown);
+    // mouseup on the window, so releasing outside the canvas still ends the look.
+    window.addEventListener('mouseup', onMouseUp);
+    window.addEventListener('blur', stopLooking);
+    document.addEventListener('pointerlockchange', onPointerLockChange);
     canvas.addEventListener('touchstart', onTouchStart, { passive: true });
     canvas.addEventListener('touchmove', onTouchMove, { passive: true });
     canvas.addEventListener('touchend', onTouchEnd, { passive: true });
@@ -2708,41 +3231,60 @@ function Player() {
     const offPress = onKeyPress((code) => {
       const s = useGame.getState();
 
-      if (code === 'KeyC') {
+      // Esc is reserved and unbindable: it always just closes what's open.
+      if (code === 'Escape') {
+        if (s.activePanel) s.setActivePanel(null);
+        return;
+      }
+
+      const action = actionForCode(code);
+      if (!action) return;
+
+      if (action === 'camera') {
         cameraMode.current = cameraMode.current === 'third' ? 'first' : 'third';
       }
-      if (code === 'Tab') {
+      if (action === 'inventory') {
         s.setActivePanel(s.activePanel === 'inventory' ? null : 'inventory');
       }
-      if (code === 'Escape' && s.activePanel) {
-        s.setActivePanel(null);
+      if (action === 'interact' || action === 'craft') {
+        // Pressing the same key again closes the panel it opened.
+        if (s.activePanel) {
+          s.setActivePanel(null);
+        } else {
+          const near = s.nearInteractable;
+          if (near && near.action === action) near.onInteract();
+        }
       }
-      if (code === 'KeyE' || code === 'KeyR') {
+      if (action === 'gather' && !s.activePanel) {
         const near = s.nearInteractable;
-        if (near && near.key === code) near.onInteract();
-      }
-      if (code === 'KeyF') {
-        const near = s.nearInteractable;
-        if (near && near.key === 'KeyF') {
+        if (near && near.action === 'gather') {
           near.onInteract();
         } else if (inWater.current) {
           s.adjustStat('thirst', 35);
           s.addToast('Drank water (+35 thirst)');
         }
       }
-      if (code === 'KeyQ') {
+      if (action === 'cycleHotbar') {
         s.setActiveHotbarSlot((s.activeHotbarSlot + 1) % s.hotbarSlots.length);
       }
-      if (code === 'KeyB') {
+      if (action === 'build') {
         s.setActivePanel(s.activePanel === 'build' ? null : 'build');
       }
-      if (code === 'KeyM') s.addToast('Full jungle map coming soon');
-      if (code === 'KeyT' && !s.activePanel) {
+      if (action === 'map') {
+        s.setActivePanel(s.activePanel === 'map' ? null : 'map');
+      }
+      if (action === 'settings') {
+        s.setActivePanel(s.activePanel === 'settings' ? null : 'settings');
+      }
+      if (action === 'tribe') {
+        s.setActivePanel(s.activePanel === 'tribe' ? null : 'tribe');
+      }
+      if (action === 'chat' && !s.activePanel) {
         s.setChatOpen(true);
         if (document.exitPointerLock) document.exitPointerLock();
       }
-      // 0 key (main row or numpad): poke/stab with the equipped weapon without throwing it.
-      if (code === 'Digit0' || code === 'Numpad0') {
+      // Poke/stab with the equipped weapon without throwing it.
+      if (action === 'poke' && !s.activePanel) {
         const slot = s.hotbarSlots[s.activeHotbarSlot];
         const weapon = WEAPONS[slot];
         if (weapon && (s.inventory[slot] || 0) > 0) {
@@ -2754,18 +3296,21 @@ function Player() {
       }
     });
 
-    // Exit pointer lock whenever a panel opens
+    // Any panel opening hands the cursor back and ends a middle-drag look, so the
+    // camera can't keep spinning while the player is clicking around a panel.
     const unsub = useGame.subscribe((state, prev) => {
       if (state.activePanel !== prev.activePanel && state.activePanel !== null) {
-        if (document.pointerLockElement === canvas) document.exitPointerLock();
+        stopLooking();
       }
     });
 
     return () => {
-      canvas.removeEventListener('click', onClick);
       document.removeEventListener('mousemove', onMouseMove);
       canvas.removeEventListener('wheel', onWheel);
       canvas.removeEventListener('mousedown', onMouseDown);
+      window.removeEventListener('mouseup', onMouseUp);
+      window.removeEventListener('blur', stopLooking);
+      document.removeEventListener('pointerlockchange', onPointerLockChange);
       canvas.removeEventListener('touchstart', onTouchStart);
       canvas.removeEventListener('touchmove', onTouchMove);
       canvas.removeEventListener('touchend', onTouchEnd);
@@ -2779,28 +3324,29 @@ function Player() {
   useFrame((_, rawDelta) => {
     const delta = Math.min(rawDelta, 0.1);
     const s = useGame.getState();
-    const panelOpen = s.activePanel !== null;
+    const panelOpen = panelBlocksMovement(s.activePanel);
     const pos = group.current.position;
 
     // ---- input ----
     let moveX = 0;
     let moveZ = 0;
     if (!panelOpen) {
-      if (isKeyDown('KeyW')) moveZ -= 1;
-      if (isKeyDown('KeyS')) moveZ += 1;
-      if (isKeyDown('KeyA')) moveX -= 1;
-      if (isKeyDown('KeyD')) moveX += 1;
+      if (keyHeld('moveForward')) moveZ -= 1;
+      if (keyHeld('moveBack')) moveZ += 1;
+      if (keyHeld('moveLeft')) moveX -= 1;
+      if (keyHeld('moveRight')) moveX += 1;
 
       // ---- virtual joystick (touch) ----
       moveX += touchInput.moveX;
       moveZ += touchInput.moveZ;
 
-      // ---- arrow keys: look around (alternative to mouse) ----
-      const lookSpeed = 1.6; // radians/sec
-      if (isKeyDown('ArrowLeft')) yaw.current += lookSpeed * delta;
-      if (isKeyDown('ArrowRight')) yaw.current -= lookSpeed * delta;
-      if (isKeyDown('ArrowUp')) pitch.current += lookSpeed * delta;
-      if (isKeyDown('ArrowDown')) pitch.current -= lookSpeed * delta;
+      // ---- look keys: turn the camera without the mouse ----
+      const lookSpeed = 1.6 * inputSettings.lookSens; // radians/sec
+      const lookY = inputSettings.invertY ? -1 : 1;
+      if (keyHeld('lookLeft')) yaw.current += lookSpeed * delta;
+      if (keyHeld('lookRight')) yaw.current -= lookSpeed * delta;
+      if (keyHeld('lookUp')) pitch.current += lookSpeed * delta * lookY;
+      if (keyHeld('lookDown')) pitch.current -= lookSpeed * delta * lookY;
       pitch.current = Math.max(-1.2, Math.min(0.9, pitch.current));
     }
 
@@ -2813,8 +3359,8 @@ function Player() {
       touchInput.lookDY = 0;
     }
     const moving = moveX !== 0 || moveZ !== 0;
-    const crouching = !panelOpen && isKeyDown('ControlLeft');
-    const sprinting = !panelOpen && !crouching && moving && isKeyDown('ShiftLeft') && s.stats.energy > 1;
+    const crouching = !panelOpen && keyHeld('crouch');
+    const sprinting = !panelOpen && !crouching && moving && keyHeld('sprint') && s.stats.energy > 1;
 
     // ---- water check ----
     const dxw = pos.x - POND_CENTER[0];
@@ -2939,10 +3485,14 @@ function Player() {
     // ---- gravity / jump / swim float ----
     if (swimming) {
       velocityY.current = 0;
-      pos.y += (-0.3 - pos.y) * 0.1;
+      // Float just under the surface, but never below the pond floor — otherwise the
+      // player's legs disappear through the ground in the shallows at the rim.
+      const floorY = getTerrainHeight(pos.x, pos.z);
+      const targetY = Math.max(floorY, POND_SURFACE_Y - SWIM_SUBMERSION);
+      pos.y += (targetY - pos.y) * 0.1;
       onGround.current = true;
     } else {
-      if (isKeyDown('Space') && onGround.current && !panelOpen) {
+      if (keyHeld('jump') && onGround.current && !panelOpen) {
         velocityY.current = JUMP_SPEED;
         onGround.current = false;
       }
@@ -3270,7 +3820,7 @@ function ResourceNode({ node }) {
       id: node.id,
       position: node.position,
       radius: 2.4,
-      key: 'KeyF',
+      action: 'gather',
       label,
       onInteract: () => useGame.getState().gatherNode(node),
     });
@@ -3360,7 +3910,7 @@ function LootPickup({ spawn }) {
       id: spawn.id,
       position: spawn.position,
       radius: 2,
-      key: 'KeyE',
+      action: 'interact',
       label: `pick up ${RESOURCES[spawn.item]?.name || spawn.item}${spawn.qty > 1 ? ` x${spawn.qty}` : ''}`,
       onInteract: () => useGame.getState().collectLoot(spawn),
     });
@@ -3403,7 +3953,7 @@ function GroundWeapon({ gw }) {
       id: gw.id,
       position: gw.position,
       radius: 2,
-      key: 'KeyE',
+      action: 'interact',
       label: `pick up ${WEAPONS[gw.weaponId].name}`,
       onInteract: () => useGame.getState().pickupWeapon(gw.id),
     });
@@ -3521,7 +4071,7 @@ function Kito() {
       id: 'kito',
       position: KITO_POS,
       radius: 3,
-      key: 'KeyE',
+      action: 'interact',
       label: 'Talk to Kito',
       onInteract: () => useGame.getState().setActivePanel('shop'),
     });
@@ -3615,7 +4165,7 @@ function Workbench() {
       id: 'workbench',
       position: WORKBENCH_POS,
       radius: 2.4,
-      key: 'KeyR',
+      action: 'craft',
       label: 'Craft at Workbench',
       onInteract: () => useGame.getState().setActivePanel('crafting'),
     });
@@ -4817,12 +5367,6 @@ function CoinDropManager() {
 // ============================================================
 // Hud.js - DOM overlay (stats, hotbar, panels, toasts)
 // ============================================================
-const KEY_LABELS = {
-  KeyE: 'E',
-  KeyF: 'F',
-  KeyR: 'R',
-};
-
 function formatTime(t) {
   const h = Math.floor(t);
   const m = Math.floor((t % 1) * 60);
@@ -4850,6 +5394,7 @@ function getItemCategory(id) {
 
 function InventoryPanel() {
   const inventory = useGame((s) => s.inventory);
+  const keybinds = useGame((s) => s.keybinds);
   const setActivePanel = useGame((s) => s.setActivePanel);
   const useItem = useGame((s) => s.useItem);
   const entries = Object.entries(inventory);
@@ -4862,7 +5407,7 @@ function InventoryPanel() {
     <div class="panel-overlay" onClick=${() => setActivePanel(null)}>
       <div class="panel" onClick=${(e) => e.stopPropagation()}>
         <h2>Inventory</h2>
-        ${entries.length === 0 && html`<p>Empty. Use F near trees (Axe for wood, Machete for leaves), rocks (Pickaxe), cave ore (Pickaxe), or bush/fiber. Hunt animals or scavenge loot with E.</p>`}
+        ${entries.length === 0 && html`<p>Empty. Use ${keyLabel(keybinds.gather)} near trees (Axe for wood, Machete for leaves), rocks (Pickaxe), cave ore (Pickaxe), or bush/fiber. Hunt animals or scavenge loot with ${keyLabel(keybinds.interact)}.</p>`}
         ${sections.map((sec) => grouped[sec].length === 0 ? null : html`
           <${Fragment} key=${sec}>
             <h3 class="inv-section">${sec}</h3>
@@ -4885,13 +5430,14 @@ function InventoryPanel() {
             })}
           <//>
         `)}
-        <p class="close-hint">Tab or Esc to close</p>
+        <p class="close-hint">${keyLabel(keybinds.inventory)} or Esc to close</p>
       </div>
     </div>
   `;
 }
 
 function ShopPanel() {
+  const keybinds = useGame((s) => s.keybinds);
   const meters = useGame((s) => s.meters);
   const coins = useGame((s) => s.coins);
   const warriors = useGame((s) => s.warriors);
@@ -4937,13 +5483,14 @@ function ShopPanel() {
             </div>
           </div>
         `)}
-        <p class="close-hint">E, Tab or Esc to close</p>
+        <p class="close-hint">${keyLabel(keybinds.interact)}, ${keyLabel(keybinds.inventory)} or Esc to close</p>
       </div>
     </div>
   `;
 }
 
 function TribePanel() {
+  const keybinds = useGame((s) => s.keybinds);
   const warriors = useGame((s) => s.warriors);
   const escortWarriors = useGame((s) => s.escortWarriors);
   const setEscortWarriors = useGame((s) => s.setEscortWarriors);
@@ -4991,13 +5538,14 @@ function TribePanel() {
             <button class="buy-btn" disabled=${escortWarriors >= warriors} onClick=${() => setEscortWarriors(escortWarriors + 1)}>+</button>
           </div>
         </div>
-        <p class="close-hint">E, Tab or Esc to close</p>
+        <p class="close-hint">${keyLabel(keybinds.interact)}, ${keyLabel(keybinds.inventory)} or Esc to close</p>
       </div>
     </div>
   `;
 }
 
 function CraftingPanel() {
+  const keybinds = useGame((s) => s.keybinds);
   const inventory = useGame((s) => s.inventory);
   const craft = useGame((s) => s.craft);
   const hasItems = useGame((s) => s.hasItems);
@@ -5022,13 +5570,14 @@ function CraftingPanel() {
             </div>
           `;
         })}
-        <p class="close-hint">R, Tab or Esc to close</p>
+        <p class="close-hint">${keyLabel(keybinds.craft)}, ${keyLabel(keybinds.inventory)} or Esc to close</p>
       </div>
     </div>
   `;
 }
 
 function BuildPanel() {
+  const keybinds = useGame((s) => s.keybinds);
   const inventory = useGame((s) => s.inventory);
   const hasItems = useGame((s) => s.hasItems);
   const placeBuilding = useGame((s) => s.placeBuilding);
@@ -5054,7 +5603,7 @@ function BuildPanel() {
             </div>
           `;
         })}
-        <p class="close-hint">B, Tab or Esc to close</p>
+        <p class="close-hint">${keyLabel(keybinds.build)}, ${keyLabel(keybinds.inventory)} or Esc to close</p>
       </div>
     </div>
   `;
@@ -5113,7 +5662,674 @@ function MultiplayerPanel() {
           <p class="desc">Connected! You can see and fight alongside each other in the jungle, and rival tribe camps are now shared between you.</p>
           <button class="craft-btn" onClick=${() => mpDisconnect()}>Disconnect</button>
         `}
-        <p class="close-hint">Tab or Esc to close</p>
+        <p class="close-hint">${keyLabel(bind('inventory'))} or Esc to close</p>
+      </div>
+    </div>
+  `;
+}
+
+// ============================================================
+// Map.js - top-down world map
+// ============================================================
+const MAP_EXTENT = 240;        // world units drawn out from the origin, each way
+const MAP_PX = 592;            // canvas resolution (CSS-scaled to the panel width)
+// Terrain raster resolution: built once (~120ms) and shared by the minimap and the
+// full map. 480 cells over 480m is 1 m per cell, just finer than the minimap's
+// ~1.13 m per pixel, so the minimap never upscales it. The start screen warms it up
+// so that cost lands while the player is reading, not as a hitch on spawn.
+const MAP_TERRAIN_CELLS = 480;
+const MAP_MIN_SCALE = 1;
+const MAP_MAX_SCALE = 5;
+
+// Mouth of each cave, matching where generateResourceNodes() seeds its ore.
+const MAP_CAVE_MOUTHS = CAVE_LOCATIONS.map((cave) => {
+  const { mx, mz, r } = cave;
+  const len = Math.sqrt(mx * mx + mz * mz) || 1;
+  return { id: cave.id, x: mx + (-mx / len) * r * 0.62, z: mz + (-mz / len) * r * 0.62 };
+});
+
+// The terrain layer never changes, so rasterise it once into an offscreen canvas
+// and blit it under the live markers each frame.
+let mapTerrainCanvas = null;
+function getMapTerrainCanvas() {
+  if (mapTerrainCanvas) return mapTerrainCanvas;
+  const n = MAP_TERRAIN_CELLS;
+  const cv = document.createElement('canvas');
+  cv.width = n;
+  cv.height = n;
+  const ctx = cv.getContext('2d');
+  const img = ctx.createImageData(n, n);
+  const step = (MAP_EXTENT * 2) / n;
+  for (let j = 0; j < n; j++) {
+    const z = -MAP_EXTENT + (j + 0.5) * step;
+    for (let i = 0; i < n; i++) {
+      const x = -MAP_EXTENT + (i + 0.5) * step;
+      const h = getTerrainHeight(x, z);
+      // Crude hill-shading: a light from the north-west, plus altitude lightening,
+      // so the hills and the mountain ring read as relief rather than flat colour.
+      const slope = (getTerrainHeight(x + step, z) - h) + (getTerrainHeight(x, z + step) - h);
+      let shade = 1 + Math.max(-0.5, Math.min(0.5, slope * 0.45)) + Math.min(0.3, h * 0.014);
+      let [r, g, b] = getBiomeColor(x, z);
+      const pondDist = Math.hypot(x - POND_CENTER[0], z - POND_CENTER[1]);
+      if (pondDist < POND_RADIUS) {
+        const t = Math.min(1, (POND_RADIUS - pondDist) / 5);
+        r = r * (1 - t) + 0.11 * t;
+        g = g * (1 - t) + 0.33 * t;
+        b = b * (1 - t) + 0.56 * t;
+        shade = 1;
+      }
+      const o = (j * n + i) * 4;
+      img.data[o] = Math.max(0, Math.min(255, r * shade * 255));
+      img.data[o + 1] = Math.max(0, Math.min(255, g * shade * 255));
+      img.data[o + 2] = Math.max(0, Math.min(255, b * shade * 255));
+      img.data[o + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  mapTerrainCanvas = cv;
+  return cv;
+}
+
+// Shared by the minimap and the full map: the live markers both want to draw, in
+// back-to-front order. `ctx` is already translated so world → canvas is toX/toY.
+// `small` trims the detail that only makes sense at full-map size.
+function drawMapMarkers(ctx, toX, toY, world, opts) {
+  const { small = false, onScreen, scale = 1 } = opts;
+
+  const dot = (sx, sy, r, fill, stroke) => {
+    ctx.beginPath();
+    ctx.arc(sx, sy, r, 0, Math.PI * 2);
+    ctx.fillStyle = fill;
+    ctx.fill();
+    if (stroke) { ctx.lineWidth = small ? 1 : 1.5; ctx.strokeStyle = stroke; ctx.stroke(); }
+  };
+  const diamond = (sx, sy, r, fill, stroke) => {
+    ctx.beginPath();
+    ctx.moveTo(sx, sy - r);
+    ctx.lineTo(sx + r, sy);
+    ctx.lineTo(sx, sy + r);
+    ctx.lineTo(sx - r, sy);
+    ctx.closePath();
+    ctx.fillStyle = fill;
+    ctx.fill();
+    if (stroke) { ctx.lineWidth = small ? 1 : 1.5; ctx.strokeStyle = stroke; ctx.stroke(); }
+  };
+  const caption = (text, sx, sy, color, size = 10) => {
+    if (small) return;
+    ctx.font = `600 ${size}px 'Segoe UI', Tahoma, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(0,0,0,0.8)';
+    ctx.strokeText(text, sx, sy);
+    ctx.fillStyle = color;
+    ctx.fillText(text, sx, sy);
+  };
+
+  // ---- resource nodes (full map only, and only when asked: there are ~80) ----
+  if (!small && world.showResources) {
+    for (const node of world.resourceNodes) {
+      if (world.depletedNodes[node.id]) continue;
+      const sx = toX(node.position[0]), sy = toY(node.position[2]);
+      if (!onScreen(sx, sy, 2)) continue;
+      dot(sx, sy, 2, RESOURCES[node.type]?.color || '#ffffff');
+    }
+  }
+
+  // ---- caves ----
+  for (const mouth of MAP_CAVE_MOUTHS) {
+    const sx = toX(mouth.x), sy = toY(mouth.z);
+    if (!onScreen(sx, sy)) continue;
+    dot(sx, sy, small ? 3.5 : 5, '#241f2e', '#cfc7e0');
+    if (!small) {
+      dot(sx, sy, 1.8, '#cfc7e0');
+      if (scale >= 1.8) caption('Cave', sx, sy + 15, '#d8d0e8', 9);
+    }
+  }
+
+  // ---- the player's own buildings ----
+  for (const b of world.buildings) {
+    const sx = toX(b.position[0]), sy = toY(b.position[2]);
+    if (!onScreen(sx, sy)) continue;
+    const half = small ? 1.8 : 2.5;
+    ctx.fillStyle = '#f4ecd8';
+    ctx.strokeStyle = 'rgba(0,0,0,0.75)';
+    ctx.lineWidth = 1;
+    ctx.fillRect(sx - half, sy - half, half * 2, half * 2);
+    ctx.strokeRect(sx - half, sy - half, half * 2, half * 2);
+  }
+
+  // ---- Kito and the workbench ----
+  const kitoX = toX(KITO_POS[0]), kitoY = toY(KITO_POS[2]);
+  if (onScreen(kitoX, kitoY)) {
+    dot(kitoX, kitoY, small ? 3.5 : 5, '#7fd8d8', 'rgba(0,0,0,0.8)');
+    if (scale >= 1.5) caption('Kito', kitoX, kitoY - 9, '#9fe8e8', 9);
+  }
+  const benchX = toX(WORKBENCH_POS[0]), benchY = toY(WORKBENCH_POS[2]);
+  if (onScreen(benchX, benchY)) {
+    dot(benchX, benchY, small ? 3 : 4, '#b98a4a', 'rgba(0,0,0,0.8)');
+    if (scale >= 1.5) caption('Workbench', benchX, benchY + 14, '#d8ab6a', 9);
+  }
+
+  // ---- rival tribe camps ----
+  for (const tribe of ENEMY_TRIBES) {
+    if (!world.activeTribeIds.includes(tribe.id)) continue;
+    const sx = toX(tribe.campPosition[0]), sy = toY(tribe.campPosition[2]);
+    if (!onScreen(sx, sy, 40)) continue;
+    const captured = !!world.capturedTribes[tribe.id];
+    const ownerId = world.campOwners[tribe.id];
+    const owner = ownerId ? ENEMY_TRIBES.find((t) => t.id === ownerId) : null;
+    const color = captured ? PLAYER_TRIBE_COLOR : (owner ? owner.color : tribe.color);
+    dot(sx, sy, small ? 5 : 7, color, 'rgba(0,0,0,0.85)');
+    if (captured) {
+      ctx.beginPath();
+      ctx.arc(sx, sy, small ? 7.5 : 10, 0, Math.PI * 2);
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = PLAYER_TRIBE_COLOR;
+      ctx.stroke();
+    }
+    caption(captured ? `${tribe.name} (yours)` : tribe.name, sx, sy - 12, color, 9);
+  }
+
+  // ---- distant tribes: never capturable, always a threat ----
+  for (const tribe of DISTANT_TRIBES) {
+    const sx = toX(tribe.campPosition[0]), sy = toY(tribe.campPosition[2]);
+    if (!onScreen(sx, sy, 40)) continue;
+    diamond(sx, sy, small ? 5 : 7, tribe.color, 'rgba(0,0,0,0.85)');
+    caption(tribe.name, sx, sy - 12, tribe.color, 9);
+  }
+
+  // ---- your home camp ----
+  const baseX = toX(BASE_CENTER[0]), baseY = toY(BASE_CENTER[2]);
+  if (onScreen(baseX, baseY, 40)) {
+    dot(baseX, baseY, small ? 6 : 8, PLAYER_TRIBE_COLOR, '#1b150f');
+    caption('★', baseX, baseY + 4, '#1b150f', 11);
+    caption('Your camp', baseX, baseY - 13, PLAYER_TRIBE_COLOR, 9);
+  }
+  if (world.mpStatus === 'connected') {
+    const fx = toX(FRIEND_BASE_CENTER[0]), fy = toY(FRIEND_BASE_CENTER[2]);
+    if (onScreen(fx, fy, 40)) {
+      dot(fx, fy, small ? 4.5 : 6, '#6ad8ff', '#1b150f');
+      caption("Friend's camp", fx, fy - 11, '#9fe4ff', 9);
+    }
+  }
+
+  // ---- wildlife ----
+  for (const id in entityRegistry.animals) {
+    const pos = entityRegistry.animals[id];
+    if (!pos) continue;
+    const sx = toX(pos.x), sy = toY(pos.z);
+    if (!onScreen(sx, sy, 2)) continue;
+    dot(sx, sy, small ? 2 : 2.5, '#c98a5a', 'rgba(0,0,0,0.6)');
+  }
+
+  // ---- raiders currently on the march ----
+  const pulse = 0.6 + 0.4 * Math.sin(Date.now() / 180);
+  for (const group of ['raiders', 'distantRaiders', 'interTribalRaiders']) {
+    for (const id in entityRegistry[group]) {
+      const pos = entityRegistry[group][id];
+      if (!pos) continue;
+      const sx = toX(pos.x), sy = toY(pos.z);
+      if (!onScreen(sx, sy, 2)) continue;
+      dot(sx, sy, small ? 2.8 : 3.5, `rgba(255,70,50,${pulse.toFixed(2)})`, 'rgba(0,0,0,0.7)');
+    }
+  }
+
+  // ---- the other player ----
+  if (remotePlayer.active) {
+    const sx = toX(remotePlayer.position[0]), sy = toY(remotePlayer.position[2]);
+    if (onScreen(sx, sy)) {
+      dot(sx, sy, small ? 4 : 5, '#6ad8ff', '#07242e');
+      caption('Friend', sx, sy - 10, '#9fe4ff', 9);
+    }
+  }
+}
+
+// The white arrow for the player, pointing where they're actually facing.
+function drawPlayerArrow(ctx, sx, sy, yaw, tip) {
+  const fwdX = -Math.sin(yaw), fwdZ = -Math.cos(yaw);
+  const back = tip * 0.67;
+  ctx.beginPath();
+  ctx.moveTo(sx + fwdX * tip, sy + fwdZ * tip);
+  ctx.lineTo(sx - fwdX * back - fwdZ * back * 0.75, sy - fwdZ * back + fwdX * back * 0.75);
+  ctx.lineTo(sx - fwdX * back + fwdZ * back * 0.75, sy - fwdZ * back - fwdX * back * 0.75);
+  ctx.closePath();
+  ctx.fillStyle = '#ffffff';
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = '#1b150f';
+  ctx.stroke();
+}
+
+// ============================================================
+// Minimap.js - always-on circular minimap, north up
+// ============================================================
+const MINIMAP_PX = 168;    // canvas resolution, matching the CSS size 1:1
+const MINIMAP_RANGE = 95;  // world metres from the centre to the rim
+
+function Minimap() {
+  const setActivePanel = useGame((s) => s.setActivePanel);
+  const activePanel = useGame((s) => s.activePanel);
+  const activeTribeIds = useGame((s) => s.activeTribeIds);
+  const capturedTribes = useGame((s) => s.capturedTribes);
+  const campOwners = useGame((s) => s.campOwners);
+  const buildings = useGame((s) => s.buildings);
+  const mpStatus = useGame((s) => s.mpStatus);
+  const canvasRef = useRef(null);
+  const coordsRef = useRef(null);
+
+  const worldRef = useRef(null);
+  worldRef.current = {
+    activeTribeIds, capturedTribes, campOwners, buildings, mpStatus,
+    resourceNodes: [], depletedNodes: {}, showResources: false,
+  };
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return undefined;
+    const ctx = canvas.getContext('2d');
+    const terrain = getMapTerrainCanvas();
+    const R = MINIMAP_PX / 2;
+    const ppu = R / MINIMAP_RANGE;
+    let raf = 0;
+    let lastCoords = '';
+
+    const draw = () => {
+      const world = worldRef.current;
+      const [px, , pz] = playerTransform.position;
+      const toX = (x) => R + (x - px) * ppu;
+      const toY = (z) => R + (z - pz) * ppu;
+      // Anything beyond the rim is off the minimap entirely.
+      const onScreen = (sx, sy) => Math.hypot(sx - R, sy - R) <= R - 1;
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(R, R, R, 0, Math.PI * 2);
+      ctx.clip();
+
+      ctx.fillStyle = '#0a140a';
+      ctx.fillRect(0, 0, MINIMAP_PX, MINIMAP_PX);
+      ctx.imageSmoothingEnabled = true;
+      const span = MAP_EXTENT * 2 * ppu;
+      ctx.drawImage(terrain, toX(-MAP_EXTENT), toY(-MAP_EXTENT), span, span);
+
+      drawMapMarkers(ctx, toX, toY, world, { small: true, onScreen, scale: 0 });
+
+      // Raiders off the edge get pinned to the rim, so a raid always shows you
+      // which way it's coming from even before it's in range.
+      for (const group of ['raiders', 'distantRaiders']) {
+        for (const id in entityRegistry[group]) {
+          const pos = entityRegistry[group][id];
+          if (!pos) continue;
+          const dx = pos.x - px, dz = pos.z - pz;
+          const d = Math.hypot(dx, dz);
+          if (d <= MINIMAP_RANGE || d === 0) continue; // already drawn in place
+          const k = (R - 6) / (d * ppu);
+          ctx.beginPath();
+          ctx.arc(R + dx * ppu * k, R + dz * ppu * k, 2.2, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(255,70,50,0.8)';
+          ctx.fill();
+        }
+      }
+
+      drawPlayerArrow(ctx, R, R, playerTransform.yaw, 7);
+      ctx.restore();
+
+      // Inner rim shading, drawn outside the clip so it reads as a lens edge.
+      ctx.beginPath();
+      ctx.arc(R, R, R - 1, 0, Math.PI * 2);
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = 'rgba(0,0,0,0.45)';
+      ctx.stroke();
+
+      const coords = `${Math.round(px)}, ${Math.round(pz)}`;
+      if (coords !== lastCoords && coordsRef.current) {
+        coordsRef.current.textContent = coords;
+        lastCoords = coords;
+      }
+
+      raf = requestAnimationFrame(draw);
+    };
+    raf = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
+  return html`
+    <div
+      class="minimap"
+      title="Open the full map"
+      onClick=${() => setActivePanel(activePanel === 'map' ? null : 'map')}
+    >
+      <canvas ref=${canvasRef} width=${MINIMAP_PX} height=${MINIMAP_PX}></canvas>
+      <div class="mm-tick">N</div>
+      <div class="mm-coords" ref=${coordsRef}>0, 0</div>
+    </div>
+  `;
+}
+
+function MapPanel() {
+  const setActivePanel = useGame((s) => s.setActivePanel);
+  const keybinds = useGame((s) => s.keybinds);
+  const activeTribeIds = useGame((s) => s.activeTribeIds);
+  const capturedTribes = useGame((s) => s.capturedTribes);
+  const campOwners = useGame((s) => s.campOwners);
+  const buildings = useGame((s) => s.buildings);
+  const resourceNodes = useGame((s) => s.resourceNodes);
+  const depletedNodes = useGame((s) => s.depletedNodes);
+  const mpStatus = useGame((s) => s.mpStatus);
+  const [showResources, setShowResources] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const canvasRef = useRef(null);
+  const view = useRef({ cx: 0, cz: 0, scale: 1 });
+
+  // The draw loop reads world state through a ref, so it never has to be torn
+  // down and rebuilt when a tribe spawns or a building goes up.
+  const worldRef = useRef(null);
+  worldRef.current = {
+    activeTribeIds, capturedTribes, campOwners, buildings,
+    resourceNodes, depletedNodes, showResources, mpStatus,
+  };
+
+  const clampView = () => {
+    const v = view.current;
+    v.scale = Math.max(MAP_MIN_SCALE, Math.min(MAP_MAX_SCALE, v.scale));
+    const span = MAP_EXTENT / v.scale;
+    const limit = Math.max(0, MAP_EXTENT - span);
+    v.cx = Math.max(-limit, Math.min(limit, v.cx));
+    v.cz = Math.max(-limit, Math.min(limit, v.cz));
+  };
+
+  const centerOnPlayer = () => {
+    // At fit zoom the whole jungle is already on screen and panning is pinned to
+    // the origin, so centering only means anything once we've zoomed in a little.
+    if (view.current.scale < 2.2) view.current.scale = 2.2;
+    view.current.cx = playerTransform.position[0];
+    view.current.cz = playerTransform.position[2];
+    clampView();
+  };
+  const fitWorld = () => {
+    view.current.cx = 0;
+    view.current.cz = 0;
+    view.current.scale = 1;
+  };
+  const zoomBy = (factor) => {
+    view.current.scale *= factor;
+    clampView();
+  };
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return undefined;
+    const ctx = canvas.getContext('2d');
+    const terrain = getMapTerrainCanvas();
+    let raf = 0;
+
+    const draw = () => {
+      const v = view.current;
+      const world = worldRef.current;
+      const ppu = (MAP_PX / (MAP_EXTENT * 2)) * v.scale;
+      const toX = (x) => MAP_PX / 2 + (x - v.cx) * ppu;
+      const toY = (z) => MAP_PX / 2 + (z - v.cz) * ppu;
+      const onScreen = (sx, sy, pad = 8) =>
+        sx >= -pad && sy >= -pad && sx <= MAP_PX + pad && sy <= MAP_PX + pad;
+
+      ctx.fillStyle = '#0a140a';
+      ctx.fillRect(0, 0, MAP_PX, MAP_PX);
+
+      // ---- terrain ----
+      ctx.imageSmoothingEnabled = true;
+      const x0 = toX(-MAP_EXTENT), y0 = toY(-MAP_EXTENT);
+      ctx.drawImage(terrain, x0, y0, toX(MAP_EXTENT) - x0, toY(MAP_EXTENT) - y0);
+
+      // ---- 50m graticule ----
+      ctx.strokeStyle = 'rgba(0,0,0,0.15)';
+      ctx.lineWidth = 1;
+      for (let g = -MAP_EXTENT; g <= MAP_EXTENT; g += 50) {
+        const gx = toX(g), gy = toY(g);
+        ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, MAP_PX); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(MAP_PX, gy); ctx.stroke();
+      }
+
+      drawMapMarkers(ctx, toX, toY, world, { onScreen, scale: v.scale });
+
+      // ---- you, pointing where you're facing ----
+      const [px, , pz] = playerTransform.position;
+      drawPlayerArrow(ctx, toX(px), toY(pz), playerTransform.yaw, 9);
+
+      // ---- readouts ----
+      ctx.font = "600 11px 'Segoe UI', Tahoma, sans-serif";
+      ctx.textAlign = 'left';
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = 'rgba(0,0,0,0.75)';
+      const readout = `X ${Math.round(px)}   Z ${Math.round(pz)}   ·   ${v.scale.toFixed(1)}x`;
+      ctx.strokeText(readout, 10, MAP_PX - 10);
+      ctx.fillStyle = '#ffe27a';
+      ctx.fillText(readout, 10, MAP_PX - 10);
+
+      raf = requestAnimationFrame(draw);
+    };
+    raf = requestAnimationFrame(draw);
+
+    // ---- zoom / pan ----
+    // Wheel and drag are wired by hand so the wheel can preventDefault (otherwise
+    // it scrolls the panel behind the map) and so dragging survives leaving the canvas.
+    const pxPerWorld = () => (MAP_PX / (MAP_EXTENT * 2)) * view.current.scale;
+    const canvasPoint = (e) => {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: ((e.clientX - rect.left) / rect.width) * MAP_PX,
+        y: ((e.clientY - rect.top) / rect.height) * MAP_PX,
+      };
+    };
+    const onWheel = (e) => {
+      e.preventDefault();
+      const v = view.current;
+      const p = canvasPoint(e);
+      // World point under the cursor, held fixed across the zoom.
+      const wx = v.cx + (p.x - MAP_PX / 2) / pxPerWorld();
+      const wz = v.cz + (p.y - MAP_PX / 2) / pxPerWorld();
+      v.scale *= e.deltaY < 0 ? 1.12 : 1 / 1.12;
+      clampView();
+      v.cx = wx - (p.x - MAP_PX / 2) / pxPerWorld();
+      v.cz = wz - (p.y - MAP_PX / 2) / pxPerWorld();
+      clampView();
+    };
+
+    let dragFrom = null;
+    const onPointerDown = (e) => {
+      dragFrom = { x: e.clientX, y: e.clientY, cx: view.current.cx, cz: view.current.cz };
+      setDragging(true);
+      if (canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId);
+    };
+    const onPointerMove = (e) => {
+      if (!dragFrom) return;
+      const rect = canvas.getBoundingClientRect();
+      const perWorld = pxPerWorld() * (rect.width / MAP_PX);
+      view.current.cx = dragFrom.cx - (e.clientX - dragFrom.x) / perWorld;
+      view.current.cz = dragFrom.cz - (e.clientY - dragFrom.y) / perWorld;
+      clampView();
+    };
+    const onPointerUp = () => {
+      if (!dragFrom) return;
+      dragFrom = null;
+      setDragging(false);
+    };
+
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+    canvas.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('pointercancel', onPointerUp);
+
+    return () => {
+      cancelAnimationFrame(raf);
+      canvas.removeEventListener('wheel', onWheel);
+      canvas.removeEventListener('pointerdown', onPointerDown);
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+      window.removeEventListener('pointercancel', onPointerUp);
+    };
+  }, []);
+
+  return html`
+    <div class="panel-overlay" onClick=${() => setActivePanel(null)}>
+      <div class="panel panel-wide" onClick=${(e) => e.stopPropagation()}>
+        <h2>Jungle Map</h2>
+        <div class="map-wrap">
+          <canvas
+            class="map-canvas ${dragging ? 'dragging' : ''}"
+            ref=${canvasRef}
+            width=${MAP_PX}
+            height=${MAP_PX}
+          ></canvas>
+          <div class="map-compass">N ↑</div>
+        </div>
+        <div class="map-toolbar">
+          <button class="buy-btn" onClick=${centerOnPlayer}>Center on me</button>
+          <button class="buy-btn" onClick=${fitWorld}>Whole jungle</button>
+          <button class="buy-btn" onClick=${() => zoomBy(1 / 1.4)}>−</button>
+          <button class="buy-btn" onClick=${() => zoomBy(1.4)}>+</button>
+          <label class="spacer">
+            <input type="checkbox" checked=${showResources} onChange=${(e) => setShowResources(e.target.checked)} />
+            Resources
+          </label>
+        </div>
+        <div class="map-legend">
+          <span><i style=${{ background: '#ffffff' }}></i>You</span>
+          <span><i style=${{ background: PLAYER_TRIBE_COLOR }}></i>Your camp / captured</span>
+          <span><i style=${{ background: '#c2453b' }}></i>Rival camp (tribe colour)</span>
+          <span><i style=${{ background: '#8b1a1a', borderRadius: '2px' }}></i>Distant tribe (diamond)</span>
+          <span><i style=${{ background: '#ff4632' }}></i>Raiders marching</span>
+          <span><i style=${{ background: '#c98a5a' }}></i>Wildlife</span>
+          <span><i style=${{ background: '#7fd8d8' }}></i>Kito</span>
+          <span><i style=${{ background: '#241f2e' }}></i>Cave (silver / gold)</span>
+        </div>
+        <p class="close-hint">
+          Scroll to zoom, drag to pan &middot; you can still walk around with
+          ${keyLabel(keybinds.moveForward)}${keyLabel(keybinds.moveLeft)}${keyLabel(keybinds.moveBack)}${keyLabel(keybinds.moveRight)}
+          while this is open &middot; ${keyLabel(keybinds.map)} or Esc to close
+        </p>
+      </div>
+    </div>
+  `;
+}
+
+// ============================================================
+// SettingsPanel.js - controls rebinding and look settings
+// ============================================================
+function SettingsPanel() {
+  const setActivePanel = useGame((s) => s.setActivePanel);
+  const keybinds = useGame((s) => s.keybinds);
+  const setKeybind = useGame((s) => s.setKeybind);
+  const resetKeybinds = useGame((s) => s.resetKeybinds);
+  const lookSens = useGame((s) => s.lookSens);
+  const setLookSens = useGame((s) => s.setLookSens);
+  const invertY = useGame((s) => s.invertY);
+  const setInvertY = useGame((s) => s.setInvertY);
+  const [tab, setTab] = useState('controls');
+  const [listening, setListening] = useState(null); // action id waiting for a key
+  const cancelRef = useRef(null);
+
+  // Grab the next key press for this action. captureNextKey swallows it, so the
+  // key being bound never also fires its old action on the way through.
+  const beginRebind = (actionId) => {
+    if (cancelRef.current) cancelRef.current();
+    setListening(actionId);
+    cancelRef.current = captureNextKey((code) => {
+      cancelRef.current = null;
+      setListening(null);
+      if (code === 'Escape') return; // Esc cancels the rebind
+      setKeybind(actionId, code);
+    });
+  };
+
+  // If the panel closes mid-rebind, un-arm the grabber.
+  useEffect(() => () => { if (cancelRef.current) cancelRef.current(); }, []);
+
+  const controlsTab = html`
+    <${Fragment}>
+      <p class="set-hint">
+        Click a key, then press the new one. <strong>Esc</strong> cancels.
+        If that key already belongs to another action the two <strong>swap</strong>:
+        the other action takes over the key you just freed, so nothing is ever left unbound.
+      </p>
+      ${KEYBIND_GROUPS.map((group) => html`
+        <${Fragment} key=${group}>
+          <h3 class="inv-section">${group}</h3>
+          ${KEYBIND_ACTIONS.filter((a) => a.group === group).map((a) => html`
+            <div class="set-row" key=${a.id}>
+              <span class="set-label">${a.label}</span>
+              <button
+                class="key-btn ${listening === a.id ? 'listening' : ''}"
+                onClick=${() => beginRebind(a.id)}
+              >${listening === a.id ? 'Press a key…' : keyLabel(keybinds[a.id])}</button>
+            </div>
+          `)}
+        <//>
+      `)}
+      <h3 class="inv-section">Fixed</h3>
+      <div class="set-row">
+        <span class="set-label">Attack — throw the spear, swing anything else</span>
+        <button class="key-btn fixed">Left Click</button>
+      </div>
+      <div class="set-row">
+        <span class="set-label">Look around — hold the wheel button and move the mouse</span>
+        <button class="key-btn fixed">Middle Mouse</button>
+      </div>
+      <div class="set-row">
+        <span class="set-label">Zoom the camera in and out</span>
+        <button class="key-btn fixed">Scroll</button>
+      </div>
+      <div class="set-row">
+        <span class="set-label">Close any menu</span>
+        <button class="key-btn fixed">Esc</button>
+      </div>
+      <div class="set-row" style=${{ background: 'none', padding: '10px 0 0' }}>
+        <span class="set-label"></span>
+        <button class="buy-btn" onClick=${() => resetKeybinds()}>Reset to defaults</button>
+      </div>
+    <//>
+  `;
+
+  const generalTab = html`
+    <${Fragment}>
+      <p class="set-hint">
+        Applies to both the middle-mouse drag and the look keys. Your controls and
+        these settings are saved in this browser, so they survive a reload.
+      </p>
+      <div class="set-row">
+        <span class="set-label">Look sensitivity</span>
+        <div class="set-slider">
+          <input
+            type="range" min="0.3" max="3" step="0.1"
+            value=${lookSens}
+            onChange=${(e) => setLookSens(parseFloat(e.target.value))}
+          />
+          <strong style=${{ minWidth: '38px', color: '#ffe27a' }}>${lookSens.toFixed(1)}x</strong>
+        </div>
+      </div>
+      <div class="set-row">
+        <span class="set-label">Invert vertical look</span>
+        <input type="checkbox" checked=${invertY} onChange=${(e) => setInvertY(e.target.checked)} />
+      </div>
+      <h3 class="inv-section">Good to know</h3>
+      <p class="set-hint">
+        Numpad digits mirror the number row: whenever an action sits on a number key,
+        the matching numpad key fires it too.
+        Esc is reserved for closing menus, so it can't be bound to an action.
+      </p>
+    <//>
+  `;
+
+  return html`
+    <div class="panel-overlay" onClick=${() => setActivePanel(null)}>
+      <div class="panel" onClick=${(e) => e.stopPropagation()}>
+        <h2>Settings</h2>
+        <div class="tabs">
+          <button class=${tab === 'controls' ? 'active' : ''} onClick=${() => setTab('controls')}>Controls</button>
+          <button class=${tab === 'general' ? 'active' : ''} onClick=${() => setTab('general')}>General</button>
+        </div>
+        ${tab === 'controls' ? controlsTab : generalTab}
+        <p class="close-hint">${keyLabel(keybinds.settings)} or Esc to close</p>
       </div>
     </div>
   `;
@@ -5197,10 +6413,12 @@ function TouchJoystick() {
   `;
 }
 
-// A button that sets a virtual key while held (for jump/sprint/crouch).
-function TouchHoldButton({ label, code, cls = '' }) {
-  const onStart = (e) => { e.preventDefault(); keys[code] = true; };
-  const onEnd = (e) => { e.preventDefault(); keys[code] = false; };
+// A button that holds down the key an action is bound to (jump/sprint/crouch).
+// The code is captured on press so a rebind mid-hold can't leave a key stuck.
+function TouchHoldButton({ label, action, cls = '' }) {
+  const held = useRef(null);
+  const onStart = (e) => { e.preventDefault(); held.current = bind(action); if (held.current) keys[held.current] = true; };
+  const onEnd = (e) => { e.preventDefault(); if (held.current) keys[held.current] = false; held.current = null; };
   return html`
     <div
       class="touch-btn ${cls}"
@@ -5221,30 +6439,32 @@ function TouchTapButton({ label, onTap, cls = '' }) {
 
 function TouchControls() {
   const nearInteractable = useGame((s) => s.nearInteractable);
-  const interactLabel = nearInteractable ? (KEY_LABELS[nearInteractable.key] || nearInteractable.key) : 'E';
+  const keybinds = useGame((s) => s.keybinds);
+  const interactLabel = keyLabel(keybinds[nearInteractable ? nearInteractable.action : 'interact']);
 
   return html`
     <div class="touch-controls">
       <${TouchJoystick} />
       <div class="touch-actions">
         <div class="touch-row">
-          <${TouchTapButton} label="🎒" cls="touch-btn-sm" onTap=${() => simulateKeyPress('Tab')} />
-          <${TouchTapButton} label="📷" cls="touch-btn-sm" onTap=${() => simulateKeyPress('KeyC')} />
-          <${TouchTapButton} label="🔁" cls="touch-btn-sm" onTap=${() => simulateKeyPress('KeyQ')} />
-          <${TouchTapButton} label="🔨" cls="touch-btn-sm" onTap=${() => simulateKeyPress('KeyB')} />
+          <${TouchTapButton} label="🎒" cls="touch-btn-sm" onTap=${() => simulateAction('inventory')} />
+          <${TouchTapButton} label="📷" cls="touch-btn-sm" onTap=${() => simulateAction('camera')} />
+          <${TouchTapButton} label="🔁" cls="touch-btn-sm" onTap=${() => simulateAction('cycleHotbar')} />
+          <${TouchTapButton} label="🔨" cls="touch-btn-sm" onTap=${() => simulateAction('build')} />
+          <${TouchTapButton} label="🗺️" cls="touch-btn-sm" onTap=${() => simulateAction('map')} />
           <${TouchTapButton} label="💬" cls="touch-btn-sm" onTap=${() => useGame.getState().setChatOpen(true)} />
         </div>
         <div class="touch-row">
-          <${TouchHoldButton} label="🐾" code="ControlLeft" cls="touch-btn-sm" />
-          <${TouchHoldButton} label="💨" code="ShiftLeft" cls="touch-btn-sm" />
-          <${TouchHoldButton} label="⬆️" code="Space" cls="touch-btn-sm" />
+          <${TouchHoldButton} label="🐾" action="crouch" cls="touch-btn-sm" />
+          <${TouchHoldButton} label="💨" action="sprint" cls="touch-btn-sm" />
+          <${TouchHoldButton} label="⬆️" action="jump" cls="touch-btn-sm" />
         </div>
         <div class="touch-row touch-row-main">
           <${TouchTapButton} label=${interactLabel} cls="touch-btn-lg" onTap=${() => {
             const near = useGame.getState().nearInteractable;
             if (near) near.onInteract();
           }} />
-          <${TouchTapButton} label="🗡️" cls="touch-btn-lg" onTap=${() => simulateKeyPress('Digit0')} />
+          <${TouchTapButton} label="🗡️" cls="touch-btn-lg" onTap=${() => simulateAction('poke')} />
           <${TouchTapButton} label="⚔️" cls="touch-btn-lg touch-btn-attack" onTap=${() => touchInput.attack()} />
         </div>
       </div>
@@ -5262,6 +6482,7 @@ function Hud() {
   const timeOfDay = useGame((s) => s.timeOfDay);
   const nearInteractable = useGame((s) => s.nearInteractable);
   const activePanel = useGame((s) => s.activePanel);
+  const keybinds = useGame((s) => s.keybinds);
   const toasts = useGame((s) => s.toasts);
   const hotbarSlots = useGame((s) => s.hotbarSlots);
   const activeHotbarSlot = useGame((s) => s.activeHotbarSlot);
@@ -5292,44 +6513,66 @@ function Hud() {
 
   return html`
     <div id="hud">
-      <div class="meters-counter">
-        <span class="label">METERS TRAVELED</span>
-        ${Math.floor(meters)} m
-        <div class="coins-line">🪙 ${coins}</div>
-      </div>
-      <div class="day-clock">🕐 ${formatTime(timeOfDay)}</div>
-      <div class="tribe-panel" onClick=${() => setActivePanel(activePanel === 'tribe' ? null : 'tribe')}>
-        ⚔️ ${warriors} warriors (${escortWarriors} with you)
-      </div>
+      <${Minimap} />
 
-      <div class="mp-button ${mpStatus === 'connected' ? 'mp-connected' : ''}" onClick=${() => setActivePanel(activePanel === 'multiplayer' ? null : 'multiplayer')}>
-        🌐 ${mpStatus === 'connected' ? 'Friend Online' : 'Multiplayer'}
-      </div>
-
-      <button class="notif-btn" onClick=${toggleNotif}>
-        🔔${notifUnread > 0 ? ` ${notifUnread}` : ''}
-      </button>
-
-      ${notifOpen && html`
-        <div class="notif-panel">
-          <h3>NOTIFICATIONS</h3>
-          ${notifications.length === 0 && html`<div style="color:rgba(255,255,255,0.3);font-size:12px;">No notifications yet.</div>`}
-          ${[...notifications].reverse().map((n) => {
-            const age = Math.floor((Date.now() - n.time) / 60000);
-            const ts = age < 1 ? 'now' : age < 60 ? age + 'm' : Math.floor(age / 60) + 'h';
-            return html`<div class="notif-entry ${n.type}" key=${n.id}>
-              <span class="notif-time">${ts}</span>
-              <span>${n.msg}</span>
-            </div>`;
-          })}
+      <div class="hud-top-right">
+        <div class="meters-counter">
+          <span class="label">METERS TRAVELED</span>
+          ${Math.floor(meters)} m
+          <div class="coins-line">🪙 ${coins}</div>
         </div>
-      `}
 
-      ${raid && html`
-        <div class="raid-banner">⚠️ ${raid.tribeName} is attacking! Raiders incoming: ${raid.raiders.length}</div>
-      `}
-      ${distantRaid && html`
-        <div class="raid-banner" style="background:rgba(80,20,80,0.85);">🏔️ ${distantRaid.tribeName} marching on ${distantRaid.targetTribeId ? (ENEMY_TRIBES.find((t) => t.id === distantRaid.targetTribeId)?.name ?? distantRaid.targetTribeId) + "'s camp" : 'your tribe'}! (${distantRaid.raiders.length} raiders)</div>
+        <div class="hud-row">
+          <div class="day-clock">🕐 ${formatTime(timeOfDay)}</div>
+          <div class="tribe-panel" onClick=${() => setActivePanel(activePanel === 'tribe' ? null : 'tribe')}>
+            ⚔️ ${warriors} warriors (${escortWarriors} with you)
+          </div>
+        </div>
+
+        <div class="hud-row">
+          <button class="notif-btn" onClick=${toggleNotif}>
+            🔔${notifUnread > 0 ? ` ${notifUnread}` : ''}
+          </button>
+          <div class="mp-button ${mpStatus === 'connected' ? 'mp-connected' : ''}" onClick=${() => setActivePanel(activePanel === 'multiplayer' ? null : 'multiplayer')}>
+            🌐 ${mpStatus === 'connected' ? 'Friend Online' : 'Multiplayer'}
+          </div>
+          <button class="hud-btn" onClick=${() => setActivePanel(activePanel === 'map' ? null : 'map')}>
+            🗺️ Map <span style=${{ opacity: 0.55 }}>${keyLabel(keybinds.map)}</span>
+          </button>
+          <button class="hud-btn" onClick=${() => setActivePanel(activePanel === 'settings' ? null : 'settings')}>
+            ⚙️ <span style=${{ opacity: 0.55 }}>${keyLabel(keybinds.settings)}</span>
+          </button>
+        </div>
+
+        ${notifOpen && html`
+          <div class="notif-panel">
+            <h3>NOTIFICATIONS</h3>
+            ${notifications.length === 0 && html`<div style="color:rgba(255,255,255,0.3);font-size:12px;">No notifications yet.</div>`}
+            ${[...notifications].reverse().map((n) => {
+              const age = Math.floor((Date.now() - n.time) / 60000);
+              const ts = age < 1 ? 'now' : age < 60 ? age + 'm' : Math.floor(age / 60) + 'h';
+              return html`<div class="notif-entry ${n.type}" key=${n.id}>
+                <span class="notif-time">${ts}</span>
+                <span>${n.msg}</span>
+              </div>`;
+            })}
+          </div>
+        `}
+
+        <div class="toasts">
+          ${toasts.map((t) => html`<div class="toast" key=${t.id}>${t.msg}</div>`)}
+        </div>
+      </div>
+
+      ${(raid || distantRaid) && html`
+        <div class="raid-banners">
+          ${raid && html`
+            <div class="raid-banner">⚠️ ${raid.tribeName} is attacking! Raiders incoming: ${raid.raiders.length}</div>
+          `}
+          ${distantRaid && html`
+            <div class="raid-banner" style=${{ background: 'rgba(80,20,80,0.85)' }}>🏔️ ${distantRaid.tribeName} marching on ${distantRaid.targetTribeId ? (ENEMY_TRIBES.find((t) => t.id === distantRaid.targetTribeId)?.name ?? distantRaid.targetTribeId) + "'s camp" : 'your tribe'}! (${distantRaid.raiders.length} raiders)</div>
+          `}
+        </div>
       `}
 
       <div class="stats-panel">
@@ -5344,7 +6587,7 @@ function Hud() {
       ${!activePanel && html`<div class="crosshair"></div>`}
 
       ${nearInteractable && !activePanel && html`
-        <div class="interact-prompt">Press ${KEY_LABELS[nearInteractable.key] || nearInteractable.key} to ${nearInteractable.label}</div>
+        <div class="interact-prompt">Press ${keyLabel(keybinds[nearInteractable.action])} to ${nearInteractable.label}</div>
       `}
 
       <div class="hotbar">
@@ -5354,10 +6597,6 @@ function Hud() {
             <span class="count">${inventory[id] || 0}</span>
           </div>
         `)}
-      </div>
-
-      <div class="toasts">
-        ${toasts.map((t) => html`<div class="toast" key=${t.id}>${t.msg}</div>`)}
       </div>
 
       <div class="chat-log">
@@ -5390,6 +6629,8 @@ function Hud() {
       ${activePanel === 'crafting' && html`<${CraftingPanel} />`}
       ${activePanel === 'build' && html`<${BuildPanel} />`}
       ${activePanel === 'multiplayer' && html`<${MultiplayerPanel} />`}
+      ${activePanel === 'map' && html`<${MapPanel} />`}
+      ${activePanel === 'settings' && html`<${SettingsPanel} />`}
 
       ${isTouchDevice && !activePanel && html`<${TouchControls} />`}
     </div>
@@ -5401,6 +6642,15 @@ function Hud() {
 // ============================================================
 function StartScreen() {
   const start = useGame((s) => s.start);
+  const keybinds = useGame((s) => s.keybinds);
+  const k = (id) => keyLabel(keybinds[id]);
+
+  // Rasterise the map terrain while the player is still reading the intro, so the
+  // minimap has it ready on spawn instead of hitching a frame on its first draw.
+  useEffect(() => {
+    const id = setTimeout(getMapTerrainCanvas, 50);
+    return () => clearTimeout(id);
+  }, []);
 
   return html`
     <div class="start-screen">
@@ -5416,11 +6666,14 @@ function StartScreen() {
       </p>
       <button onClick=${() => { start(); }}>Begin Survival</button>
       <div class="controls-list">
-        WASD move &middot; Mouse or Arrow keys look (click to lock mouse) &middot; Space jump &middot; Shift sprint (drains energy)
-        &middot; Ctrl crouch &middot; F gather / drink &middot; E talk to Kito / shop / pick up weapon &middot; R craft at workbench
-        &middot; B build menu &middot; Tab inventory &middot; Q cycle hotbar &middot; C toggle camera &middot; Scroll zoom &middot; Esc close menus
-        &middot; Left Click attack (throws spear, swings other weapons) &middot; 0 poke with spear
-        &middot; T chat with your friend (multiplayer)
+        ${k('moveForward')}${k('moveLeft')}${k('moveBack')}${k('moveRight')} move &middot; Hold the middle mouse button (the wheel) and move the mouse to look around, or use ${k('lookLeft')}${k('lookDown')}${k('lookUp')}${k('lookRight')}
+        &middot; ${k('jump')} jump &middot; ${k('sprint')} sprint (drains energy)
+        &middot; ${k('crouch')} crouch &middot; ${k('gather')} gather / drink &middot; ${k('interact')} talk to Kito / shop / pick up weapon &middot; ${k('craft')} craft at workbench
+        &middot; ${k('build')} build menu &middot; ${k('inventory')} inventory &middot; ${k('cycleHotbar')} cycle hotbar &middot; ${k('camera')} toggle camera &middot; Scroll zoom &middot; Esc close menus
+        &middot; ${k('map')} world map (you keep walking while it's open) &middot; ${k('settings')} settings &middot; ${k('tribe')} tribe panel
+        &middot; Left Click attack (throws spear, swings other weapons) &middot; ${k('poke')} poke with spear
+        &middot; ${k('chat')} chat with your friend (multiplayer)
+        &middot; Every key above can be remapped in ⚙️ Settings → Controls (${k('settings')})
         &middot; Click the ⚔️ warriors panel (top left) to choose how many warriors fight alongside you
         &middot; On touch devices: drag the left joystick to move, drag anywhere to look, and use the on-screen buttons (including 💬 for chat)
         &middot; Click the 🌐 Multiplayer button (top right) to play together with a friend
