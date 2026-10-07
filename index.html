@@ -46,6 +46,7 @@ canvas {
   position: fixed;
   inset: 0;
   pointer-events: none;
+  z-index: 2;
   color: #fff;
   text-shadow: 0 1px 3px rgba(0,0,0,0.8);
   user-select: none;
@@ -933,6 +934,29 @@ canvas {
   50% { opacity: 0.55; }
 }
 
+/* A light cinematic grade over the 3D view: a vignette to pull the eye to the
+   centre and a faint warm lift in the corners. Purely visual, never interactive,
+   and it sits under the HUD so nothing becomes hard to read. */
+.grade-overlay {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  background:
+    radial-gradient(ellipse 72% 72% at 50% 48%, rgba(0,0,0,0) 55%, rgba(4,8,14,0.42) 100%),
+    radial-gradient(ellipse 120% 90% at 50% 100%, rgba(32,20,8,0.12), rgba(0,0,0,0) 60%);
+}
+.gfx-presets {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.set-value {
+  color: #ffe27a;
+  text-align: right;
+  font-size: 13px;
+  max-width: 48%;
+}
 .set-hint {
   font-size: 11px;
   color: #b8a98a;
@@ -1202,6 +1226,50 @@ try {
 function saveInputSettings() {
   try { localStorage.setItem(INPUT_SETTINGS_KEY, JSON.stringify(inputSettings)); } catch (e) {}
 }
+
+// ============================================================
+// graphics.js - quality presets
+//
+// The realistic pass (instanced grass, layered terrain detail, big shadow
+// maps, a live sky environment map) is not free. These presets scale the
+// expensive parts so the same build runs on a laptop and on a desktop GPU.
+// Everything here is applied live - no reload, and the player never moves.
+// ============================================================
+const GRAPHICS_KEY = 'jungleking.graphics.v1';
+const GRAPHICS_PRESETS = {
+  low: {
+    label: 'Low', grassRadius: 0, grassPerCell: 0, foliage: 150,
+    shadowMap: 1024, shadowExtent: 55, envSeconds: 0, dpr: 1.0,
+    vines: false, treeDetail: 0, waterSegments: 24,
+  },
+  medium: {
+    label: 'Medium', grassRadius: 20, grassPerCell: 5, foliage: 220,
+    shadowMap: 2048, shadowExtent: 50, envSeconds: 4, dpr: 1.35,
+    vines: false, treeDetail: 1, waterSegments: 48,
+  },
+  high: {
+    label: 'High', grassRadius: 30, grassPerCell: 8, foliage: 300,
+    shadowMap: 2048, shadowExtent: 45, envSeconds: 2, dpr: 1.6,
+    vines: true, treeDetail: 2, waterSegments: 72,
+  },
+  ultra: {
+    label: 'Ultra', grassRadius: 42, grassPerCell: 12, foliage: 380,
+    shadowMap: 4096, shadowExtent: 42, envSeconds: 1.2, dpr: 2.0,
+    vines: true, treeDetail: 2, waterSegments: 96,
+  },
+};
+const GRAPHICS_ORDER = ['low', 'medium', 'high', 'ultra'];
+
+const graphicsSettings = { quality: 'high' };
+try {
+  const saved = JSON.parse(localStorage.getItem(GRAPHICS_KEY) || 'null');
+  if (saved && GRAPHICS_PRESETS[saved.quality]) graphicsSettings.quality = saved.quality;
+} catch (e) {}
+function saveGraphicsSettings() {
+  try { localStorage.setItem(GRAPHICS_KEY, JSON.stringify(graphicsSettings)); } catch (e) {}
+}
+// Read inside useFrame and in render, so it must stay cheap and allocation-free.
+function gfx() { return GRAPHICS_PRESETS[graphicsSettings.quality] || GRAPHICS_PRESETS.high; }
 
 // ============================================================
 // touch.js - on-screen controls for tablets/phones (no keyboard/mouse)
@@ -2293,6 +2361,13 @@ const useGame = create((set, get) => ({
   invertY: inputSettings.invertY,
   setLookSens: (v) => { inputSettings.lookSens = v; saveInputSettings(); set({ lookSens: v }); },
   setInvertY: (v) => { inputSettings.invertY = v; saveInputSettings(); set({ invertY: v }); },
+  graphicsQuality: graphicsSettings.quality,
+  setGraphicsQuality: (q) => {
+    if (!GRAPHICS_PRESETS[q]) return;
+    graphicsSettings.quality = q;
+    saveGraphicsSettings();
+    set({ graphicsQuality: q });
+  },
 
   // Rebinding is a swap, never a steal: if `code` already belongs to another
   // action, that action inherits the key this one is giving up. So no action is
@@ -2654,97 +2729,550 @@ const useGame = create((set, get) => ({
 
 // ============================================================
 // textures.js - procedural canvas textures, no image assets
+//
+// Everything here is generated at runtime from seeded noise, so the game
+// stays a single file with no asset downloads. Each surface returns a small
+// bundle { map, normalMap, roughnessMap } so materials get real relief and
+// varying gloss instead of a flat colour.
 // ============================================================
-function createGrassTexture() {
-  const size = 256;
-  const canvas = document.createElement('canvas');
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext('2d');
+// Shared easing used by the noise lattice, the pond basin and the grass fade.
+const smoothstep = (t) => t * t * (3 - 2 * t);
 
-  ctx.fillStyle = '#3f7d3a';
-  ctx.fillRect(0, 0, size, size);
+function makeCanvas(size, h) {
+  const cv = document.createElement('canvas');
+  cv.width = size;
+  cv.height = h || size;
+  return cv;
+}
 
-  // speckle variation
-  for (let i = 0; i < 4000; i++) {
-    const x = Math.random() * size;
-    const y = Math.random() * size;
-    const shade = Math.random();
-    ctx.fillStyle = shade > 0.5
-      ? `rgba(60, 110, 50, ${0.2 + Math.random() * 0.3})`
-      : `rgba(30, 70, 30, ${0.2 + Math.random() * 0.3})`;
-    ctx.fillRect(x, y, 2, 2);
+// Seamless value noise. The lattice wraps, so the resulting tile repeats with
+// no visible seam. cellsY differs from cellsX for stretched grain (bark, water).
+function latticeNoise(size, cellsX, cellsY, seed) {
+  const rand = mulberry32(seed);
+  const cx = Math.max(1, Math.round(cellsX));
+  const cy = Math.max(1, Math.round(cellsY));
+  const g = new Float32Array(cx * cy);
+  for (let i = 0; i < g.length; i++) g[i] = rand();
+  const out = new Float32Array(size * size);
+  for (let y = 0; y < size; y++) {
+    const fy = (y / size) * cy;
+    const y0 = Math.floor(fy);
+    const ty = smoothstep(fy - y0);
+    const ry0 = ((y0 % cy) + cy) % cy;
+    const ry1 = (ry0 + 1) % cy;
+    for (let x = 0; x < size; x++) {
+      const fx = (x / size) * cx;
+      const x0 = Math.floor(fx);
+      const tx = smoothstep(fx - x0);
+      const rx0 = ((x0 % cx) + cx) % cx;
+      const rx1 = (rx0 + 1) % cx;
+      const a = g[ry0 * cx + rx0], b = g[ry0 * cx + rx1];
+      const c = g[ry1 * cx + rx0], d = g[ry1 * cx + rx1];
+      out[y * size + x] = (a + (b - a) * tx) * (1 - ty) + (c + (d - c) * tx) * ty;
+    }
   }
+  return out;
+}
 
-  // patches of dirt
-  for (let i = 0; i < 14; i++) {
-    const x = Math.random() * size;
-    const y = Math.random() * size;
-    const r = 4 + Math.random() * 10;
-    ctx.fillStyle = 'rgba(110, 80, 45, 0.25)';
+// Stacked octaves of the above: the broad shapes come from the first octave,
+// the grit from the last.
+function fbm(size, cellsX, cellsY, octaves, seed) {
+  const out = new Float32Array(size * size);
+  let amp = 1, total = 0, cx = cellsX, cy = cellsY;
+  for (let o = 0; o < octaves; o++) {
+    const layer = latticeNoise(size, cx, cy, seed + o * 1013);
+    for (let i = 0; i < out.length; i++) out[i] += layer[i] * amp;
+    total += amp;
+    amp *= 0.5;
+    cx *= 2;
+    cy *= 2;
+  }
+  for (let i = 0; i < out.length; i++) out[i] /= total;
+  return out;
+}
+
+// Sobel the height field into a tangent-space normal map. Wrapping lookups keep
+// the normals seamless across the tile edge, same as the height field.
+function normalMapFromHeight(h, size, strength) {
+  const cv = makeCanvas(size);
+  const ctx = cv.getContext('2d');
+  const img = ctx.createImageData(size, size);
+  const at = (x, y) => h[(((y % size) + size) % size) * size + (((x % size) + size) % size)];
+  const s = (strength === undefined ? 2 : strength) * size / 256;
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const dx = (at(x + 1, y) - at(x - 1, y)) * s;
+      const dy = (at(x, y + 1) - at(x, y - 1)) * s;
+      const len = Math.sqrt(dx * dx + dy * dy + 1);
+      const i = (y * size + x) * 4;
+      img.data[i] = (-dx / len * 0.5 + 0.5) * 255;
+      img.data[i + 1] = (-dy / len * 0.5 + 0.5) * 255;
+      img.data[i + 2] = (1 / len * 0.5 + 0.5) * 255;
+      img.data[i + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return cv;
+}
+
+// Height field -> greyscale map, for roughness/AO style channels.
+function greyCanvasFromField(field, size, lo, hi) {
+  const cv = makeCanvas(size);
+  const ctx = cv.getContext('2d');
+  const img = ctx.createImageData(size, size);
+  for (let i = 0; i < field.length; i++) {
+    const v = Math.round((lo + (hi - lo) * field[i]) * 255);
+    const o = i * 4;
+    img.data[o] = img.data[o + 1] = img.data[o + 2] = v;
+    img.data[o + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  return cv;
+}
+
+function hexToRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+// Map a 0..1 noise value through colour stops.
+function rampColor(stops, t) {
+  if (t <= stops[0].t) return stops[0].rgb;
+  for (let i = 0; i < stops.length - 1; i++) {
+    const a = stops[i], b = stops[i + 1];
+    if (t <= b.t) {
+      const f = (t - a.t) / (b.t - a.t || 1);
+      return [
+        a.rgb[0] + (b.rgb[0] - a.rgb[0]) * f,
+        a.rgb[1] + (b.rgb[1] - a.rgb[1]) * f,
+        a.rgb[2] + (b.rgb[2] - a.rgb[2]) * f,
+      ];
+    }
+  }
+  return stops[stops.length - 1].rgb;
+}
+
+function makeRamp(list) {
+  return list.map(([t, hex]) => ({ t, rgb: hexToRgb(hex) }));
+}
+
+// Paint a colour ramp over a noise field, optionally modulated by a second
+// field so the albedo doesn't track the relief exactly (real surfaces don't).
+function albedoCanvas(size, field, ramp, tintField, tintAmount) {
+  const cv = makeCanvas(size);
+  const ctx = cv.getContext('2d');
+  const img = ctx.createImageData(size, size);
+  for (let i = 0; i < field.length; i++) {
+    const c = rampColor(ramp, field[i]);
+    const m = tintField ? 1 + (tintField[i] - 0.5) * tintAmount : 1;
+    const o = i * 4;
+    img.data[o] = Math.max(0, Math.min(255, c[0] * m));
+    img.data[o + 1] = Math.max(0, Math.min(255, c[1] * m));
+    img.data[o + 2] = Math.max(0, Math.min(255, c[2] * m));
+    img.data[o + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  return cv;
+}
+
+function texFrom(canvas, repeat, srgb) {
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(repeat[0], repeat[1]);
+  tex.anisotropy = 8;
+  if (srgb) tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+// ---------- Surface bundles ----------
+// Each builder returns { map, normalMap, roughnessMap } ready to spread onto a
+// meshStandardMaterial. Built lazily and cached by SURFACES below.
+
+function buildGroundSurface(size) {
+  // Jungle floor: damp earth under a scatter of leaf litter and pebbles.
+  const base = fbm(size, 4, 4, 5, 1201);
+  const patch = fbm(size, 2, 2, 3, 7717);
+  const grit = fbm(size, 24, 24, 2, 3301);
+  const ramp = makeRamp([
+    [0.00, '#24351a'], [0.32, '#33491f'], [0.52, '#405a26'],
+    [0.70, '#55502b'], [0.86, '#6b5633'], [1.00, '#7d6740'],
+  ]);
+  const cv = albedoCanvas(size, base, ramp, patch, 0.45);
+  const ctx = cv.getContext('2d');
+  // Fallen leaves and twigs, the detail you actually notice underfoot.
+  const rand = mulberry32(5150);
+  for (let i = 0; i < Math.round(size * 1.6); i++) {
+    const x = rand() * size, y = rand() * size;
+    const r = size * (0.006 + rand() * 0.016);
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(rand() * Math.PI * 2);
+    ctx.globalAlpha = 0.25 + rand() * 0.4;
+    ctx.fillStyle = rand() > 0.45 ? '#6f6433' : '#4c6b2c';
+    ctx.beginPath();
+    ctx.ellipse(0, 0, r * 2.4, r, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+  for (let i = 0; i < Math.round(size * 0.5); i++) {
+    const x = rand() * size, y = rand() * size;
+    const r = size * (0.004 + rand() * 0.008);
+    ctx.globalAlpha = 0.3 + rand() * 0.3;
+    ctx.fillStyle = rand() > 0.5 ? '#8d8477' : '#5d564c';
     ctx.beginPath();
     ctx.arc(x, y, r, 0, Math.PI * 2);
     ctx.fill();
   }
-
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.wrapS = THREE.RepeatWrapping;
-  tex.wrapT = THREE.RepeatWrapping;
-  tex.repeat.set(40, 40);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  return tex;
+  ctx.globalAlpha = 1;
+  // Pebbles push the relief up; damp hollows read as smoother.
+  const height = new Float32Array(size * size);
+  for (let i = 0; i < height.length; i++) height[i] = base[i] * 0.65 + grit[i] * 0.35;
+  return {
+    map: texFrom(cv, [1, 1], true),
+    normalMap: texFrom(normalMapFromHeight(height, size, 2.6), [1, 1], false),
+    roughnessMap: texFrom(greyCanvasFromField(patch, size, 0.72, 1.0), [1, 1], false),
+  };
 }
 
-function createBarkTexture() {
-  const size = 64;
-  const canvas = document.createElement('canvas');
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext('2d');
-
-  ctx.fillStyle = '#5a3c22';
-  ctx.fillRect(0, 0, size, size);
-
-  for (let i = 0; i < size; i += 3) {
-    ctx.fillStyle = `rgba(40, 25, 15, ${0.2 + Math.random() * 0.3})`;
-    ctx.fillRect(0, i, size, 1 + Math.random() * 2);
-  }
-
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.wrapS = THREE.RepeatWrapping;
-  tex.wrapT = THREE.RepeatWrapping;
-  tex.repeat.set(1, 2);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  return tex;
-}
-
-function createWaterTexture() {
-  const size = 128;
-  const canvas = document.createElement('canvas');
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext('2d');
-
-  const grad = ctx.createLinearGradient(0, 0, size, size);
-  grad.addColorStop(0, '#1a6fa3');
-  grad.addColorStop(1, '#2f9bd6');
-  ctx.fillStyle = grad;
-  ctx.fillRect(0, 0, size, size);
-
-  for (let i = 0; i < 200; i++) {
-    ctx.strokeStyle = `rgba(255,255,255,${0.05 + Math.random() * 0.1})`;
+function buildBarkSurface(size) {
+  // Vertical grain: many cells across, few down, so the noise stretches into
+  // ridges that run with the trunk.
+  const grain = fbm(size, 10, 2, 5, 4404);
+  const deep = fbm(size, 3, 1, 3, 9091);
+  const ramp = makeRamp([
+    [0.00, '#241a10'], [0.30, '#3b2a18'], [0.55, '#553d24'],
+    [0.78, '#6d5133'], [1.00, '#826444'],
+  ]);
+  const cv = albedoCanvas(size, grain, ramp, deep, 0.35);
+  const ctx = cv.getContext('2d');
+  // A few deep fissures, and patches of lichen for the humid look.
+  const rand = mulberry32(8822);
+  for (let i = 0; i < 18; i++) {
+    const x = rand() * size;
+    ctx.strokeStyle = `rgba(22,15,9,${0.25 + rand() * 0.4})`;
+    ctx.lineWidth = size * (0.004 + rand() * 0.012);
     ctx.beginPath();
-    const y = Math.random() * size;
-    ctx.moveTo(0, y);
-    ctx.bezierCurveTo(size * 0.3, y + 5, size * 0.7, y - 5, size, y);
+    ctx.moveTo(x, 0);
+    let cxp = x;
+    for (let y = 0; y <= size; y += size / 8) {
+      cxp += (rand() - 0.5) * size * 0.05;
+      ctx.lineTo(cxp, y);
+    }
     ctx.stroke();
   }
+  for (let i = 0; i < 26; i++) {
+    ctx.globalAlpha = 0.07 + rand() * 0.12;
+    ctx.fillStyle = rand() > 0.5 ? '#7f8c5a' : '#5d6b4a';
+    ctx.beginPath();
+    ctx.ellipse(rand() * size, rand() * size, size * 0.03 * (0.5 + rand()), size * 0.05 * (0.5 + rand()), rand() * 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  const height = new Float32Array(size * size);
+  for (let i = 0; i < height.length; i++) height[i] = grain[i] * 0.75 + deep[i] * 0.25;
+  return {
+    map: texFrom(cv, [1, 1], true),
+    normalMap: texFrom(normalMapFromHeight(height, size, 4.5), [1, 1], false),
+    roughnessMap: texFrom(greyCanvasFromField(grain, size, 0.75, 1.0), [1, 1], false),
+  };
+}
 
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.wrapS = THREE.RepeatWrapping;
-  tex.wrapT = THREE.RepeatWrapping;
-  tex.repeat.set(8, 8);
-  return tex;
+function buildLeafSurface(size) {
+  // Canopy foliage seen from a distance: clumped light and shade with veins.
+  const clump = fbm(size, 5, 5, 4, 2211);
+  const fine = fbm(size, 20, 20, 2, 6612);
+  const ramp = makeRamp([
+    [0.00, '#15300f'], [0.28, '#22491a'], [0.52, '#326b24'],
+    [0.76, '#448c2e'], [1.00, '#62ad3f'],
+  ]);
+  const cv = albedoCanvas(size, clump, ramp, fine, 0.3);
+  const ctx = cv.getContext('2d');
+  // Individual leaf silhouettes so the canopy doesn't read as mossy fuzz.
+  const rand = mulberry32(3737);
+  for (let i = 0; i < Math.round(size * 1.1); i++) {
+    const x = rand() * size, y = rand() * size;
+    const r = size * (0.012 + rand() * 0.03);
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(rand() * Math.PI * 2);
+    const lit = rand();
+    ctx.globalAlpha = 0.3 + rand() * 0.4;
+    ctx.fillStyle = lit > 0.6 ? '#6cba46' : lit > 0.3 ? '#3c7d28' : '#1d4415';
+    ctx.beginPath();
+    ctx.ellipse(0, 0, r * 0.55, r, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(20,45,15,0.35)';
+    ctx.lineWidth = Math.max(1, size * 0.002);
+    ctx.beginPath();
+    ctx.moveTo(0, -r);
+    ctx.lineTo(0, r);
+    ctx.stroke();
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+  const height = new Float32Array(size * size);
+  for (let i = 0; i < height.length; i++) height[i] = clump[i] * 0.6 + fine[i] * 0.4;
+  return {
+    map: texFrom(cv, [1, 1], true),
+    normalMap: texFrom(normalMapFromHeight(height, size, 3.2), [1, 1], false),
+    roughnessMap: texFrom(greyCanvasFromField(fine, size, 0.55, 0.9), [1, 1], false),
+  };
+}
+
+function buildRockSurface(size) {
+  const body = fbm(size, 5, 5, 5, 1717);
+  const crack = fbm(size, 14, 14, 3, 4242);
+  const ramp = makeRamp([
+    [0.00, '#3b3a37'], [0.30, '#565450'], [0.58, '#6e6c66'],
+    [0.82, '#85837b'], [1.00, '#9c998f'],
+  ]);
+  const cv = albedoCanvas(size, body, ramp, crack, 0.3);
+  const ctx = cv.getContext('2d');
+  const rand = mulberry32(2929);
+  for (let i = 0; i < 14; i++) {
+    ctx.strokeStyle = `rgba(28,27,25,${0.2 + rand() * 0.35})`;
+    ctx.lineWidth = size * (0.003 + rand() * 0.008);
+    ctx.beginPath();
+    let x = rand() * size, y = rand() * size;
+    ctx.moveTo(x, y);
+    for (let s = 0; s < 6; s++) {
+      x += (rand() - 0.5) * size * 0.28;
+      y += (rand() - 0.5) * size * 0.28;
+      ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+  const height = new Float32Array(size * size);
+  for (let i = 0; i < height.length; i++) height[i] = body[i] * 0.55 + crack[i] * 0.45;
+  return {
+    map: texFrom(cv, [1, 1], true),
+    normalMap: texFrom(normalMapFromHeight(height, size, 4), [1, 1], false),
+    roughnessMap: texFrom(greyCanvasFromField(crack, size, 0.8, 1.0), [1, 1], false),
+  };
+}
+
+function buildSkinSurface(size, ramp) {
+  const pores = fbm(size, 26, 26, 3, 6161);
+  const blotch = fbm(size, 4, 4, 3, 8383);
+  const cv = albedoCanvas(size, blotch, ramp, pores, 0.16);
+  const height = new Float32Array(size * size);
+  for (let i = 0; i < height.length; i++) height[i] = pores[i] * 0.8 + blotch[i] * 0.2;
+  return {
+    map: texFrom(cv, [1, 1], true),
+    normalMap: texFrom(normalMapFromHeight(height, size, 1.1), [1, 1], false),
+    roughnessMap: texFrom(greyCanvasFromField(pores, size, 0.52, 0.78), [1, 1], false),
+  };
+}
+
+function buildClothSurface(size, ramp, seed) {
+  // Woven weft: two crossed stretched noises read as thread.
+  const warp = fbm(size, 48, 2, 2, seed);
+  const weft = fbm(size, 2, 48, 2, seed + 77);
+  const woven = new Float32Array(size * size);
+  for (let i = 0; i < woven.length; i++) woven[i] = (warp[i] + weft[i]) * 0.5;
+  const slub = fbm(size, 6, 6, 3, seed + 500);
+  const cv = albedoCanvas(size, woven, ramp, slub, 0.3);
+  return {
+    map: texFrom(cv, [1, 1], true),
+    normalMap: texFrom(normalMapFromHeight(woven, size, 2.2), [1, 1], false),
+    roughnessMap: texFrom(greyCanvasFromField(slub, size, 0.78, 1.0), [1, 1], false),
+  };
+}
+
+function buildFurSurface(size, ramp, seed) {
+  // Directional strands rather than isotropic blobs.
+  const strands = fbm(size, 40, 7, 3, seed);
+  const shade = fbm(size, 5, 5, 3, seed + 311);
+  const cv = albedoCanvas(size, strands, ramp, shade, 0.34);
+  return {
+    map: texFrom(cv, [1, 1], true),
+    normalMap: texFrom(normalMapFromHeight(strands, size, 2.6), [1, 1], false),
+    roughnessMap: texFrom(greyCanvasFromField(strands, size, 0.7, 0.95), [1, 1], false),
+  };
+}
+
+// Water gets normals only - colour comes from the material and the sky
+// reflection. Two copies of this scroll in different directions so the
+// interference looks like real chop instead of a sliding pattern.
+function buildWaterNormal(size) {
+  const a = fbm(size, 6, 6, 4, 9311);
+  const b = fbm(size, 11, 9, 3, 1559);
+  const h = new Float32Array(size * size);
+  for (let i = 0; i < h.length; i++) h[i] = a[i] * 0.6 + b[i] * 0.4;
+  return normalMapFromHeight(h, size, 1.8);
+}
+
+// Soft round alpha blob, used for foam, dust motes and light shafts.
+function buildSoftDisc(size) {
+  const cv = makeCanvas(size);
+  const ctx = cv.getContext('2d');
+  const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+  g.addColorStop(0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.45, 'rgba(255,255,255,0.55)');
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, size, size);
+  return cv;
+}
+
+// A single grass/fern blade with a soft alpha edge, for the leaf cards that
+// fill out the undergrowth and palm fronds.
+function buildBladeAlpha(size) {
+  const cv = makeCanvas(size);
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, size, size);
+  ctx.fillStyle = '#ffffff';
+  ctx.beginPath();
+  ctx.moveTo(size * 0.5, size);
+  ctx.quadraticCurveTo(size * 0.02, size * 0.55, size * 0.5, 0);
+  ctx.quadraticCurveTo(size * 0.98, size * 0.55, size * 0.5, size);
+  ctx.fill();
+  return cv;
+}
+
+// Lazily built, shared across every material that wants them. Building all of
+// these up front would stall the first frame, so each is made on first access.
+const SURFACES = {};
+function surface(name) {
+  if (SURFACES[name]) return SURFACES[name];
+  let s;
+  if (name === 'ground') s = buildGroundSurface(256);
+  else if (name === 'bark') s = buildBarkSurface(256);
+  else if (name === 'leaf') s = buildLeafSurface(256);
+  else if (name === 'rock') s = buildRockSurface(256);
+  else if (name === 'skin') s = buildSkinSurface(128, makeRamp([[0, '#8a5c38'], [0.5, '#a9764e'], [1, '#c89468']]));
+  else if (name === 'skinPale') s = buildSkinSurface(128, makeRamp([[0, '#b07d52'], [0.5, '#d8a878'], [1, '#efc49a']]));
+  else if (name === 'cloth') s = buildClothSurface(128, makeRamp([[0, '#3d3222'], [0.5, '#5a4632'], [1, '#776046']]), 404);
+  else if (name === 'hide') s = buildClothSurface(128, makeRamp([[0, '#4a3722'], [0.5, '#6b5133'], [1, '#8a6a46']]), 909);
+  else if (name === 'boarFur') s = buildFurSurface(128, makeRamp([[0, '#241a12'], [0.5, '#3f2f20'], [1, '#5c4730']]), 1212);
+  else if (name === 'monkeyFur') s = buildFurSurface(128, makeRamp([[0, '#3b2516'], [0.5, '#6b4a2e'], [1, '#8e6a44']]), 1313);
+  else throw new Error('unknown surface ' + name);
+  SURFACES[name] = s;
+  return s;
+}
+
+// Building every surface costs a couple of hundred milliseconds all told. Left
+// to happen lazily it lands as a stutter the moment you spawn, because that's
+// when the first tree, the first person and the ground all ask for theirs at
+// once. So the start screen builds them ahead of time, one per tick, which keeps
+// the menu responsive and means the world is fully dressed before you see it.
+const WARM_ORDER = [
+  'ground', 'bark', 'leaf', 'rock',
+  'skin', 'skinPale', 'cloth', 'hide', 'boarFur', 'monkeyFur',
+];
+let warmStarted = false;
+function warmSurfaces(onDone) {
+  if (warmStarted) {
+    if (onDone) onDone();
+    return () => {};
+  }
+  warmStarted = true;
+  let i = 0;
+  let timer = null;
+  const step = () => {
+    if (i >= WARM_ORDER.length) {
+      // The derived maps are cheap next to the surfaces they come from.
+      try {
+        waterNormals();
+        for (const name of ['ground', 'bark', 'leaf', 'rock', 'cloth']) grainTiled(name, [1, 1]);
+      } catch (e) {}
+      if (onDone) onDone();
+      return;
+    }
+    try { surface(WARM_ORDER[i]); } catch (e) {}
+    i++;
+    timer = setTimeout(step, 0);
+  };
+  timer = setTimeout(step, 0);
+  return () => { if (timer) clearTimeout(timer); };
+}
+
+// Same bundle, but the tiling is per-use: a tree trunk wants bark repeating
+// differently from a wooden wall. Clones share the underlying canvas upload.
+function surfaceTiled(name, repeat) {
+  const key = name + '@' + repeat[0] + 'x' + repeat[1];
+  if (SURFACES[key]) return SURFACES[key];
+  const base = surface(name);
+  const out = {};
+  for (const slot in base) {
+    const t = base[slot].clone();
+    t.needsUpdate = true;
+    t.repeat.set(repeat[0], repeat[1]);
+    out[slot] = t;
+  }
+  SURFACES[key] = out;
+  return out;
+}
+
+// Tinting a full-colour albedo with a `color` just multiplies two colours and
+// everything turns to mud. This strips a surface down to its light/dark grain,
+// normalised around its own average, so `color` survives and only the texture's
+// relief and variation come through.
+const GRAIN = {};
+function grainCanvasFor(name) {
+  const cached = GRAIN['canvas:' + name];
+  if (cached) return cached;
+  const src = surface(name).map.image;
+  const size = src.width;
+  const d = src.getContext('2d').getImageData(0, 0, size, size).data;
+  const lum = new Float32Array(size * size);
+  let sum = 0;
+  for (let i = 0; i < lum.length; i++) {
+    const o = i * 4;
+    lum[i] = (d[o] + d[o + 1] + d[o + 2]) / 765;
+    sum += lum[i];
+  }
+  const mean = sum / lum.length || 0.5;
+  const cv = makeCanvas(size);
+  const ctx = cv.getContext('2d');
+  const img = ctx.createImageData(size, size);
+  for (let i = 0; i < lum.length; i++) {
+    const v = Math.max(0.35, Math.min(1, 0.82 + ((lum[i] - mean) / mean) * 0.3));
+    const o = i * 4;
+    img.data[o] = img.data[o + 1] = img.data[o + 2] = Math.round(v * 255);
+    img.data[o + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  GRAIN['canvas:' + name] = cv;
+  return cv;
+}
+
+function grainTiled(name, repeat) {
+  const key = 'grain:' + name + '@' + repeat[0] + 'x' + repeat[1];
+  if (GRAIN[key]) return GRAIN[key];
+  const base = surface(name);
+  const out = { map: texFrom(grainCanvasFor(name), repeat, true) };
+  for (const slot of ['normalMap', 'roughnessMap']) {
+    const t = base[slot].clone();
+    t.needsUpdate = true;
+    t.repeat.set(repeat[0], repeat[1]);
+    out[slot] = t;
+  }
+  GRAIN[key] = out;
+  return out;
+}
+
+let _waterNormalA = null, _waterNormalB = null;
+function waterNormals() {
+  if (!_waterNormalA) {
+    const cv = buildWaterNormal(256);
+    _waterNormalA = texFrom(cv, [5, 5], false);
+    _waterNormalB = texFrom(cv, [9, 9], false);
+  }
+  return [_waterNormalA, _waterNormalB];
+}
+
+let _softDisc = null;
+function softDiscTexture() {
+  if (!_softDisc) _softDisc = texFrom(buildSoftDisc(64), [1, 1], false);
+  return _softDisc;
+}
+
+let _bladeAlpha = null;
+function bladeAlphaTexture() {
+  if (!_bladeAlpha) _bladeAlpha = texFrom(buildBladeAlpha(64), [1, 1], false);
+  return _bladeAlpha;
 }
 
 // ============================================================
@@ -2752,65 +3280,381 @@ function createWaterTexture() {
 // ============================================================
 const DAY_LENGTH_SECONDS = 600; // full 24h cycle takes 10 real minutes
 
-const SKY_KEYFRAMES = [
-  { t: 0,  color: new THREE.Color('#0a0e2a') },  // midnight
-  { t: 5,  color: new THREE.Color('#16213b') },  // pre-dawn
-  { t: 6,  color: new THREE.Color('#f6a35c') },  // dawn
-  { t: 8,  color: new THREE.Color('#8ec9f0') },  // morning
-  { t: 12, color: new THREE.Color('#6fb8ee') },  // noon
-  { t: 17, color: new THREE.Color('#f0a35c') },  // afternoon glow
-  { t: 19, color: new THREE.Color('#c1546b') },  // sunset
-  { t: 21, color: new THREE.Color('#1c1740') },  // dusk
-  { t: 24, color: new THREE.Color('#0a0e2a') },  // midnight wrap
+// Each keyframe is a complete lighting setup for one moment of the day: the
+// three sky bands, the sun's colour and strength, how much bounce light fills
+// the shadows, how far you can see, and how visible the stars are. Everything
+// in between is interpolated, so dawn actually sweeps across the sky.
+const SKY_STATES = [
+  { t: 0,    zen: '#030615', hor: '#0a1026', grd: '#05080f', sunC: '#4a62a8', sunI: 0.07, ambI: 0.10, hemiI: 0.17, fogN: 14, fogF: 125, star: 1.00, glow: 0.25, cloud: '#121a33' },
+  { t: 4.6,  zen: '#06102c', hor: '#1b2442', grd: '#0a1020', sunC: '#5e6fae', sunI: 0.10, ambI: 0.13, hemiI: 0.23, fogN: 14, fogF: 135, star: 0.80, glow: 0.30, cloud: '#1e2644' },
+  { t: 6.0,  zen: '#2b3f72', hor: '#e8915c', grd: '#4a3a34', sunC: '#ff9d55', sunI: 0.60, ambI: 0.20, hemiI: 0.40, fogN: 12, fogF: 155, star: 0.22, glow: 1.00, cloud: '#f0a877' },
+  { t: 7.6,  zen: '#4a8ad0', hor: '#cfe2ef', grd: '#6f7a63', sunC: '#ffd6a8', sunI: 1.45, ambI: 0.30, hemiI: 0.62, fogN: 24, fogF: 235, star: 0.00, glow: 0.70, cloud: '#ffffff' },
+  { t: 12,   zen: '#2a79d2', hor: '#bcdaef', grd: '#8a9478', sunC: '#fff6e4', sunI: 2.25, ambI: 0.36, hemiI: 0.78, fogN: 40, fogF: 305, star: 0.00, glow: 0.45, cloud: '#ffffff' },
+  { t: 16.6, zen: '#4683c7', hor: '#ddd2bb', grd: '#7f8468', sunC: '#ffe3b4', sunI: 1.60, ambI: 0.30, hemiI: 0.60, fogN: 28, fogF: 255, star: 0.00, glow: 0.65, cloud: '#fff1dc' },
+  { t: 18.3, zen: '#36407e', hor: '#f08a52', grd: '#50392c', sunC: '#ff8441', sunI: 0.65, ambI: 0.20, hemiI: 0.40, fogN: 16, fogF: 175, star: 0.18, glow: 1.00, cloud: '#ef9765' },
+  { t: 19.6, zen: '#141a44', hor: '#7a4663', grd: '#20182c', sunC: '#a05a7a', sunI: 0.22, ambI: 0.15, hemiI: 0.27, fogN: 14, fogF: 145, star: 0.55, glow: 0.50, cloud: '#4b3450' },
+  { t: 21,   zen: '#050a1c', hor: '#0d142c', grd: '#060a14', sunC: '#4a62a8', sunI: 0.08, ambI: 0.11, hemiI: 0.19, fogN: 14, fogF: 125, star: 1.00, glow: 0.25, cloud: '#141c35' },
+  { t: 24,   zen: '#030615', hor: '#0a1026', grd: '#05080f', sunC: '#4a62a8', sunI: 0.07, ambI: 0.10, hemiI: 0.17, fogN: 14, fogF: 125, star: 1.00, glow: 0.25, cloud: '#121a33' },
 ];
+// Pre-parsed so the per-frame blend never touches a hex string.
+for (const st of SKY_STATES) {
+  st.zenC = new THREE.Color(st.zen);
+  st.horC = new THREE.Color(st.hor);
+  st.grdC = new THREE.Color(st.grd);
+  st.sunColor = new THREE.Color(st.sunC);
+  st.cloudC = new THREE.Color(st.cloud);
+}
 
-function getSkyColor(t) {
-  for (let i = 0; i < SKY_KEYFRAMES.length - 1; i++) {
-    const a = SKY_KEYFRAMES[i];
-    const b = SKY_KEYFRAMES[i + 1];
-    if (t >= a.t && t <= b.t) {
-      const f = (t - a.t) / (b.t - a.t);
-      return a.color.clone().lerp(b.color, f);
+// Reused scratch so the blend allocates nothing per frame.
+const skyNow = {
+  zen: new THREE.Color(), hor: new THREE.Color(), grd: new THREE.Color(),
+  sunColor: new THREE.Color(), cloud: new THREE.Color(),
+  sunI: 1, ambI: 0.3, hemiI: 0.6, fogN: 30, fogF: 250, star: 0, glow: 0.5,
+};
+
+function sampleSky(t) {
+  let a = SKY_STATES[0], b = SKY_STATES[SKY_STATES.length - 1], f = 0;
+  for (let i = 0; i < SKY_STATES.length - 1; i++) {
+    if (t >= SKY_STATES[i].t && t <= SKY_STATES[i + 1].t) {
+      a = SKY_STATES[i];
+      b = SKY_STATES[i + 1];
+      f = (t - a.t) / (b.t - a.t || 1);
+      break;
     }
   }
-  return SKY_KEYFRAMES[0].color.clone();
+  f = smoothstep(Math.max(0, Math.min(1, f)));
+  skyNow.zen.copy(a.zenC).lerp(b.zenC, f);
+  skyNow.hor.copy(a.horC).lerp(b.horC, f);
+  skyNow.grd.copy(a.grdC).lerp(b.grdC, f);
+  skyNow.sunColor.copy(a.sunColor).lerp(b.sunColor, f);
+  skyNow.cloud.copy(a.cloudC).lerp(b.cloudC, f);
+  skyNow.sunI = a.sunI + (b.sunI - a.sunI) * f;
+  skyNow.ambI = a.ambI + (b.ambI - a.ambI) * f;
+  skyNow.hemiI = a.hemiI + (b.hemiI - a.hemiI) * f;
+  skyNow.fogN = a.fogN + (b.fogN - a.fogN) * f;
+  skyNow.fogF = a.fogF + (b.fogF - a.fogF) * f;
+  skyNow.star = a.star + (b.star - a.star) * f;
+  skyNow.glow = a.glow + (b.glow - a.glow) * f;
+  return skyNow;
 }
 
+// Kept for the map/minimap tint and anything else that just wants "what colour
+// is the sky right now".
+function getSkyColor(t) {
+  return sampleSky(t).hor.clone();
+}
 function getSunIntensity(t) {
-  // Highest at noon, near-zero at night
-  const angle = ((t - 6) / 24) * Math.PI * 2;
-  const h = Math.sin(angle);
-  return Math.max(0.05, h) * 1.4;
+  return sampleSky(t).sunI;
 }
 
-// ---------- Sky / Lighting / day-night cycle ----------
+// Where the sun sits for a given hour. Noon is overhead-ish rather than dead
+// vertical, which gives everything a readable shadow all day.
+function sunDirectionAt(t, out) {
+  const a = ((t - 6) / 24) * Math.PI * 2;
+  out.set(Math.cos(a) * 0.82, Math.sin(a), 0.38).normalize();
+  return out;
+}
+
+// ---------- Sky dome ----------
+// A gradient dome with a real sun disc, drifting cloud layer and stars, instead
+// of a flat background colour. Drawn on the inside of a big sphere with
+// depthWrite off so it never occludes anything.
+const SKY_VERT = `
+  varying vec3 vDir;
+  void main() {
+    vDir = normalize((modelMatrix * vec4(position, 1.0)).xyz - cameraPosition);
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }
+`;
+
+const SKY_FRAG = `
+  uniform vec3 zenith;
+  uniform vec3 horizon;
+  uniform vec3 ground;
+  uniform vec3 sunColor;
+  uniform vec3 cloudColor;
+  uniform vec3 sunDir;
+  uniform float glow;
+  uniform float starAmount;
+  uniform float cloudAmount;
+  uniform float time;
+  uniform sampler2D cloudTex;
+  varying vec3 vDir;
+
+  float hash(vec3 p) {
+    return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+  }
+
+  void main() {
+    vec3 dir = normalize(vDir);
+    float h = dir.y;
+
+    // Two-stage vertical blend: a tight haze band at the horizon, then a slow
+    // fade to the zenith. pow() keeps the haze thin like real atmosphere.
+    vec3 col = mix(horizon, zenith, pow(clamp(h, 0.0, 1.0), 0.42));
+    col = mix(col, ground, smoothstep(0.0, -0.18, h));
+
+    float sd = max(dot(dir, sunDir), 0.0);
+    // Broad atmospheric scatter around the sun, strongest near the horizon.
+    col += sunColor * pow(sd, 6.0) * 0.35 * glow;
+    col += sunColor * pow(sd, 90.0) * 0.9 * glow;
+    // The disc itself.
+    col += sunColor * smoothstep(0.9975, 0.9990, sd) * 3.2;
+
+    // Moon sits opposite the sun so there is always something up there.
+    float md = max(dot(dir, -sunDir), 0.0);
+    col += vec3(0.75, 0.79, 0.92) * smoothstep(0.9988, 0.9995, md) * starAmount * 2.2;
+    col += vec3(0.35, 0.40, 0.55) * pow(md, 200.0) * starAmount * 0.5;
+
+    if (starAmount > 0.01 && h > 0.0) {
+      // Quantise the direction into a grid and light up a sparse few cells.
+      vec3 cell = floor(dir * 260.0);
+      float s = hash(cell);
+      float star = smoothstep(0.9972, 0.9999, s);
+      float twinkle = 0.65 + 0.35 * sin(time * 2.4 + s * 90.0);
+      col += vec3(0.85, 0.88, 1.0) * star * twinkle * starAmount * smoothstep(0.0, 0.25, h);
+    }
+
+    if (h > 0.03 && cloudAmount > 0.01) {
+      // Project the view direction onto a flat plane overhead - the standard
+      // cheap sky-plane trick. Clouds stretch out and thin near the horizon.
+      vec2 uv = dir.xz / (h + 0.12);
+      float c1 = texture2D(cloudTex, uv * 0.045 + vec2(time * 0.0035, time * 0.0012)).r;
+      float c2 = texture2D(cloudTex, uv * 0.10 - vec2(time * 0.0052, time * 0.0021)).r;
+      float cover = smoothstep(0.52, 0.92, c1 * 0.68 + c2 * 0.42);
+      cover *= smoothstep(0.03, 0.30, h) * cloudAmount;
+      // Lit rim where the cloud faces the sun.
+      vec3 lit = mix(cloudColor * 0.55, cloudColor, smoothstep(0.0, 1.0, c2));
+      lit += sunColor * pow(sd, 12.0) * 0.5 * glow;
+      col = mix(col, lit, cover);
+    }
+
+    gl_FragColor = vec4(col, 1.0);
+  }
+`;
+
+// Greyscale fbm used as the cloud mask. Seamless, so the sky plane can scroll
+// forever without a visible join.
+let _cloudTex = null;
+function cloudTexture() {
+  if (!_cloudTex) {
+    const size = 256;
+    const f = fbm(size, 4, 4, 5, 20250);
+    _cloudTex = texFrom(greyCanvasFromField(f, size, 0, 1), [1, 1], false);
+  }
+  return _cloudTex;
+}
+
+function SkyDome({ uniforms }) {
+  const ref = useRef();
+  const geo = useMemo(() => new THREE.SphereGeometry(460, 32, 20), []);
+  const mat = useMemo(() => new THREE.ShaderMaterial({
+    uniforms,
+    vertexShader: SKY_VERT,
+    fragmentShader: SKY_FRAG,
+    side: THREE.BackSide,
+    // Drawn first (renderOrder -1) and never written to the depth buffer, so
+    // everything else paints over it. Skipping the depth test as well avoids
+    // relying on a 460-unit sphere staying inside the far plane's precision.
+    depthWrite: false,
+    depthTest: false,
+    // Authored colours: let them through untouched rather than have the tone
+    // mapper flatten the sunset.
+    toneMapped: false,
+    fog: false,
+  }), [uniforms]);
+  useEffect(() => () => { geo.dispose(); mat.dispose(); }, [geo, mat]);
+  // Ride along with the camera so the dome is effectively infinitely far away
+  // and can never clip against the far plane, however far you walk.
+  useFrame(({ camera }) => {
+    if (ref.current) ref.current.position.copy(camera.position);
+  });
+  return html`<mesh ref=${ref} geometry=${geo} material=${mat} frustumCulled=${false} renderOrder=${-1} />`;
+}
+
+// ---------- Environment map ----------
+// Materials need something to reflect or the water and any metal read as flat
+// paint. This paints a tiny equirectangular sky from the current colours and
+// runs it through PMREM so roughness-aware reflections work. Rebuilt a few
+// times a minute, not per frame.
+function paintEnvCanvas(cv, sky, sunDir) {
+  const ctx = cv.getContext('2d');
+  const w = cv.width, h = cv.height;
+  const grad = ctx.createLinearGradient(0, 0, 0, h);
+  grad.addColorStop(0, '#' + sky.zen.getHexString());
+  grad.addColorStop(0.46, '#' + sky.hor.getHexString());
+  grad.addColorStop(0.54, '#' + sky.hor.getHexString());
+  grad.addColorStop(1, '#' + sky.grd.getHexString());
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, w, h);
+  // Equirect: longitude across, latitude down. Put a soft sun blob where the
+  // light actually is so reflections have a highlight to catch.
+  const lon = Math.atan2(-sunDir.z, sunDir.x);
+  const lat = Math.asin(Math.max(-1, Math.min(1, sunDir.y)));
+  const sx = ((lon / (Math.PI * 2)) + 0.5) * w;
+  const sy = (0.5 - lat / Math.PI) * h;
+  const r = h * 0.3;
+  const blob = ctx.createRadialGradient(sx, sy, 0, sx, sy, r);
+  const sc = sky.sunColor;
+  blob.addColorStop(0, `rgba(${Math.round(sc.r * 255)},${Math.round(sc.g * 255)},${Math.round(sc.b * 255)},${0.95 * sky.glow})`);
+  blob.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = blob;
+  ctx.fillRect(0, 0, w, h);
+  return cv;
+}
+
 function DayNightSystem() {
-  const { scene } = useThree();
+  const { scene, gl } = useThree();
   const sunRef = useRef();
+  const moonRef = useRef();
+  const ambRef = useRef();
+  const hemiRef = useRef();
   const clockAccum = useRef(0);
   const localTime = useRef(8); // hours
+  const sunDir = useRef(new THREE.Vector3(0, 1, 0));
+  const sunTarget = useMemo(() => new THREE.Object3D(), []);
+  const shadowSetup = useRef({ map: 0, extent: 0 });
+  const envAge = useRef(1e9);
+
+  const uniforms = useMemo(() => ({
+    zenith: { value: new THREE.Color('#2a79d2') },
+    horizon: { value: new THREE.Color('#bcdaef') },
+    ground: { value: new THREE.Color('#8a9478') },
+    sunColor: { value: new THREE.Color('#fff6e4') },
+    cloudColor: { value: new THREE.Color('#ffffff') },
+    sunDir: { value: new THREE.Vector3(0, 1, 0) },
+    glow: { value: 0.5 },
+    starAmount: { value: 0 },
+    cloudAmount: { value: 1 },
+    time: { value: 0 },
+    cloudTex: { value: cloudTexture() },
+  }), []);
+
+  // One canvas and one PMREM generator reused for every environment rebuild.
+  const env = useMemo(() => {
+    const cv = makeCanvas(128, 64);
+    const tex = new THREE.CanvasTexture(cv);
+    tex.mapping = THREE.EquirectangularReflectionMapping;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    let pmrem = null;
+    try {
+      pmrem = new THREE.PMREMGenerator(gl);
+      pmrem.compileEquirectangularShader();
+    } catch (e) {
+      pmrem = null;
+    }
+    return { cv, tex, pmrem, rt: null };
+  }, [gl]);
+
+  useEffect(() => () => {
+    if (env.rt) env.rt.dispose();
+    if (env.pmrem) env.pmrem.dispose();
+    env.tex.dispose();
+    scene.environment = null;
+  }, [env, scene]);
 
   useFrame((_, delta) => {
+    const q = gfx();
     clockAccum.current += delta;
     localTime.current = (8 + (clockAccum.current / DAY_LENGTH_SECONDS) * 24) % 24;
     const t = localTime.current;
+    const sky = sampleSky(t);
+    sunDirectionAt(t, sunDir.current);
 
-    const sky = getSkyColor(t);
-    scene.background = sky;
-    if (scene.fog) scene.fog.color = sky;
+    // --- sky dome ---
+    uniforms.zenith.value.copy(sky.zen);
+    uniforms.horizon.value.copy(sky.hor);
+    uniforms.ground.value.copy(sky.grd);
+    uniforms.sunColor.value.copy(sky.sunColor);
+    uniforms.cloudColor.value.copy(sky.cloud);
+    uniforms.sunDir.value.copy(sunDir.current);
+    uniforms.glow.value = sky.glow;
+    uniforms.starAmount.value = sky.star;
+    uniforms.time.value = clockAccum.current;
 
-    const angle = ((t - 6) / 24) * Math.PI * 2;
-    const sunDist = 150;
-    const sunY = Math.sin(angle) * sunDist;
-    const sunX = Math.cos(angle) * sunDist;
-    if (sunRef.current) {
-      sunRef.current.position.set(sunX, Math.max(sunY, -20), 40);
-      sunRef.current.intensity = getSunIntensity(t);
-      const warmth = Math.max(0, 1 - Math.abs(t - 6) / 4) + Math.max(0, 1 - Math.abs(t - 18) / 4);
-      sunRef.current.color.set(warmth > 0.3 ? '#ffb37a' : '#ffffff');
+    // --- fog + fallback background ---
+    scene.background = sky.hor;
+    if (scene.fog) {
+      scene.fog.color.copy(sky.hor);
+      scene.fog.near = sky.fogN;
+      scene.fog.far = sky.fogF;
     }
 
-    // push time of day to store roughly once per second
+    // --- sun ---
+    const px = playerTransform.position[0];
+    const pz = playerTransform.position[2];
+    if (sunRef.current) {
+      const sun = sunRef.current;
+      // Keep the light rigged to the player. The shadow frustum is small so
+      // shadows stay sharp; parking it at the world origin instead would make
+      // everything mushy once you walked away from camp.
+      sun.position.set(px + sunDir.current.x * 90, Math.max(2, sunDir.current.y * 90), pz + sunDir.current.z * 90);
+      sunTarget.position.set(px, 0, pz);
+      sun.target = sunTarget;
+      sun.color.copy(sky.sunColor);
+      sun.intensity = sky.sunI;
+      sun.visible = sky.sunI > 0.03;
+
+      const setup = shadowSetup.current;
+      if (setup.map !== q.shadowMap || setup.extent !== q.shadowExtent) {
+        setup.map = q.shadowMap;
+        setup.extent = q.shadowExtent;
+        sun.shadow.mapSize.set(q.shadowMap, q.shadowMap);
+        const c = sun.shadow.camera;
+        c.left = -q.shadowExtent;
+        c.right = q.shadowExtent;
+        c.top = q.shadowExtent;
+        c.bottom = -q.shadowExtent;
+        c.near = 1;
+        c.far = 260;
+        c.updateProjectionMatrix();
+        // Force the shadow map to be reallocated at the new resolution.
+        if (sun.shadow.map) {
+          sun.shadow.map.dispose();
+          sun.shadow.map = null;
+        }
+      }
+    }
+
+    // --- moon fill: a cold directional opposite the sun, so night reads as
+    // moonlit rather than pitch black. No shadows; it's a fill light. ---
+    if (moonRef.current) {
+      const m = moonRef.current;
+      m.position.set(px - sunDir.current.x * 80, Math.max(6, -sunDir.current.y * 80), pz - sunDir.current.z * 80);
+      m.target = sunTarget;
+      m.intensity = 0.42 * sky.star;
+      m.visible = sky.star > 0.02;
+    }
+
+    if (ambRef.current) {
+      ambRef.current.intensity = sky.ambI;
+      ambRef.current.color.copy(sky.hor).lerp(new THREE.Color('#ffffff'), 0.35);
+    }
+    if (hemiRef.current) {
+      hemiRef.current.intensity = sky.hemiI;
+      hemiRef.current.color.copy(sky.hor);
+      hemiRef.current.groundColor.copy(sky.grd).lerp(new THREE.Color('#3f5a28'), 0.5);
+    }
+
+    // --- environment map, throttled ---
+    envAge.current += delta;
+    if (q.envSeconds > 0 && env.pmrem && envAge.current >= q.envSeconds) {
+      envAge.current = 0;
+      try {
+        paintEnvCanvas(env.cv, sky, sunDir.current);
+        env.tex.needsUpdate = true;
+        const next = env.pmrem.fromEquirectangular(env.tex);
+        if (env.rt) env.rt.dispose();
+        env.rt = next;
+        scene.environment = next.texture;
+      } catch (e) {
+        env.pmrem = null; // one failure is enough; don't retry every tick
+      }
+    } else if (q.envSeconds === 0 && scene.environment) {
+      scene.environment = null;
+    }
+
+    // push time of day to store roughly four times a second
     if (Math.floor(clockAccum.current * 4) !== Math.floor((clockAccum.current - delta) * 4)) {
       useGame.getState().setTimeOfDay(t);
     }
@@ -2818,12 +3662,14 @@ function DayNightSystem() {
 
   return html`
     <${Fragment}>
-      <directionalLight ref=${sunRef} position=${[50, 80, 40]} intensity=${1} castShadow
+      <${SkyDome} uniforms=${uniforms} />
+      <primitive object=${sunTarget} />
+      <directionalLight ref=${sunRef} position=${[50, 80, 40]} intensity=${2} castShadow=${true}
         shadow-mapSize-width=${2048} shadow-mapSize-height=${2048}
-        shadow-camera-far=${300} shadow-camera-left=${-120} shadow-camera-right=${120}
-        shadow-camera-top=${120} shadow-camera-bottom=${-120} />
-      <ambientLight intensity=${0.35} color="#bcd4ff" />
-      <hemisphereLight args=${['#bcd4ff', '#3a5a30', 0.5]} />
+        shadow-bias=${-0.0004} shadow-normalBias=${0.035} />
+      <directionalLight ref=${moonRef} position=${[-50, 60, -40]} intensity=${0} color="#8fa6d8" />
+      <ambientLight ref=${ambRef} intensity=${0.35} color="#bcd4ff" />
+      <hemisphereLight ref=${hemiRef} args=${['#bcd4ff', '#3a5a30', 0.7]} />
     <//>
   `;
 }
@@ -2848,9 +3694,6 @@ const TERRAIN_HILLS = [
   { x: 6.6, z: -189.9, amp: 22, r: 42 },
   { x: 180.7, z: -58.7, amp: 24, r: 45 },
 ];
-
-
-const smoothstep = (t) => t * t * (3 - 2 * t);
 
 // How strongly the pond overrides the natural hills: fully inside the waterline,
 // easing back to untouched terrain by POND_BLEND_R so the bank has no seam.
@@ -2915,11 +3758,103 @@ function getDominantBiome(x, z) {
   return best; // 0=woodland, 1=sandy, 2=snow, 3=rocky, 4=swamp
 }
 
+// ---------- Shared materials ----------
+// One material per surface, shared by every mesh that uses it, so the renderer
+// can batch and the textures upload once.
+const MATS = {};
+function stdMat(name, build) {
+  if (!MATS[name]) MATS[name] = build();
+  return MATS[name];
+}
+function surfaceMat(name, surfKey, repeat, opts) {
+  return stdMat(name, () => {
+    // A `color` means this material is tinted, so it needs the grain variant
+    // rather than the full-colour albedo.
+    const s = (opts && opts.color) ? grainTiled(surfKey, repeat) : surfaceTiled(surfKey, repeat);
+    return new THREE.MeshStandardMaterial(Object.assign({
+      map: s.map, normalMap: s.normalMap, roughnessMap: s.roughnessMap,
+    }, opts || {}));
+  });
+}
+
+// Mean luminance of a surface's albedo, needed by the detail-blend patch below
+// so the second texture layer modulates around its own average instead of
+// darkening everything it touches.
+const _meanCache = {};
+function surfaceMeanLuma(name) {
+  if (_meanCache[name] !== undefined) return _meanCache[name];
+  let mean = 0.3;
+  try {
+    const tex = surface(name).map;
+    const cv = tex.image;
+    const ctx = cv.getContext('2d');
+    const d = ctx.getImageData(0, 0, cv.width, cv.height).data;
+    let sum = 0;
+    for (let i = 0; i < d.length; i += 4) sum += (d[i] + d[i + 1] + d[i + 2]) / 765;
+    mean = sum / (d.length / 4);
+  } catch (e) {}
+  _meanCache[name] = mean;
+  return mean;
+}
+
+// ---------- Detail-texture shader patches ----------
+// A single tiled texture either looks blurry up close or obviously repeating far
+// away. These patch meshStandardMaterial to sample the same texture at two
+// scales: a macro layer for the broad colour and a fine layer for the grit under
+// your feet. Both patches no-op if the shader chunks aren't where we expect, so
+// a three.js upgrade degrades to plain tiling rather than breaking.
+function patchMapDetail(shader, macro, detail, mean, strength) {
+  const chunk = '#include <map_fragment>';
+  // Bail out unless the chunk AND the varying it reads are both where we expect.
+  // If three ever renames either, we quietly keep the plain single-scale map
+  // instead of generating GLSL that won't compile.
+  if (shader.fragmentShader.indexOf(chunk) === -1) return false;
+  if (shader.vertexShader.indexOf('vMapUv') === -1) return false;
+  shader.uniforms.uMapMacro = { value: macro };
+  shader.uniforms.uMapDetail = { value: detail };
+  shader.uniforms.uMapMean = { value: mean };
+  shader.uniforms.uMapStrength = { value: strength };
+  shader.fragmentShader = 'uniform float uMapMacro;\nuniform float uMapDetail;\nuniform float uMapMean;\nuniform float uMapStrength;\n' + shader.fragmentShader;
+  shader.fragmentShader = shader.fragmentShader.replace(chunk, [
+    '#ifdef USE_MAP',
+    '  vec4 macroTex = texture2D( map, vMapUv * uMapMacro );',
+    '  float detailLuma = dot( texture2D( map, vMapUv * uMapDetail ).rgb, vec3( 0.3333 ) );',
+    '  float detailMod = 1.0 + ( detailLuma - uMapMean ) * uMapStrength;',
+    '  diffuseColor *= vec4( macroTex.rgb * detailMod, macroTex.a );',
+    '#endif',
+  ].join('\n'));
+  return true;
+}
+
+function patchNormalDetail(shader, macro, detail, blend) {
+  const chunk = '#include <normal_fragment_maps>';
+  if (shader.fragmentShader.indexOf(chunk) === -1) return false;
+  if (shader.vertexShader.indexOf('vNormalMapUv') === -1) return false;
+  shader.uniforms.uNrmMacro = { value: macro };
+  shader.uniforms.uNrmDetail = { value: detail };
+  shader.uniforms.uNrmBlend = { value: blend };
+  shader.fragmentShader = 'uniform float uNrmMacro;\nuniform float uNrmDetail;\nuniform float uNrmBlend;\n' + shader.fragmentShader;
+  shader.fragmentShader = shader.fragmentShader.replace(chunk, [
+    '#ifdef USE_NORMALMAP_TANGENTSPACE',
+    '  vec3 nA = texture2D( normalMap, vNormalMapUv * uNrmMacro ).xyz * 2.0 - 1.0;',
+    '  vec3 nB = texture2D( normalMap, vNormalMapUv * uNrmDetail ).xyz * 2.0 - 1.0;',
+    // Whiteout blend: add the tangents, keep the z product. Cheap and it never
+    // flattens the macro shape the way a plain mix() does.
+    '  vec3 mapN = normalize( vec3( nA.xy + nB.xy * uNrmBlend, nA.z * nB.z ) );',
+    '  mapN.xy *= normalScale;',
+    '  normal = normalize( tbn * mapN );',
+    '#endif',
+  ].join('\n'));
+  return true;
+}
+
 // ---------- Ground ----------
 const TERRAIN_SIZE = 600;
 // 200 segments over 600 units is a 3-unit grid, enough for the 18-unit pond basin
 // to read as round. At 100 the basin spanned only three quads and looked faceted.
 const TERRAIN_SEGMENTS = 200;
+// How far out from the waterline the ground reads as wet silt rather than grass.
+const POND_SILT_R = POND_RADIUS + 3.5;
 
 function createTerrainGeometry() {
   const geo = new THREE.BufferGeometry();
@@ -2929,13 +3864,23 @@ function createTerrainGeometry() {
   const uvs = [];
   const colors = [];
   const indices = [];
+  const silt = [0.40, 0.345, 0.25];
   for (let iz = 0; iz <= seg; iz++) {
     for (let ix = 0; ix <= seg; ix++) {
       const x = -half + (ix / seg) * TERRAIN_SIZE;
       const z = -half + (iz / seg) * TERRAIN_SIZE;
       positions.push(x, getTerrainHeight(x, z), z);
       uvs.push(ix / seg, iz / seg);
-      const [cr, cg, cb] = getBiomeColor(x, z);
+      let [cr, cg, cb] = getBiomeColor(x, z);
+      // Wet silt around and under the pond. Only the 3D mesh is tinted - the map
+      // raster keeps using getBiomeColor so the overhead view stays readable.
+      const pd = Math.hypot(x - POND_CENTER[0], z - POND_CENTER[1]);
+      if (pd < POND_SILT_R) {
+        const w = smoothstep(1 - pd / POND_SILT_R);
+        cr += (silt[0] - cr) * w;
+        cg += (silt[1] - cg) * w;
+        cb += (silt[2] - cb) * w;
+      }
       colors.push(cr, cg, cb);
     }
   }
@@ -2958,189 +3903,1361 @@ function createTerrainGeometry() {
 
 function Ground() {
   const geo = useMemo(() => createTerrainGeometry(), []);
-  return html`
-    <mesh geometry=${geo} receiveShadow=${true}>
-      <meshStandardMaterial vertexColors=${true} roughness=${0.9} />
-    </mesh>
-  `;
+  const mat = useMemo(() => {
+    const s = surfaceTiled('ground', [1, 1]);
+    const m = new THREE.MeshStandardMaterial({
+      map: s.map,
+      normalMap: s.normalMap,
+      roughnessMap: s.roughnessMap,
+      vertexColors: true,
+      roughness: 0.95,
+      metalness: 0,
+      normalScale: new THREE.Vector2(1.1, 1.1),
+      envMapIntensity: 0.35,
+    });
+    const mean = surfaceMeanLuma('ground');
+    // UVs run 0..1 across all 600 units, so these numbers are tiles per world:
+    // 90 gives a ~6.7m macro tile, 520 a ~1.15m detail tile.
+    m.onBeforeCompile = (shader) => {
+      try {
+        patchMapDetail(shader, 90, 520, mean, 0.85);
+        patchNormalDetail(shader, 90, 520, 0.8);
+      } catch (e) {}
+    };
+    return m;
+  }, []);
+  return html`<mesh geometry=${geo} material=${mat} receiveShadow=${true} />`;
 }
 
 // ---------- Water (pond) ----------
+// Alpha ring that fades the shoreline into foam. RingGeometry's UVs are a
+// centred square, so a radial gradient lines up with the rim.
+let _foamTex = null;
+function foamTexture() {
+  if (!_foamTex) {
+    const size = 256;
+    const cv = makeCanvas(size);
+    const ctx = cv.getContext('2d');
+    ctx.clearRect(0, 0, size, size);
+    const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+    g.addColorStop(0.00, 'rgba(255,255,255,0)');
+    g.addColorStop(0.80, 'rgba(255,255,255,0)');
+    g.addColorStop(0.93, 'rgba(255,255,255,0.85)');
+    g.addColorStop(1.00, 'rgba(255,255,255,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, size, size);
+    // Break the ring up so it reads as froth rather than a drawn circle.
+    const rand = mulberry32(6060);
+    ctx.globalCompositeOperation = 'destination-out';
+    for (let i = 0; i < 420; i++) {
+      const a = rand() * Math.PI * 2;
+      const r = size * (0.40 + rand() * 0.10);
+      ctx.beginPath();
+      ctx.arc(size / 2 + Math.cos(a) * r, size / 2 + Math.sin(a) * r, size * (0.004 + rand() * 0.016), 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(0,0,0,${0.3 + rand() * 0.7})`;
+      ctx.fill();
+    }
+    ctx.globalCompositeOperation = 'source-over';
+    _foamTex = texFrom(cv, [1, 1], false);
+  }
+  return _foamTex;
+}
+
 function Water() {
-  const tex = useMemo(() => createWaterTexture(), []);
+  const quality = useGame((s) => s.graphicsQuality);
+  const seg = (GRAPHICS_PRESETS[quality] || gfx()).waterSegments;
   const ref = useRef();
-  useFrame((_, delta) => {
-    tex.offset.x += delta * 0.02;
-    tex.offset.y += delta * 0.01;
-  });
-  return html`
-    <mesh
-      ref=${ref}
-      position=${[POND_CENTER[0], POND_SURFACE_Y, POND_CENTER[1]]}
-      rotation=${[-Math.PI / 2, 0, 0]}
-      receiveShadow=${true}
-    >
-      <circleGeometry args=${[POND_RADIUS, 48]} />
-      <meshStandardMaterial map=${tex} transparent=${true} opacity=${0.85} roughness=${0.2} metalness=${0.1} />
-    </mesh>
-  `;
-}
+  const base = useRef(null);
 
-// ---------- Procedural Tree ----------
-function Tree({ position, scale = 1 }) {
-  const barkTex = useTreeBark();
-  return html`
-    <group position=${position} scale=${scale}>
-      <mesh position=${[0, 1.5, 0]} castShadow=${true}>
-        <cylinderGeometry args=${[0.18, 0.28, 3, 6]} />
-        <meshStandardMaterial map=${barkTex} roughness=${0.9} />
-      </mesh>
-      <mesh position=${[0, 3.4, 0]} castShadow=${true}>
-        <coneGeometry args=${[1.6, 2.2, 7]} />
-        <meshStandardMaterial color="#2f7a37" roughness=${0.85} />
-      </mesh>
-      <mesh position=${[0, 4.6, 0]} castShadow=${true}>
-        <coneGeometry args=${[1.1, 1.6, 7]} />
-        <meshStandardMaterial color="#3a8f43" roughness=${0.85} />
-      </mesh>
-      <mesh position=${[0, 5.6, 0]} castShadow=${true}>
-        <coneGeometry args=${[0.6, 1.2, 7]} />
-        <meshStandardMaterial color="#4aa852" roughness=${0.85} />
-      </mesh>
-    </group>
-  `;
-}
+  // Radial rings (not a plain circle) so the surface has vertices to lift into
+  // swell. RingGeometry gives us those rings for free.
+  const geo = useMemo(() => {
+    const g = new THREE.RingGeometry(0.02, POND_RADIUS, seg, Math.max(4, Math.round(seg / 3)));
+    g.rotateX(-Math.PI / 2);
+    base.current = g.attributes.position.array.slice();
+    return g;
+  }, [seg]);
 
-let _barkTex = null;
-function useTreeBark() {
-  return useMemo(() => {
-    if (!_barkTex) _barkTex = createBarkTexture();
-    return _barkTex;
+  const mat = useMemo(() => {
+    const [nA] = waterNormals();
+    const m = new THREE.MeshStandardMaterial({
+      color: '#2d6f80',
+      normalMap: nA,
+      normalScale: new THREE.Vector2(0.7, 0.7),
+      roughness: 0.07,
+      metalness: 0.02,
+      transparent: true,
+      opacity: 0.86,
+      envMapIntensity: 1.8,
+      side: THREE.DoubleSide,
+    });
+    // Two scales of the same ripple normal, scrolling together. The interference
+    // between them is what stops it looking like a sliding wallpaper.
+    m.onBeforeCompile = (shader) => {
+      try { patchNormalDetail(shader, 1, 2.9, 0.75); } catch (e) {}
+    };
+    return m;
   }, []);
+
+  const foamMat = useMemo(() => new THREE.MeshBasicMaterial({
+    map: foamTexture(),
+    transparent: true,
+    opacity: 0.5,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  }), []);
+
+  // The froth ring that marks the waterline.
+  const foamGeo = useMemo(() => {
+    const g = new THREE.RingGeometry(POND_RADIUS * 0.80, POND_RADIUS * 1.04, 64, 1);
+    g.rotateX(-Math.PI / 2);
+    return g;
+  }, []);
+
+  const elapsed = useRef(0);
+  useFrame((_, delta) => {
+    elapsed.current += delta;
+    const t = elapsed.current;
+    const [nA] = waterNormals();
+    nA.offset.x = t * 0.022;
+    nA.offset.y = t * 0.013;
+    // Gentle crossing swell. Only a few hundred vertices, so this is cheap.
+    const mesh = ref.current;
+    if (mesh && base.current) {
+      const pos = mesh.geometry.attributes.position;
+      const src = base.current;
+      for (let i = 0; i < pos.count; i++) {
+        const x = src[i * 3];
+        const z = src[i * 3 + 2];
+        const h = Math.sin(x * 0.42 + t * 1.25) * 0.035
+                + Math.sin(z * 0.33 - t * 0.95) * 0.03
+                + Math.sin((x + z) * 0.6 + t * 1.9) * 0.015;
+        pos.setY(i, h);
+      }
+      pos.needsUpdate = true;
+      mesh.geometry.computeVertexNormals();
+    }
+    if (foamMat) foamMat.opacity = 0.42 + Math.sin(t * 1.1) * 0.08;
+  });
+
+  return html`
+    <${Fragment}>
+      <mesh
+        ref=${ref}
+        geometry=${geo}
+        material=${mat}
+        position=${[POND_CENTER[0], POND_SURFACE_Y, POND_CENTER[1]]}
+      />
+      <mesh
+        geometry=${foamGeo}
+        material=${foamMat}
+        position=${[POND_CENTER[0], POND_SURFACE_Y + 0.035, POND_CENTER[1]]}
+      />
+    <//>
+  `;
 }
 
-// ---------- Procedural Snow Tree (pine with snow-capped tips) ----------
+// ============================================================
+// vegetation.js - procedural plant geometry
+//
+// A plant is a flat list of parts: { k: geometry key, p: offset, r: euler,
+// s: scale, c: optional tint }. The same list can be drawn as individual
+// meshes (a handful of harvestable trees) or merged into InstancedMeshes (the
+// few hundred decorative ones), so detail costs us draw calls only once.
+// ============================================================
+
+// Smooth, position-driven wobble. Because it's a function of the vertex
+// position, vertices shared between faces always agree and the mesh never
+// cracks open - which is what happens if you jitter each vertex randomly.
+function wobble3(x, y, z, freq, seed) {
+  return Math.sin(x * freq + seed) * Math.sin(y * freq * 1.37 + seed * 1.7)
+       * Math.sin(z * freq * 1.11 + seed * 2.3);
+}
+
+function displaceGeometry(geo, amount, freq, seed) {
+  const p = geo.attributes.position;
+  for (let i = 0; i < p.count; i++) {
+    const x = p.getX(i), y = p.getY(i), z = p.getZ(i);
+    const n = wobble3(x, y, z, freq, seed);
+    const l = Math.sqrt(x * x + y * y + z * z) || 1;
+    p.setXYZ(i, x + (x / l) * n * amount, y + (y / l) * n * amount, z + (z / l) * n * amount);
+  }
+  geo.computeVertexNormals();
+  return geo;
+}
+
+// Trunks only bulge sideways - displacing them radially from the origin would
+// shorten and shear them.
+function displaceXZ(geo, amount, freq, seed) {
+  const p = geo.attributes.position;
+  for (let i = 0; i < p.count; i++) {
+    const x = p.getX(i), y = p.getY(i), z = p.getZ(i);
+    const n = wobble3(x, y, z, freq, seed);
+    const l = Math.sqrt(x * x + z * z) || 1;
+    p.setXYZ(i, x + (x / l) * n * amount, y, z + (z / l) * n * amount);
+  }
+  geo.computeVertexNormals();
+  return geo;
+}
+
+// A leaf/frond: tapered, drooping, built along +Y with the stem at the origin so
+// a part's scale sets its length directly.
+function buildLeafGeometry(steps, droop, width, tipBias) {
+  const positions = [];
+  const uvs = [];
+  const indices = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    // Leaf silhouette: widest a third of the way along, tapering to a point.
+    const hw = width * Math.sin(Math.PI * Math.pow(t, tipBias)) * (1 - t * 0.15);
+    const y = t;
+    const z = -droop * t * t;
+    positions.push(-hw, y, z, hw, y, z);
+    uvs.push(0, t, 1, t);
+    if (i > 0) {
+      const a = (i - 1) * 2, b = a + 1, c = i * 2, d = c + 1;
+      indices.push(a, c, b, b, c, d);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setIndex(indices);
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  geo.computeVertexNormals();
+  return geo;
+}
+
+// Every geometry key used by the part lists, built once on first use.
+const VEG_GEO = {};
+function vegGeo(key) {
+  if (VEG_GEO[key]) return VEG_GEO[key];
+  let g;
+  if (key === 'trunk') {
+    // Unit height, base at y=0, tapering upward. Nine sides reads as round
+    // without the cost of a smooth cylinder.
+    g = new THREE.CylinderGeometry(0.62, 1, 1, 9, 3, true);
+    g.translate(0, 0.5, 0);
+    displaceXZ(g, 0.055, 7, 1.3);
+  } else if (key === 'branch') {
+    g = new THREE.CylinderGeometry(0.3, 1, 1, 6, 1, true);
+    g.translate(0, 0.5, 0);
+  } else if (key === 'root') {
+    // Buttress root: a flattened cone leaning out from the trunk base.
+    g = new THREE.ConeGeometry(1, 1, 5, 1);
+    g.translate(0, 0.5, 0);
+    displaceXZ(g, 0.07, 6, 2.2);
+  } else if (key === 'canopy') {
+    g = new THREE.IcosahedronGeometry(1, 2);
+    displaceGeometry(g, 0.26, 2.4, 0.8);
+  } else if (key === 'canopySmall') {
+    g = new THREE.IcosahedronGeometry(1, 1);
+    displaceGeometry(g, 0.3, 3.1, 1.9);
+  } else if (key === 'leaf') {
+    g = buildLeafGeometry(8, 0.42, 0.17, 0.55);
+  } else if (key === 'frond') {
+    g = buildLeafGeometry(12, 0.78, 0.13, 0.42);
+  } else if (key === 'needleSkirt') {
+    g = new THREE.ConeGeometry(1, 1, 9, 2);
+    g.translate(0, 0.5, 0);
+    displaceGeometry(g, 0.1, 5, 3.3);
+  } else if (key === 'snowCap') {
+    g = new THREE.ConeGeometry(1, 1, 9, 1);
+    g.translate(0, 0.5, 0);
+    displaceGeometry(g, 0.07, 6, 4.1);
+  } else if (key === 'boulder') {
+    g = new THREE.IcosahedronGeometry(1, 1);
+    displaceGeometry(g, 0.3, 2.2, 5.5);
+  } else if (key === 'pebble') {
+    g = new THREE.IcosahedronGeometry(1, 0);
+    displaceGeometry(g, 0.22, 3, 6.6);
+  } else if (key === 'cactus') {
+    g = new THREE.CapsuleGeometry(1, 2.2, 4, 9);
+    g.translate(0, 1.1, 0);
+    displaceXZ(g, 0.06, 9, 7.7);
+  } else if (key === 'vine') {
+    g = new THREE.CylinderGeometry(1, 0.7, 1, 4, 1, true);
+    g.translate(0, -0.5, 0); // hangs down from its anchor
+  } else {
+    throw new Error('unknown vegetation geometry ' + key);
+  }
+  VEG_GEO[key] = g;
+  return g;
+}
+
+// Which material each geometry key is drawn with.
+function vegMat(key) {
+  if (key === 'trunk' || key === 'branch' || key === 'root' || key === 'vine') {
+    return surfaceMat('bark', 'bark', [1.6, 2.4], { roughness: 0.95, envMapIntensity: 0.2 });
+  }
+  if (key === 'canopy' || key === 'canopySmall' || key === 'leaf' || key === 'frond' || key === 'needleSkirt') {
+    return surfaceMat('leaf', 'leaf', [1.8, 1.8], {
+      roughness: 0.68, envMapIntensity: 0.35, side: THREE.DoubleSide,
+    });
+  }
+  if (key === 'snowCap') {
+    return stdMat('snow', () => new THREE.MeshStandardMaterial({
+      color: '#eef5fa', roughness: 0.55, metalness: 0, envMapIntensity: 0.9,
+    }));
+  }
+  if (key === 'boulder' || key === 'pebble') {
+    return surfaceMat('rock', 'rock', [1.4, 1.4], { roughness: 0.95, envMapIntensity: 0.3 });
+  }
+  if (key === 'cactus') {
+    return stdMat('cactus', () => {
+      const s = grainTiled('leaf', [2.4, 3.4]);
+      return new THREE.MeshStandardMaterial({
+        map: s.map, normalMap: s.normalMap, color: '#8fb86e', roughness: 0.75,
+      });
+    });
+  }
+  throw new Error('no material for ' + key);
+}
+
+// ---------- Plant model builders ----------
+// Each returns a part list. `detail` comes from the graphics preset: 0 drops the
+// fiddly extras, 2 is everything.
+
+function buildJungleTreeModel(rand, detail) {
+  const parts = [];
+  const h = 5.4 + rand() * 3.4;            // trunk height
+  const rad = 0.17 + rand() * 0.09;        // trunk radius at the base
+  const lean = (rand() - 0.5) * 0.09;
+  parts.push({ k: 'trunk', p: [0, 0, 0], r: [lean, rand() * 6.28, lean * 0.7], s: [rad, h, rad] });
+
+  // Buttress roots flaring out of the base - the thing that most says "jungle".
+  if (detail > 0) {
+    const roots = 3 + Math.floor(rand() * 3);
+    for (let i = 0; i < roots; i++) {
+      const a = (i / roots) * Math.PI * 2 + rand() * 0.5;
+      const rl = rad * (3.4 + rand() * 2.2);
+      parts.push({
+        k: 'root',
+        p: [Math.cos(a) * rad * 0.8, 0, Math.sin(a) * rad * 0.8],
+        r: [Math.cos(a) * 0.95, -a, -Math.sin(a) * 0.95],
+        s: [rad * 0.85, rl, rad * 0.5],
+      });
+    }
+  }
+
+  // Branches reaching up and out toward where the canopy blobs will sit.
+  const canopyY = h * 0.82;
+  const spread = 1.5 + rand() * 1.1;
+  const blobs = detail > 0 ? 5 + Math.floor(rand() * 3) : 3;
+  for (let i = 0; i < blobs; i++) {
+    const a = (i / blobs) * Math.PI * 2 + rand() * 0.7;
+    const d = spread * (0.35 + rand() * 0.75);
+    const by = canopyY + (rand() - 0.4) * h * 0.16;
+    const bx = Math.cos(a) * d;
+    const bz = Math.sin(a) * d;
+    if (detail > 0 && i < 4) {
+      const len = Math.sqrt(bx * bx + bz * bz + 1);
+      parts.push({
+        k: 'branch',
+        p: [0, canopyY - h * 0.22, 0],
+        r: [Math.cos(a) * 0.75, -a, -Math.sin(a) * 0.75],
+        s: [rad * 0.42, len * 1.25, rad * 0.42],
+      });
+    }
+    // Flattened ellipsoids: a canopy is wide and shallow, not a ball.
+    const bs = 0.95 + rand() * 0.75;
+    parts.push({
+      k: i % 2 === 0 ? 'canopy' : 'canopySmall',
+      p: [bx, by, bz],
+      r: [rand() * 0.5, rand() * 6.28, rand() * 0.5],
+      s: [bs * 1.15, bs * 0.68, bs * 1.15],
+      c: ['#9fd98a', '#86c773', '#6fae5e', '#b6e39c'][Math.floor(rand() * 4)],
+    });
+  }
+
+  // Big drooping leaves hanging off the underside of the canopy.
+  if (detail > 0) {
+    const leaves = 5 + Math.floor(rand() * 5);
+    for (let i = 0; i < leaves; i++) {
+      const a = rand() * Math.PI * 2;
+      const d = spread * (0.5 + rand() * 0.6);
+      parts.push({
+        k: 'leaf',
+        p: [Math.cos(a) * d, canopyY - 0.35 - rand() * 0.5, Math.sin(a) * d],
+        r: [2.0 + rand() * 0.7, a, 0],
+        s: [1, 1.2 + rand() * 0.9, 1],
+      });
+    }
+  }
+
+  // Hanging vines. Cheap, and they do a lot for the jungle read.
+  if (detail > 1) {
+    const vines = 2 + Math.floor(rand() * 3);
+    for (let i = 0; i < vines; i++) {
+      const a = rand() * Math.PI * 2;
+      const d = spread * (0.4 + rand() * 0.7);
+      const vl = 1.4 + rand() * 2.6;
+      parts.push({
+        k: 'vine',
+        p: [Math.cos(a) * d, canopyY - 0.4, Math.sin(a) * d],
+        r: [0, 0, (rand() - 0.5) * 0.25],
+        s: [0.035, vl, 0.035],
+      });
+    }
+  }
+  return parts;
+}
+
+function buildPalmModel(rand, detail) {
+  const parts = [];
+  const h = 5 + rand() * 3;
+  const rad = 0.14 + rand() * 0.05;
+  const curve = (rand() - 0.5) * 0.5;
+  // Stacked, progressively tilted segments give the trunk its characteristic
+  // sweep; one straight cylinder reads as a telegraph pole.
+  const segs = 5;
+  let y = 0, x = 0, tilt = 0;
+  for (let i = 0; i < segs; i++) {
+    const sl = h / segs;
+    const sr = rad * (1 - i * 0.07);
+    parts.push({ k: 'trunk', p: [x, y, 0], r: [0, 0, tilt], s: [sr, sl, sr] });
+    x += Math.sin(tilt) * sl;
+    y += Math.cos(tilt) * sl;
+    tilt += curve / segs;
+  }
+  const fronds = detail > 0 ? 8 + Math.floor(rand() * 4) : 6;
+  for (let i = 0; i < fronds; i++) {
+    const a = (i / fronds) * Math.PI * 2 + rand() * 0.3;
+    parts.push({
+      k: 'frond',
+      p: [x, y, 0],
+      r: [0.55 + rand() * 0.55, a, 0],
+      s: [1.5, 2.6 + rand() * 1.0, 1.5],
+      c: ['#8fc97a', '#76b464', '#a3d98c'][Math.floor(rand() * 3)],
+    });
+  }
+  // The dead, drooping skirt under the crown.
+  if (detail > 0) {
+    for (let i = 0; i < 4; i++) {
+      const a = rand() * Math.PI * 2;
+      parts.push({
+        k: 'frond', p: [x, y - 0.12, 0], r: [2.3 + rand() * 0.4, a, 0],
+        s: [1.1, 1.5 + rand() * 0.6, 1.1], c: '#8a7a46',
+      });
+    }
+  }
+  return parts;
+}
+
+function buildPineModel(rand, detail, snowy) {
+  const parts = [];
+  const h = 5 + rand() * 3.5;
+  const rad = 0.15 + rand() * 0.07;
+  parts.push({ k: 'trunk', p: [0, 0, 0], r: [0, rand() * 6.28, 0], s: [rad, h, rad] });
+  const tiers = detail > 0 ? 5 : 3;
+  for (let i = 0; i < tiers; i++) {
+    const t = i / (tiers - 1);
+    const y = h * (0.26 + t * 0.66);
+    const r = (1.75 - t * 1.25) * (0.75 + rand() * 0.3);
+    const th = h * (0.3 - t * 0.1);
+    parts.push({
+      k: 'needleSkirt', p: [0, y, 0], r: [0, rand() * 6.28, 0], s: [r, th, r],
+      c: snowy ? '#4e7f63' : ['#2f6b33', '#3b7d3d', '#27592c'][Math.floor(rand() * 3)],
+    });
+    // Snow sits on the upper surface of each tier, thicker toward the top.
+    if (snowy && (detail > 0 || i >= tiers - 2)) {
+      parts.push({
+        k: 'snowCap', p: [0, y + th * 0.1, 0], r: [0, rand() * 6.28, 0],
+        s: [r * (0.72 + t * 0.2), th * 0.52, r * (0.72 + t * 0.2)],
+      });
+    }
+  }
+  return parts;
+}
+
+function buildBushModel(rand, detail, swamp) {
+  const parts = [];
+  const blobs = detail > 0 ? 3 + Math.floor(rand() * 3) : 2;
+  for (let i = 0; i < blobs; i++) {
+    const s = 0.32 + rand() * 0.3;
+    parts.push({
+      k: 'canopySmall',
+      p: [(rand() - 0.5) * 0.5, 0.26 + rand() * 0.34, (rand() - 0.5) * 0.5],
+      r: [rand() * 6.28, rand() * 6.28, rand() * 6.28],
+      s: [s * 1.2, s * 0.9, s * 1.2],
+      c: swamp
+        ? ['#4a6b3a', '#3d5c30', '#55754a'][Math.floor(rand() * 3)]
+        : ['#7fc46a', '#67ad57', '#96d47f'][Math.floor(rand() * 3)],
+    });
+  }
+  // Fronds poking out of the mass so the silhouette isn't just lumps.
+  if (detail > 0) {
+    const n = 4 + Math.floor(rand() * 5);
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI * 2 + rand() * 0.6;
+      parts.push({
+        k: 'leaf',
+        p: [Math.cos(a) * 0.14, 0.14 + rand() * 0.2, Math.sin(a) * 0.14],
+        r: [0.55 + rand() * 0.7, a, 0],
+        s: [0.95, 0.65 + rand() * 0.45, 0.95],
+        c: swamp ? '#5a7a46' : '#86c773',
+      });
+    }
+  }
+  return parts;
+}
+
+function buildRockModel(rand, detail) {
+  const parts = [];
+  const s = 0.5 + rand() * 0.25;
+  parts.push({
+    k: 'boulder', p: [0, s * 0.72, 0],
+    r: [rand() * 6.28, rand() * 6.28, rand() * 6.28],
+    s: [s * 1.25, s * (0.8 + rand() * 0.4), s * 1.1],
+  });
+  // A couple of smaller stones at the base; a boulder never sits alone.
+  if (detail > 0) {
+    const n = 2 + Math.floor(rand() * 3);
+    for (let i = 0; i < n; i++) {
+      const a = rand() * Math.PI * 2;
+      const d = s * (1.0 + rand() * 0.8);
+      const ps = s * (0.14 + rand() * 0.22);
+      parts.push({
+        k: 'pebble', p: [Math.cos(a) * d, ps * 0.6, Math.sin(a) * d],
+        r: [rand() * 6.28, rand() * 6.28, rand() * 6.28], s: [ps * 1.3, ps, ps * 1.2],
+      });
+    }
+  }
+  return parts;
+}
+
+function buildCactusModel(rand, detail) {
+  const parts = [];
+  const r = 0.15 + rand() * 0.06;
+  const h = 0.75 + rand() * 0.45;
+  parts.push({ k: 'cactus', p: [0, 0, 0], r: [0, rand() * 6.28, 0], s: [r, h, r] });
+  const arms = detail > 0 ? 1 + Math.floor(rand() * 3) : 1;
+  for (let i = 0; i < arms; i++) {
+    const a = rand() * Math.PI * 2;
+    const ay = (0.9 + rand() * 1.1) * h;
+    parts.push({
+      k: 'cactus',
+      p: [Math.cos(a) * r * 1.4, ay, Math.sin(a) * r * 1.4],
+      r: [Math.cos(a) * 0.5, -a, -Math.sin(a) * 0.5],
+      s: [r * 0.6, h * 0.42, r * 0.6],
+    });
+  }
+  return parts;
+}
+
+// Stable per-position seed, so the same tree is the same shape every reload and
+// across both multiplayer clients.
+function seedFromPosition(position, salt) {
+  return Math.abs(Math.round(position[0] * 73.1 + position[2] * 149.7 + (salt || 0) * 31)) + 1;
+}
+
+// ---------- Drawing a part list ----------
+// Individual meshes. Used for the handful of harvestable plants, where we want
+// them to be separate objects that can disappear when depleted.
+function ProcModel({ model, position, scale = 1, rotY = 0 }) {
+  const instances = useMemo(
+    () => [{ model, position, scale, rotY }],
+    [model, position, scale, rotY]
+  );
+  return html`<${InstancedModels} instances=${instances} />`;
+}
+
+// One InstancedMesh per geometry key. frustumCulled is off because the instances
+// are scattered across the whole map while the geometry's own bounding sphere is
+// unit-sized - three would otherwise cull the entire batch the moment the
+// origin left the view.
+function InstancedPart({ geometry, material, matrices, colors }) {
+  const ref = useRef();
+  useEffect(() => {
+    const mesh = ref.current;
+    if (!mesh) return;
+    const tint = new THREE.Color();
+    for (let i = 0; i < matrices.length; i++) {
+      mesh.setMatrixAt(i, matrices[i]);
+      tint.set(colors[i] || '#ffffff');
+      mesh.setColorAt(i, tint);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  }, [matrices, colors]);
+  return html`
+    <instancedMesh
+      ref=${ref}
+      args=${[geometry, material, matrices.length]}
+      castShadow=${true}
+      receiveShadow=${true}
+      frustumCulled=${false}
+    />
+  `;
+}
+
+// Flatten a list of placed models into one batch per geometry key. Each part's
+// local transform is composed with its plant's own placement, so the GPU gets a
+// single world matrix per part and we get one draw call per geometry rather than
+// one per part.
+function groupModelInstances(instances) {
+  const byKey = new Map();
+  const m = new THREE.Matrix4();
+  const parent = new THREE.Matrix4();
+  const local = new THREE.Matrix4();
+  const q = new THREE.Quaternion();
+  const e = new THREE.Euler();
+  const v = new THREE.Vector3();
+  const sc = new THREE.Vector3();
+  for (const inst of instances) {
+    const s = inst.scale === undefined ? 1 : inst.scale;
+    e.set(0, inst.rotY || 0, 0);
+    q.setFromEuler(e);
+    parent.compose(v.set(inst.position[0], inst.position[1], inst.position[2]), q, sc.set(s, s, s));
+    for (const part of inst.model) {
+      const r = part.r || [0, 0, 0];
+      e.set(r[0], r[1], r[2]);
+      q.setFromEuler(e);
+      local.compose(v.set(part.p[0], part.p[1], part.p[2]), q, sc.set(part.s[0], part.s[1], part.s[2]));
+      m.multiplyMatrices(parent, local);
+      let g = byKey.get(part.k);
+      if (!g) {
+        g = { matrices: [], colors: [] };
+        byKey.set(part.k, g);
+      }
+      g.matrices.push(m.clone());
+      g.colors.push(part.c || null);
+    }
+  }
+  return Array.from(byKey.entries());
+}
+
+function InstancedModels({ instances }) {
+  const groups = useMemo(() => groupModelInstances(instances), [instances]);
+
+  return html`
+    <${Fragment}>
+      ${groups.map(([key, g]) => html`
+        <${InstancedPart}
+          key=${key}
+          geometry=${vegGeo(key)}
+          material=${vegMat(key)}
+          matrices=${g.matrices}
+          colors=${g.colors}
+        />
+      `)}
+    <//>
+  `;
+}
+
+// ---------- The plants the game code asks for by name ----------
+// Same props as before, so Resources and the rest of the game are unchanged.
+function Tree({ position, scale = 1 }) {
+  const detail = (GRAPHICS_PRESETS[useGame((s) => s.graphicsQuality)] || gfx()).treeDetail;
+  const model = useMemo(
+    () => buildJungleTreeModel(mulberry32(seedFromPosition(position, 1)), detail),
+    [position[0], position[2], detail]
+  );
+  return html`<${ProcModel} model=${model} position=${position} scale=${scale} />`;
+}
+
 function SnowTree({ position, scale = 1 }) {
-  const barkTex = useTreeBark();
-  return html`
-    <group position=${position} scale=${scale}>
-      <mesh position=${[0, 1.5, 0]} castShadow=${true}>
-        <cylinderGeometry args=${[0.18, 0.28, 3, 6]} />
-        <meshStandardMaterial map=${barkTex} roughness=${0.9} />
-      </mesh>
-      <mesh position=${[0, 3.4, 0]} castShadow=${true}>
-        <coneGeometry args=${[1.6, 2.2, 7]} />
-        <meshStandardMaterial color="#255a38" roughness=${0.85} />
-      </mesh>
-      <mesh position=${[0, 4.6, 0]} castShadow=${true}>
-        <coneGeometry args=${[1.1, 1.6, 7]} />
-        <meshStandardMaterial color="#cce8da" roughness=${0.7} />
-      </mesh>
-      <mesh position=${[0, 5.6, 0]} castShadow=${true}>
-        <coneGeometry args=${[0.6, 1.2, 7]} />
-        <meshStandardMaterial color="#e8f4f0" roughness=${0.6} />
-      </mesh>
-    </group>
-  `;
+  const detail = (GRAPHICS_PRESETS[useGame((s) => s.graphicsQuality)] || gfx()).treeDetail;
+  const model = useMemo(
+    () => buildPineModel(mulberry32(seedFromPosition(position, 2)), detail, true),
+    [position[0], position[2], detail]
+  );
+  return html`<${ProcModel} model=${model} position=${position} scale=${scale} />`;
 }
 
-// ---------- Procedural Cactus ----------
 function Cactus({ position, scale = 1 }) {
-  return html`
-    <group position=${position} scale=${scale}>
-      <mesh position=${[0, 1.2, 0]} castShadow=${true}>
-        <cylinderGeometry args=${[0.14, 0.18, 2.4, 6]} />
-        <meshStandardMaterial color="#4a7a28" roughness=${0.9} />
-      </mesh>
-      <mesh position=${[0.44, 0.9, 0]} rotation=${[0, 0, -0.35]} castShadow=${true}>
-        <cylinderGeometry args=${[0.08, 0.10, 0.75, 5]} />
-        <meshStandardMaterial color="#4a7a28" roughness=${0.9} />
-      </mesh>
-      <mesh position=${[-0.38, 1.2, 0]} rotation=${[0, 0, 0.4]} castShadow=${true}>
-        <cylinderGeometry args=${[0.08, 0.10, 0.65, 5]} />
-        <meshStandardMaterial color="#4a7a28" roughness=${0.9} />
-      </mesh>
-    </group>
-  `;
+  const model = useMemo(
+    () => buildCactusModel(mulberry32(seedFromPosition(position, 3)), 1),
+    [position[0], position[2]]
+  );
+  return html`<${ProcModel} model=${model} position=${position} scale=${scale} />`;
 }
 
-// ---------- Procedural Rock ----------
 function Rock({ position, scale = 1 }) {
-  return html`
-    <mesh position=${position} scale=${scale} castShadow=${true} receiveShadow=${true}>
-      <dodecahedronGeometry args=${[0.6, 0]} />
-      <meshStandardMaterial color="#8a8a8a" roughness=${1} flatShading=${true} />
-    </mesh>
-  `;
+  const model = useMemo(
+    () => buildRockModel(mulberry32(seedFromPosition(position, 4)), 1),
+    [position[0], position[2]]
+  );
+  return html`<${ProcModel} model=${model} position=${position} scale=${scale} />`;
 }
 
-// ---------- Procedural Bush ----------
 function Bush({ position, scale = 1 }) {
+  const model = useMemo(
+    () => buildBushModel(mulberry32(seedFromPosition(position, 5)), 1, false),
+    [position[0], position[2]]
+  );
+  return html`<${ProcModel} model=${model} position=${position} scale=${scale} />`;
+}
+
+// ============================================================
+// grass.js - instanced ground cover that follows the player
+//
+// Real grass is the single biggest thing separating "flat green plane" from
+// "ground you're standing on". Blades are instanced into a disc of cells around
+// the player; as you walk, cells that fall out of range are recycled into the
+// ones that just came into range, so the instance count is constant and nothing
+// is allocated per frame. Each cell's contents are derived from its coordinates,
+// so a cell looks identical every time you walk back over it.
+// ============================================================
+const GRASS_CELL = 2.6;
+const GRASS_BLADE_H = 0.55;
+// Packs a signed cell coordinate pair into one integer for Map keys - cheaper
+// than building strings every time the player crosses a cell boundary.
+const GRASS_KEY_BIAS = 4096;
+function grassKey(cx, cz) {
+  return (cx + GRASS_KEY_BIAS) * 8192 + (cz + GRASS_KEY_BIAS);
+}
+
+function buildGrassBladeGeometry() {
+  // Normalised to 1 unit tall so the wind shader can read position.y directly
+  // as "how far up this blade are we" and bend the tip without moving the root.
+  const steps = 4;
+  const positions = [], uvs = [], colors = [], indices = [];
+  const root = [0.16, 0.26, 0.10];
+  const tip = [0.60, 0.82, 0.34];
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const hw = 0.024 * (1 - t) * (1 - t * 0.35) + 0.0015;
+    const z = 0.13 * t * t; // blades arch over rather than standing to attention
+    positions.push(-hw, t, z, hw, t, z);
+    uvs.push(0, t, 1, t);
+    for (let k = 0; k < 2; k++) {
+      colors.push(
+        root[0] + (tip[0] - root[0]) * t,
+        root[1] + (tip[1] - root[1]) * t,
+        root[2] + (tip[2] - root[2]) * t
+      );
+    }
+    if (i > 0) {
+      const a = (i - 1) * 2, b = a + 1, c = i * 2, d = c + 1;
+      indices.push(a, c, b, b, c, d);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setIndex(indices);
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  geo.computeVertexNormals();
+  return geo;
+}
+
+// How much ground cover each biome gets. Sand and snow are nearly bare; the
+// swamp is nearly solid.
+function grassDensityForBiome(b) {
+  if (b === 0) return 1.0;    // woodland
+  if (b === 1) return 0.06;   // sandy
+  if (b === 2) return 0.10;   // snow
+  if (b === 3) return 0.22;   // rocky
+  return 0.92;                // swamp
+}
+
+// Move the ring of populated cells to be centred on (cx, cz): hand back every
+// cell that just fell out of range, then claim the ones that just came in and
+// hand each to `fill`. Kept out of the component so it can be exercised
+// directly - the pool must never leak a block or run dry, and a cell that stays
+// in range must keep the exact blades it already had, or the grass visibly
+// reshuffles itself every time you take a step.
+function recycleGrassCells(book, plan, cx, cz, radius, fill) {
+  book.cx = cx;
+  book.cz = cz;
+
+  for (const [key, block] of book.live) {
+    const kx = Math.floor(key / 8192) - GRASS_KEY_BIAS;
+    const kz = (key % 8192) - GRASS_KEY_BIAS;
+    if (Math.hypot((kx - cx) * GRASS_CELL, (kz - cz) * GRASS_CELL) > radius) {
+      book.free.push(block);
+      book.live.delete(key);
+    }
+  }
+
+  for (const off of plan.offs) {
+    const gx = cx + off[0];
+    const gz = cz + off[1];
+    const key = grassKey(gx, gz);
+    if (book.live.has(key)) continue;
+    const block = book.free.pop();
+    if (block === undefined) break; // pool exhausted; leave the rest bare
+    book.live.set(key, block);
+    fill(block, gx, gz);
+  }
+}
+
+function GrassField() {
+  const quality = useGame((s) => s.graphicsQuality);
+  const q = GRAPHICS_PRESETS[quality] || gfx();
+  const ref = useRef();
+  const timeU = useMemo(() => ({ value: 0 }), []);
+  const windU = useMemo(() => ({ value: 0.16 }), []);
+  const geo = useMemo(() => buildGrassBladeGeometry(), []);
+
+  const mat = useMemo(() => {
+    const m = new THREE.MeshStandardMaterial({
+      vertexColors: true,
+      roughness: 0.78,
+      metalness: 0,
+      side: THREE.DoubleSide,
+      envMapIntensity: 0.25,
+    });
+    // aPhase is our own instanced attribute, declared here rather than relying
+    // on anything three exposes internally, so this stays stable across
+    // three.js versions. Only the begin_vertex chunk name is assumed.
+    m.onBeforeCompile = (shader) => {
+      if (shader.vertexShader.indexOf('#include <begin_vertex>') === -1) return;
+      shader.uniforms.uTime = timeU;
+      shader.uniforms.uWind = windU;
+      shader.vertexShader =
+        'attribute float aPhase;\nuniform float uTime;\nuniform float uWind;\n' + shader.vertexShader;
+      shader.vertexShader = shader.vertexShader.replace('#include <begin_vertex>', [
+        'vec3 transformed = vec3( position );',
+        'float bladeUp = clamp( position.y, 0.0, 1.0 );',
+        // Two sines at different rates: a slow roll with a faster flutter on
+        // top, so gusts never look metronomic.
+        'float sway = sin( uTime * 1.7 + aPhase ) * 0.6 + sin( uTime * 3.3 + aPhase * 1.9 ) * 0.25;',
+        'float bend = bladeUp * bladeUp * uWind;',
+        'transformed.x += sway * bend;',
+        'transformed.z += cos( uTime * 1.3 + aPhase * 0.7 ) * bend * 0.55;',
+      ].join('\n'));
+    };
+    return m;
+  }, [timeU, windU]);
+
+  // The ring of cells we keep populated, nearest first, plus how many blade
+  // slots that needs. Constant for a given quality preset, so the pool can be
+  // sized exactly and never grow.
+  const plan = useMemo(() => {
+    const offs = [];
+    const span = Math.ceil(q.grassRadius / GRASS_CELL);
+    for (let dz = -span; dz <= span; dz++) {
+      for (let dx = -span; dx <= span; dx++) {
+        const d = Math.hypot(dx, dz) * GRASS_CELL;
+        if (d <= q.grassRadius) offs.push([dx, dz, d]);
+      }
+    }
+    offs.sort((a, b) => a[2] - b[2]);
+    return { offs, blocks: offs.length, perCell: q.grassPerCell, capacity: offs.length * q.grassPerCell };
+  }, [q.grassRadius, q.grassPerCell]);
+
+  const phaseAttr = useMemo(
+    () => new THREE.InstancedBufferAttribute(new Float32Array(Math.max(1, plan.capacity)), 1),
+    [plan.capacity]
+  );
+
+  // Cell bookkeeping. Rebuilt whenever the pool is resized by a quality change.
+  const book = useMemo(() => ({
+    live: new Map(),
+    free: [],
+    cx: null,
+    cz: null,
+  }), [plan.capacity]);
+
+  useEffect(() => {
+    book.live.clear();
+    book.free.length = 0;
+    for (let i = plan.blocks - 1; i >= 0; i--) book.free.push(i);
+    book.cx = null;
+    book.cz = null;
+  }, [book, plan.blocks]);
+
+  useEffect(() => {
+    const mesh = ref.current;
+    if (mesh) mesh.geometry.setAttribute('aPhase', phaseAttr);
+  }, [phaseAttr, geo]);
+
+  const scratch = useMemo(() => ({
+    m: new THREE.Matrix4(),
+    q: new THREE.Quaternion(),
+    e: new THREE.Euler(),
+    v: new THREE.Vector3(),
+    s: new THREE.Vector3(),
+    c: new THREE.Color(),
+  }), []);
+
+  useFrame((_, delta) => {
+    const mesh = ref.current;
+    if (!mesh || plan.capacity === 0) return;
+    timeU.value += delta;
+    // Wind comes in slow gusts rather than sitting at one strength.
+    windU.value = 0.13 + Math.sin(timeU.value * 0.23) * 0.06 + Math.sin(timeU.value * 0.07) * 0.035;
+
+    const px = playerTransform.position[0];
+    const pz = playerTransform.position[2];
+    const cx = Math.floor(px / GRASS_CELL);
+    const cz = Math.floor(pz / GRASS_CELL);
+    if (book.cx === cx && book.cz === cz) return; // nothing to re-scatter
+
+    const per = plan.perCell;
+    const sc = scratch;
+    recycleGrassCells(book, plan, cx, cz, q.grassRadius, (block, gx, gz) => {
+      const rand = mulberry32(((gx & 0xffff) << 16 ^ (gz & 0xffff)) + 17);
+      const cellX = gx * GRASS_CELL;
+      const cellZ = gz * GRASS_CELL;
+      const density = grassDensityForBiome(getDominantBiome(cellX, cellZ));
+      for (let i = 0; i < per; i++) {
+        const idx = block * per + i;
+        const x = cellX + rand() * GRASS_CELL;
+        const z = cellZ + rand() * GRASS_CELL;
+        const keep = rand() <= density
+          && Math.hypot(x - POND_CENTER[0], z - POND_CENTER[1]) > POND_RADIUS + 0.6;
+        if (!keep) {
+          // Collapse unwanted blades to nothing rather than shrinking the pool -
+          // keeps the slot bookkeeping trivial.
+          sc.m.makeScale(0, 0, 0);
+          mesh.setMatrixAt(idx, sc.m);
+          phaseAttr.array[idx] = 0;
+          continue;
+        }
+        const h = GRASS_BLADE_H * (0.55 + rand() * 0.9);
+        const w = 0.8 + rand() * 0.7;
+        sc.e.set((rand() - 0.5) * 0.28, rand() * Math.PI * 2, (rand() - 0.5) * 0.28);
+        sc.q.setFromEuler(sc.e);
+        sc.v.set(x, getTerrainHeight(x, z) - 0.03, z);
+        sc.s.set(w, h, w);
+        sc.m.compose(sc.v, sc.q, sc.s);
+        mesh.setMatrixAt(idx, sc.m);
+        const [br, bg, bb] = getBiomeColor(x, z);
+        const lift = 1.5 + rand() * 1.1; // biome colours are dark; blades catch more light
+        sc.c.setRGB(
+          Math.min(1, br * lift),
+          Math.min(1, bg * lift * 1.05),
+          Math.min(1, bb * lift)
+        );
+        mesh.setColorAt(idx, sc.c);
+        phaseAttr.array[idx] = rand() * Math.PI * 2;
+      }
+    });
+
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    phaseAttr.needsUpdate = true;
+  });
+
+  if (plan.capacity === 0) return null;
+
   return html`
-    <group position=${position} scale=${scale}>
-      <mesh position=${[0, 0.35, 0]} castShadow=${true}>
-        <icosahedronGeometry args=${[0.5, 0]} />
-        <meshStandardMaterial color="#3f8f3f" flatShading=${true} roughness=${0.9} />
-      </mesh>
-      <mesh position=${[0.3, 0.5, 0.1]} castShadow=${true}>
-        <icosahedronGeometry args=${[0.32, 0]} />
-        <meshStandardMaterial color="#4aa852" flatShading=${true} roughness=${0.9} />
-      </mesh>
-    </group>
+    <instancedMesh
+      ref=${ref}
+      args=${[geo, mat, plan.capacity]}
+      castShadow=${false}
+      receiveShadow=${true}
+      frustumCulled=${false}
+    />
   `;
 }
 
 // ---------- Decorative scattered foliage (non-interactable, purely visual) ----------
+// Drawn as instances: a few hundred detailed plants cost the same handful of
+// draw calls as a few dozen did before.
 function DecorativeFoliage() {
-  const items = useMemo(() => {
+  const quality = useGame((s) => s.graphicsQuality);
+  const q = GRAPHICS_PRESETS[quality] || gfx();
+
+  const instances = useMemo(() => {
     const rand = mulberry32(99);
-    const trees = [], bushes = [], snowTrees = [], cacti = [], boulders = [];
-    for (let i = 0; i < 220; i++) {
+    const detail = q.treeDetail;
+    const out = [];
+    const add = (model, x, y, z, scale) => out.push({ model, position: [x, y, z], scale, rotY: rand() * Math.PI * 2 });
+    for (let i = 0; i < q.foliage; i++) {
       const angle = rand() * Math.PI * 2;
       const dist = 10 + rand() * 220;
       const x = Math.cos(angle) * dist;
       const z = Math.sin(angle) * dist;
       if (Math.hypot(x, z) < 10) continue;
-      if (Math.hypot(x - 40, z + 40) < 14) continue;
+      const pondDist = Math.hypot(x - POND_CENTER[0], z - POND_CENTER[1]);
+      if (pondDist < 14) continue; // keep the water clear
       const y = getTerrainHeight(x, z);
       const s = 0.7 + rand() * 0.9;
       const biome = getDominantBiome(x, z);
-      if (biome === 0) { // woodland — dense trees + bushes
-        if (rand() > 0.3) trees.push({ position: [x, y, z], scale: s });
-        else bushes.push({ position: [x, y, z], scale: s * 0.8 });
-      } else if (biome === 1) { // sandy — sparse cacti
-        if (rand() > 0.55) cacti.push({ position: [x, y, z], scale: 0.5 + rand() * 0.7 });
-      } else if (biome === 2) { // snowy — snow-capped pines
-        if (rand() > 0.35) snowTrees.push({ position: [x, y, z], scale: s });
-      } else if (biome === 3) { // rocky — boulders
-        if (rand() > 0.45) boulders.push({ position: [x, y, z], scale: 0.4 + rand() * 1.8 });
-      } else { // swamp — dark shrubs
-        bushes.push({ position: [x, y, z], scale: s * 0.9 });
+      if (biome === 0) {
+        // Woodland: mostly broadleaf jungle trees, palms near the water, bushes
+        // filling the gaps between.
+        const roll = rand();
+        if (pondDist < 32 && roll > 0.55) add(buildPalmModel(rand, detail), x, y, z, 0.8 + rand() * 0.5);
+        else if (roll > 0.34) add(buildJungleTreeModel(rand, detail), x, y, z, s);
+        else add(buildBushModel(rand, detail, false), x, y, z, s * 0.95);
+      } else if (biome === 1) {
+        if (rand() > 0.5) add(buildCactusModel(rand, detail), x, y, z, 0.7 + rand() * 0.7);
+        else if (rand() > 0.7) add(buildRockModel(rand, detail), x, y, z, 0.4 + rand() * 0.8);
+      } else if (biome === 2) {
+        if (rand() > 0.3) add(buildPineModel(rand, detail, true), x, y, z, s);
+        else if (rand() > 0.6) add(buildRockModel(rand, detail), x, y, z, 0.35 + rand() * 0.6);
+      } else if (biome === 3) {
+        if (rand() > 0.35) add(buildRockModel(rand, detail), x, y, z, 0.45 + rand() * 1.7);
+        else if (rand() > 0.6) add(buildPineModel(rand, detail, false), x, y, z, s * 0.85);
+      } else {
+        // Swamp: low dark growth with the occasional palm standing out of it.
+        if (rand() > 0.72) add(buildPalmModel(rand, detail), x, y, z, 0.75 + rand() * 0.5);
+        else add(buildBushModel(rand, detail, true), x, y, z, s * 1.05);
       }
     }
-    return { trees, bushes, snowTrees, cacti, boulders };
-  }, []);
+    return out;
+  }, [q.foliage, q.treeDetail]);
 
-  return html`
-    <${Fragment}>
-      ${items.trees.map((t, i) => html`<${Tree} key=${'dt' + i} position=${t.position} scale=${t.scale} />`)}
-      ${items.bushes.map((b, i) => html`<${Bush} key=${'db' + i} position=${b.position} scale=${b.scale} />`)}
-      ${items.snowTrees.map((t, i) => html`<${SnowTree} key=${'dst' + i} position=${t.position} scale=${t.scale} />`)}
-      ${items.cacti.map((c, i) => html`<${Cactus} key=${'dc' + i} position=${c.position} scale=${c.scale} />`)}
-      ${items.boulders.map((r, i) => html`<${Rock} key=${'dbr' + i} position=${r.position} scale=${r.scale} />`)}
-    <//>
-  `;
+  return html`<${InstancedModels} instances=${instances} />`;
 }
 
 function World() {
   return html`
     <${Fragment}>
       <${DayNightSystem} />
-      <fog attach="fog" args=${['#8ec9f0', 30, 280]} />
+      <fog attach="fog" args=${['#bcdaef', 40, 305]} />
       <${Ground} />
       <${Water} />
+      <${GrassField} />
       <${DecorativeFoliage} />
     <//>
+  `;
+}
+
+// ============================================================
+// humanbody.js - shared anatomy for every person in the game
+//
+// One body definition drives the player, the remote player, tribe members,
+// raiders and recruited warriors, so they all move and read the same way.
+// Limbs are lathed profiles rather than plain capsules: an upper arm is thick
+// at the shoulder and thin at the elbow, a calf has a belly to it. The
+// animation contract is unchanged - callers still hand in armL/armR/legL/legR
+// refs and rotate them about X - so every existing walk, swing and death
+// animation keeps working.
+// ============================================================
+
+// Proportions for a roughly 1.85m person, in metres from the ground.
+const BODY = {
+  hipY: 0.92,
+  shoulderY: 1.50,
+  headY: 1.70,
+  shoulderX: 0.215,
+  hipX: 0.095,
+  upperArm: 0.32,
+  foreArm: 0.28,
+  thigh: 0.50,
+  shin: 0.42,
+  torsoTop: 1.55,
+  torsoLen: 0.60,
+};
+// The hand sits here relative to the shoulder pivot. HeldWeapon models are
+// authored with their grip 0.5 below the old shoulder, so this offset slides
+// them down into the longer arm's actual hand.
+const WEAPON_HAND_OFFSET = [0, -0.15, 0.03];
+
+// Profiles run top (t=0) to bottom (t=1) with radius normalised to 1, so a
+// part's scale is literally its radius and length in metres. The points are
+// reversed on the way in because LatheGeometry wants ascending Y to get its
+// normals pointing outward.
+function latheLimb(profile, segments) {
+  const pts = [];
+  for (let i = profile.length - 1; i >= 0; i--) {
+    pts.push(new THREE.Vector2(Math.max(0.003, profile[i][1]), -profile[i][0]));
+  }
+  return new THREE.LatheGeometry(pts, segments);
+}
+
+const HUMAN_GEO = {};
+function humanGeo(key) {
+  if (HUMAN_GEO[key]) return HUMAN_GEO[key];
+  let g;
+  if (key === 'ball') g = new THREE.SphereGeometry(1, 16, 12);
+  else if (key === 'ballLow') g = new THREE.SphereGeometry(1, 10, 8);
+  else if (key === 'box') g = new THREE.BoxGeometry(1, 1, 1);
+  else if (key === 'torso') {
+    // Broad at the chest, tucked at the waist, flaring again at the hips.
+    g = latheLimb([[0, 0.60], [0.08, 0.92], [0.26, 1.0], [0.52, 0.84], [0.70, 0.80], [0.90, 0.93], [1, 0.72]], 16);
+  } else if (key === 'upperArm') {
+    g = latheLimb([[0, 0.95], [0.22, 1.0], [0.68, 0.80], [1, 0.66]], 10);
+  } else if (key === 'foreArm') {
+    g = latheLimb([[0, 0.90], [0.28, 0.96], [1, 0.58]], 10);
+  } else if (key === 'thigh') {
+    g = latheLimb([[0, 0.90], [0.24, 1.0], [0.72, 0.78], [1, 0.64]], 12);
+  } else if (key === 'shin') {
+    g = latheLimb([[0, 0.88], [0.20, 1.0], [0.74, 0.58], [1, 0.42]], 10);
+  } else if (key === 'neck') {
+    g = latheLimb([[0, 1.0], [1, 0.92]], 10);
+  } else if (key === 'wrap') {
+    // Open-ended cone: loincloths, skirts, sleeves.
+    g = new THREE.CylinderGeometry(1, 1.25, 1, 14, 1, true);
+    g.translate(0, -0.5, 0);
+  } else if (key === 'band') {
+    g = new THREE.TorusGeometry(1, 0.16, 6, 18);
+  } else if (key === 'cone') {
+    g = new THREE.ConeGeometry(1, 1, 8);
+    g.translate(0, 0.5, 0);
+  } else {
+    throw new Error('unknown body geometry ' + key);
+  }
+  HUMAN_GEO[key] = g;
+  return g;
+}
+
+const HUMAN_MATS = {};
+function skinMat(key) {
+  const id = 'skin:' + key;
+  if (!HUMAN_MATS[id]) {
+    const s = surfaceTiled(key, [1.4, 2.2]);
+    HUMAN_MATS[id] = new THREE.MeshStandardMaterial({
+      map: s.map,
+      normalMap: s.normalMap,
+      roughnessMap: s.roughnessMap,
+      normalScale: new THREE.Vector2(0.45, 0.45),
+      roughness: 0.72,
+      metalness: 0,
+      envMapIntensity: 0.35,
+      // Lathed parts are only right-side-out if the profile winding is right;
+      // double-siding them costs almost nothing at this size and removes any
+      // chance of a limb turning inside out.
+      side: THREE.DoubleSide,
+    });
+  }
+  return HUMAN_MATS[id];
+}
+
+function clothMat(hex, surfKey) {
+  const id = 'cloth:' + (surfKey || 'cloth') + ':' + hex;
+  if (!HUMAN_MATS[id]) {
+    const s = grainTiled(surfKey || 'cloth', [2.2, 2.2]);
+    HUMAN_MATS[id] = new THREE.MeshStandardMaterial({
+      map: s.map,
+      normalMap: s.normalMap,
+      roughnessMap: s.roughnessMap,
+      color: hex,
+      roughness: 0.92,
+      metalness: 0,
+      envMapIntensity: 0.2,
+      side: THREE.DoubleSide,
+    });
+  }
+  return HUMAN_MATS[id];
+}
+
+// Animal pelts: the same lathed parts as the people, wearing a directional
+// strand texture instead of skin.
+function furMat(key) {
+  const id = 'fur:' + key;
+  if (!HUMAN_MATS[id]) {
+    const sf = surfaceTiled(key, [2.6, 2.6]);
+    HUMAN_MATS[id] = new THREE.MeshStandardMaterial({
+      map: sf.map,
+      normalMap: sf.normalMap,
+      roughnessMap: sf.roughnessMap,
+      normalScale: new THREE.Vector2(0.8, 0.8),
+      roughness: 0.9,
+      metalness: 0,
+      envMapIntensity: 0.2,
+      side: THREE.DoubleSide,
+    });
+  }
+  return HUMAN_MATS[id];
+}
+
+function plainMat(id, opts) {
+  if (!HUMAN_MATS[id]) HUMAN_MATS[id] = new THREE.MeshStandardMaterial(opts);
+  return HUMAN_MATS[id];
+}
+function hairMat(hex) {
+  return plainMat('hair:' + hex, { color: hex, roughness: 0.62, metalness: 0 });
+}
+
+// ---------- One arm ----------
+// The group the caller animates is the shoulder. Inside it the forearm sits in
+// its own group with a fixed slight bend, so the arm has an elbow instead of
+// being a single straight stick.
+function HumanArm({ groupRef, side, skinKey, bandColor, face, weapon, detail }) {
+  const sx = side * BODY.shoulderX;
+  const bend = -face * 0.16;
+  return html`
+    <group ref=${groupRef} position=${[sx, BODY.shoulderY, 0]}>
+      <mesh geometry=${humanGeo('ball')} material=${skinMat(skinKey)}
+        position=${[0, 0.01, 0]} scale=${[0.082, 0.075, 0.082]} castShadow=${true} />
+      <mesh geometry=${humanGeo('upperArm')} material=${skinMat(skinKey)}
+        position=${[0, 0, 0]} scale=${[0.072, BODY.upperArm, 0.072]} castShadow=${true} />
+      ${detail > 0 && bandColor && html`
+        <mesh geometry=${humanGeo('band')} material=${clothMat(bandColor)}
+          position=${[0, -BODY.upperArm * 0.55, 0]} rotation=${[Math.PI / 2, 0, 0]}
+          scale=${[0.062, 0.062, 0.055]} castShadow=${true} />
+      `}
+      <group position=${[0, -BODY.upperArm, 0]} rotation=${[bend, 0, 0]}>
+        <mesh geometry=${humanGeo('ballLow')} material=${skinMat(skinKey)}
+          position=${[0, 0, 0]} scale=${[0.058, 0.055, 0.058]} castShadow=${true} />
+        <mesh geometry=${humanGeo('foreArm')} material=${skinMat(skinKey)}
+          position=${[0, 0, 0]} scale=${[0.062, BODY.foreArm, 0.062]} castShadow=${true} />
+        <mesh geometry=${humanGeo('ballLow')} material=${skinMat(skinKey)}
+          position=${[0, -BODY.foreArm - 0.03, face * 0.012]}
+          scale=${[0.045, 0.055, 0.032]} castShadow=${true} />
+      </group>
+      ${weapon && html`
+        <group position=${WEAPON_HAND_OFFSET} rotation=${[0, face > 0 ? Math.PI : 0, 0]}>
+          <${HeldWeapon} id=${weapon} />
+        </group>
+      `}
+    </group>
+  `;
+}
+
+// ---------- Both legs ----------
+// Same deal as the arms: the caller animates the hip group, the knee lives
+// inside it, and the foot points the way the figure faces.
+function HumanLeg({ groupRef, side, skinKey, wrapColor, face, detail }) {
+  const bend = face * 0.12;
+  return html`
+    <group ref=${groupRef} position=${[side * BODY.hipX, BODY.hipY, 0]}>
+      <mesh geometry=${humanGeo('thigh')} material=${skinMat(skinKey)}
+        position=${[0, 0, 0]} scale=${[0.105, BODY.thigh, 0.105]} castShadow=${true} />
+      <group position=${[0, -BODY.thigh, 0]} rotation=${[bend, 0, 0]}>
+        <mesh geometry=${humanGeo('ballLow')} material=${skinMat(skinKey)}
+          scale=${[0.078, 0.07, 0.078]} castShadow=${true} />
+        <mesh geometry=${humanGeo('shin')} material=${skinMat(skinKey)}
+          position=${[0, 0, 0]} scale=${[0.082, BODY.shin, 0.082]} castShadow=${true} />
+        <mesh geometry=${humanGeo('ballLow')} material=${skinMat(skinKey)}
+          position=${[0, -BODY.shin, 0]} scale=${[0.045, 0.045, 0.045]} castShadow=${true} />
+        <mesh geometry=${humanGeo('box')} material=${skinMat(skinKey)}
+          position=${[0, -BODY.shin - 0.035, face * 0.055]}
+          scale=${[0.085, 0.055, 0.21]} castShadow=${true} />
+        ${detail > 0 && wrapColor && html`
+          <mesh geometry=${humanGeo('band')} material=${clothMat(wrapColor)}
+            position=${[0, -BODY.shin + 0.06, 0]} rotation=${[Math.PI / 2, 0, 0]}
+            scale=${[0.062, 0.062, 0.05]} castShadow=${true} />
+        `}
+      </group>
+    </group>
+  `;
+}
+
+// ---------- Head ----------
+function HumanHead({ skinKey, hairColor, bandColor, face, headwear, detail }) {
+  const hy = BODY.headY;
+  const skin = skinMat(skinKey);
+  return html`
+    <${Fragment}>
+      <mesh geometry=${humanGeo('neck')} material=${skin}
+        position=${[0, hy - 0.10, 0]} scale=${[0.055, 0.12, 0.055]} castShadow=${true} />
+      <mesh geometry=${humanGeo('ball')} material=${skin}
+        position=${[0, hy, -face * 0.004]} scale=${[0.105, 0.125, 0.115]} castShadow=${true} />
+      <mesh geometry=${humanGeo('ballLow')} material=${skin}
+        position=${[0, hy - 0.056, face * 0.022]} scale=${[0.084, 0.072, 0.098]} castShadow=${true} />
+      <mesh geometry=${humanGeo('ballLow')} material=${skin}
+        position=${[0, hy - 0.012, face * 0.106]} scale=${[0.021, 0.027, 0.034]} castShadow=${true} />
+      <mesh geometry=${humanGeo('box')} material=${skin}
+        position=${[0, hy + 0.034, face * 0.096]} scale=${[0.135, 0.021, 0.028]} castShadow=${true} />
+      <mesh geometry=${humanGeo('ballLow')} material=${plainMat('eyeWhite', { color: '#efe7dd', roughness: 0.3 })}
+        position=${[0.043, hy + 0.012, face * 0.090]} scale=${[0.022, 0.018, 0.018]} />
+      <mesh geometry=${humanGeo('ballLow')} material=${plainMat('eyeWhite', { color: '#efe7dd', roughness: 0.3 })}
+        position=${[-0.043, hy + 0.012, face * 0.090]} scale=${[0.022, 0.018, 0.018]} />
+      ${detail > 0 && html`
+        <${Fragment}>
+          <mesh geometry=${humanGeo('ballLow')} material=${plainMat('iris', { color: '#2a1b10', roughness: 0.25 })}
+            position=${[0.043, hy + 0.012, face * 0.102]} scale=${[0.010, 0.010, 0.008]} />
+          <mesh geometry=${humanGeo('ballLow')} material=${plainMat('iris', { color: '#2a1b10', roughness: 0.25 })}
+            position=${[-0.043, hy + 0.012, face * 0.102]} scale=${[0.010, 0.010, 0.008]} />
+          <mesh geometry=${humanGeo('box')} material=${plainMat('mouth', { color: '#7a4b42', roughness: 0.6 })}
+            position=${[0, hy - 0.062, face * 0.092]} scale=${[0.046, 0.009, 0.02]} />
+          <mesh geometry=${humanGeo('ballLow')} material=${skin}
+            position=${[0.104, hy + 0.002, -face * 0.004]} scale=${[0.015, 0.031, 0.025]} />
+          <mesh geometry=${humanGeo('ballLow')} material=${skin}
+            position=${[-0.104, hy + 0.002, -face * 0.004]} scale=${[0.015, 0.031, 0.025]} />
+        <//>
+      `}
+      <mesh geometry=${humanGeo('ball')} material=${hairMat(hairColor)}
+        position=${[0, hy + 0.030, -face * 0.016]} scale=${[0.116, 0.112, 0.122]} castShadow=${true} />
+      ${bandColor && html`
+        <mesh geometry=${humanGeo('band')} material=${clothMat(bandColor)}
+          position=${[0, hy + 0.044, 0]} rotation=${[Math.PI / 2, 0, 0]}
+          scale=${[0.112, 0.112, 0.10]} castShadow=${true} />
+      `}
+      ${headwear === 'feathers' && html`
+        <${Fragment}>
+          <mesh geometry=${humanGeo('cone')} material=${clothMat(bandColor || '#c45a3a')}
+            position=${[0, hy + 0.10, -face * 0.03]} rotation=${[-face * 0.35, 0, 0]}
+            scale=${[0.028, 0.20, 0.028]} castShadow=${true} />
+          <mesh geometry=${humanGeo('cone')} material=${clothMat('#e8e2d4')}
+            position=${[0.05, hy + 0.095, -face * 0.03]} rotation=${[-face * 0.35, 0, 0.32]}
+            scale=${[0.022, 0.15, 0.022]} castShadow=${true} />
+          <mesh geometry=${humanGeo('cone')} material=${clothMat('#e8e2d4')}
+            position=${[-0.05, hy + 0.095, -face * 0.03]} rotation=${[-face * 0.35, 0, -0.32]}
+            scale=${[0.022, 0.15, 0.022]} castShadow=${true} />
+        <//>
+      `}
+    <//>
+  `;
+}
+
+// ---------- Torso, clothing and the whole figure ----------
+// `face` is +1 for a figure whose front is local +Z and -1 for local -Z. The
+// tribes use +Z (their yaw comes from atan2(dirX, dirZ)); the player uses -Z.
+function HumanFigure({
+  skinKey = 'skin',
+  clothColor = '#6b5a3c',
+  accentColor = null,
+  hairColor = '#241509',
+  headwear = 'none',
+  armL = null, armR = null, legL = null, legR = null,
+  weapon = null,
+  face = 1,
+  torsoWrap = false,
+}) {
+  const detail = gfx().treeDetail;
+  const skin = skinMat(skinKey);
+  const accent = accentColor || clothColor;
+  return html`
+    <${Fragment}>
+      <mesh geometry=${humanGeo('torso')} material=${skin}
+        position=${[0, BODY.torsoTop, 0]} scale=${[0.205, BODY.torsoLen, 0.145]}
+        castShadow=${true} receiveShadow=${true} />
+      <mesh geometry=${humanGeo('ballLow')} material=${skin}
+        position=${[0, BODY.hipY + 0.045, 0]} scale=${[0.155, 0.115, 0.118]} castShadow=${true} />
+
+      ${torsoWrap && html`
+        <mesh geometry=${humanGeo('torso')} material=${clothMat(clothColor)}
+          position=${[0, BODY.torsoTop - 0.02, 0]} scale=${[0.215, BODY.torsoLen * 0.72, 0.155]}
+          castShadow=${true} />
+      `}
+      ${!torsoWrap && html`
+        <mesh geometry=${humanGeo('band')} material=${clothMat(accent)}
+          position=${[0, BODY.torsoTop - 0.26, 0]} rotation=${[Math.PI / 2, 0, 0.92]}
+          scale=${[0.215, 0.215, 0.115]} castShadow=${true} />
+      `}
+
+      <mesh geometry=${humanGeo('wrap')} material=${clothMat(clothColor)}
+        position=${[0, BODY.hipY + 0.10, 0]} scale=${[0.175, 0.34, 0.16]}
+        castShadow=${true} />
+      <mesh geometry=${humanGeo('band')} material=${clothMat(accent)}
+        position=${[0, BODY.hipY + 0.085, 0]} rotation=${[Math.PI / 2, 0, 0]}
+        scale=${[0.172, 0.172, 0.085]} castShadow=${true} />
+
+      <${HumanHead} skinKey=${skinKey} hairColor=${hairColor} bandColor=${accent}
+        face=${face} headwear=${headwear} detail=${detail} />
+      <${HumanArm} groupRef=${armL} side=${1} skinKey=${skinKey} bandColor=${accent}
+        face=${face} weapon=${null} detail=${detail} />
+      <${HumanArm} groupRef=${armR} side=${-1} skinKey=${skinKey} bandColor=${accent}
+        face=${face} weapon=${weapon} detail=${detail} />
+      ${legL && html`<${HumanLeg} groupRef=${legL} side=${1} skinKey=${skinKey}
+        wrapColor=${accent} face=${face} detail=${detail} />`}
+      ${legR && html`<${HumanLeg} groupRef=${legR} side=${-1} skinKey=${skinKey}
+        wrapColor=${accent} face=${face} detail=${detail} />`}
+    <//>
+  `;
+}
+
+// ---------- The two figure shells the game code uses ----------
+// Tribesfolk and warriors: bare-chested, with the tribe's colour carried on the
+// loincloth, sash, headband and armbands so factions stay readable at a
+// distance even though the body itself is now skin-toned.
+function TribalFigure({ color, armL = null, armR = null, legL = null, legR = null, weapon = null }) {
+  return html`
+    <${HumanFigure}
+      skinKey="skin"
+      clothColor=${color}
+      accentColor=${color}
+      hairColor="#1d1109"
+      headwear="feathers"
+      armL=${armL} armR=${armR} legL=${legL} legR=${legR}
+      weapon=${weapon}
+      face=${1}
+    />
+  `;
+}
+
+function WarriorFigure({ legL, legR, armL = null, armR = null, weapon = null, color = PLAYER_TRIBE_COLOR }) {
+  return html`
+    <${TribalFigure} color=${color} armL=${armL} armR=${armR}
+      legL=${legL} legR=${legR} weapon=${weapon} />
   `;
 }
 
@@ -3174,16 +5291,36 @@ function triggerWeaponFx(weaponId) {
 
 // ---------- Weapon held in the right hand, swapped based on the active hotbar slot ----------
 function HeldWeapon({ id }) {
+  // Shared materials so every weapon in the world is one draw state each:
+  // real wood grain on the hafts, worn metal on the heads, cord on the grips.
+  const wood = surfaceMat('weaponWood', 'bark', [1.4, 2.6], {
+    color: '#9a7446', roughness: 0.82, metalness: 0, envMapIntensity: 0.3,
+  });
+  const cord = surfaceMat('weaponCord', 'cloth', [2.6, 2.6], {
+    color: '#6a5436', roughness: 0.95, metalness: 0,
+  });
+  const steel = stdMat('weaponSteel', () => new THREE.MeshStandardMaterial({
+    color: '#b7bcc4', roughness: 0.28, metalness: 0.85, envMapIntensity: 1.3,
+  }));
+  const stone = surfaceMat('weaponStone', 'rock', [1.6, 1.6], {
+    color: '#9a978e', roughness: 0.7, metalness: 0.05, envMapIntensity: 0.5,
+  });
+
   if (id === 'spear') {
     return html`
       <group position=${[0, -0.55, -0.05]} rotation=${[1.35, 0, 0]}>
-        <mesh position=${[0, 0.55, 0]} castShadow=${true}>
-          <cylinderGeometry args=${[0.025, 0.03, 1.3, 6]} />
-          <meshStandardMaterial color="#8a5a2b" roughness=${0.8} flatShading=${true} />
+        <mesh position=${[0, 0.55, 0]} castShadow=${true} material=${wood}>
+          <cylinderGeometry args=${[0.022, 0.028, 1.3, 10]} />
         </mesh>
-        <mesh position=${[0, 1.25, 0]} castShadow=${true}>
-          <coneGeometry args=${[0.06, 0.3, 6]} />
-          <meshStandardMaterial color="#b9b9b9" metalness=${0.4} roughness=${0.4} flatShading=${true} />
+        <mesh position=${[0, 1.25, 0]} castShadow=${true} material=${stone}>
+          <coneGeometry args=${[0.055, 0.3, 8]} />
+        </mesh>
+        <!-- sinew lashing where the head is bound to the shaft -->
+        <mesh position=${[0, 1.10, 0]} castShadow=${true} material=${cord}>
+          <cylinderGeometry args=${[0.034, 0.034, 0.075, 8]} />
+        </mesh>
+        <mesh position=${[0, 0.30, 0]} material=${cord}>
+          <cylinderGeometry args=${[0.031, 0.031, 0.13, 8]} />
         </mesh>
       </group>
     `;
@@ -3191,13 +5328,21 @@ function HeldWeapon({ id }) {
   if (id === 'machete') {
     return html`
       <group position=${[0, -0.5, -0.05]} rotation=${[1.15, 0, 0.1]}>
-        <mesh position=${[0, 0.12, 0]} castShadow=${true}>
-          <cylinderGeometry args=${[0.035, 0.035, 0.25, 6]} />
-          <meshStandardMaterial color="#4a3322" roughness=${0.9} flatShading=${true} />
+        <mesh position=${[0, 0.12, 0]} castShadow=${true} material=${wood}>
+          <cylinderGeometry args=${[0.032, 0.036, 0.25, 10]} />
         </mesh>
-        <mesh position=${[0, 0.55, 0]} castShadow=${true}>
-          <boxGeometry args=${[0.07, 0.75, 0.02]} />
-          <meshStandardMaterial color="#cfd6dd" metalness=${0.6} roughness=${0.3} flatShading=${true} />
+        <mesh position=${[0, 0.12, 0]} material=${cord}>
+          <cylinderGeometry args=${[0.037, 0.037, 0.16, 10]} />
+        </mesh>
+        <mesh position=${[0, 0.27, 0]} castShadow=${true} material=${steel}>
+          <boxGeometry args=${[0.085, 0.05, 0.035]} />
+        </mesh>
+        <mesh position=${[0, 0.58, 0.002]} castShadow=${true} material=${steel}>
+          <boxGeometry args=${[0.075, 0.72, 0.012]} />
+        </mesh>
+        <!-- the blade's bevelled edge catches the light down one side -->
+        <mesh position=${[0.034, 0.58, 0]} rotation=${[0, 0, 0.04]} castShadow=${true} material=${steel}>
+          <boxGeometry args=${[0.016, 0.70, 0.006]} />
         </mesh>
       </group>
     `;
@@ -3205,13 +5350,24 @@ function HeldWeapon({ id }) {
   if (id === 'club') {
     return html`
       <group position=${[0, -0.5, -0.05]} rotation=${[1.25, 0, 0]}>
-        <mesh position=${[0, 0.3, 0]} castShadow=${true}>
-          <cylinderGeometry args=${[0.04, 0.05, 0.6, 6]} />
-          <meshStandardMaterial color="#6b4a2b" roughness=${0.9} flatShading=${true} />
+        <mesh position=${[0, 0.3, 0]} castShadow=${true} material=${wood}>
+          <cylinderGeometry args=${[0.036, 0.046, 0.6, 10]} />
         </mesh>
-        <mesh position=${[0, 0.68, 0]} castShadow=${true}>
-          <sphereGeometry args=${[0.13, 8, 8]} />
-          <meshStandardMaterial color="#5a3c22" roughness=${0.9} flatShading=${true} />
+        <mesh position=${[0, 0.12, 0]} material=${cord}>
+          <cylinderGeometry args=${[0.048, 0.048, 0.18, 10]} />
+        </mesh>
+        <mesh position=${[0, 0.68, 0]} castShadow=${true} material=${wood}>
+          <sphereGeometry args=${[0.125, 12, 10]} />
+        </mesh>
+        <!-- stone spikes driven into the head -->
+        <mesh position=${[0.11, 0.70, 0]} rotation=${[0, 0, -1.3]} castShadow=${true} material=${stone}>
+          <coneGeometry args=${[0.028, 0.10, 6]} />
+        </mesh>
+        <mesh position=${[-0.11, 0.66, 0]} rotation=${[0, 0, 1.3]} castShadow=${true} material=${stone}>
+          <coneGeometry args=${[0.028, 0.10, 6]} />
+        </mesh>
+        <mesh position=${[0, 0.70, 0.11]} rotation=${[1.3, 0, 0]} castShadow=${true} material=${stone}>
+          <coneGeometry args=${[0.028, 0.10, 6]} />
         </mesh>
       </group>
     `;
@@ -3219,13 +5375,21 @@ function HeldWeapon({ id }) {
   if (id === 'axe') {
     return html`
       <group position=${[0, -0.5, -0.05]} rotation=${[1.1, 0, 0.15]}>
-        <mesh position=${[0, 0.32, 0]} castShadow=${true}>
-          <cylinderGeometry args=${[0.032, 0.04, 0.7, 6]} />
-          <meshStandardMaterial color="#7a5a2b" roughness=${0.85} flatShading=${true} />
+        <mesh position=${[0, 0.32, 0]} castShadow=${true} material=${wood}>
+          <cylinderGeometry args=${[0.03, 0.038, 0.7, 10]} />
         </mesh>
-        <mesh position=${[0.08, 0.75, 0]} rotation=${[0, 0, 0.55]} castShadow=${true}>
-          <boxGeometry args=${[0.52, 0.16, 0.07]} />
-          <meshStandardMaterial color="#b8b0a8" metalness=${0.45} roughness=${0.5} flatShading=${true} />
+        <mesh position=${[0, 0.08, 0]} material=${cord}>
+          <cylinderGeometry args=${[0.04, 0.04, 0.17, 10]} />
+        </mesh>
+        <mesh position=${[0.06, 0.74, 0]} rotation=${[0, 0, 0.55]} castShadow=${true} material=${steel}>
+          <boxGeometry args=${[0.30, 0.15, 0.055]} />
+        </mesh>
+        <!-- flared cutting edge -->
+        <mesh position=${[0.19, 0.80, 0]} rotation=${[0, 0, 0.55]} castShadow=${true} material=${steel}>
+          <boxGeometry args=${[0.10, 0.26, 0.022]} />
+        </mesh>
+        <mesh position=${[0, 0.72, 0]} castShadow=${true} material=${cord}>
+          <cylinderGeometry args=${[0.045, 0.045, 0.10, 8]} />
         </mesh>
       </group>
     `;
@@ -3234,17 +5398,23 @@ function HeldWeapon({ id }) {
     const halfPi = Math.PI / 2;
     return html`
       <group position=${[0, -0.5, -0.05]} rotation=${[1.15, 0, 0.1]}>
-        <mesh position=${[0, 0.32, 0]} castShadow=${true}>
-          <cylinderGeometry args=${[0.03, 0.036, 0.72, 6]} />
-          <meshStandardMaterial color="#7a5a2b" roughness=${0.85} flatShading=${true} />
+        <mesh position=${[0, 0.32, 0]} castShadow=${true} material=${wood}>
+          <cylinderGeometry args=${[0.028, 0.034, 0.72, 10]} />
         </mesh>
-        <mesh position=${[0, 0.74, 0]} rotation=${[0, 0, halfPi]} castShadow=${true}>
-          <boxGeometry args=${[0.09, 0.48, 0.07]} />
-          <meshStandardMaterial color="#adb5bd" metalness=${0.5} roughness=${0.4} flatShading=${true} />
+        <mesh position=${[0, 0.08, 0]} material=${cord}>
+          <cylinderGeometry args=${[0.036, 0.036, 0.17, 10]} />
         </mesh>
-        <mesh position=${[-0.2, 0.74, 0]} rotation=${[0, 0, halfPi - 0.3]} castShadow=${true}>
-          <coneGeometry args=${[0.05, 0.24, 6]} />
-          <meshStandardMaterial color="#adb5bd" metalness=${0.5} roughness=${0.4} flatShading=${true} />
+        <mesh position=${[0, 0.74, 0]} rotation=${[0, 0, halfPi]} castShadow=${true} material=${steel}>
+          <boxGeometry args=${[0.075, 0.40, 0.055]} />
+        </mesh>
+        <mesh position=${[0.24, 0.74, 0]} rotation=${[0, 0, halfPi + 0.25]} castShadow=${true} material=${steel}>
+          <coneGeometry args=${[0.04, 0.22, 6]} />
+        </mesh>
+        <mesh position=${[-0.24, 0.74, 0]} rotation=${[0, 0, halfPi - 0.25]} castShadow=${true} material=${steel}>
+          <coneGeometry args=${[0.04, 0.22, 6]} />
+        </mesh>
+        <mesh position=${[0, 0.74, 0]} castShadow=${true} material=${cord}>
+          <cylinderGeometry args=${[0.042, 0.042, 0.085, 8]} />
         </mesh>
       </group>
     `;
@@ -3835,45 +6005,17 @@ function Player() {
     <${Fragment}>
     <group ref=${group} position=${[0, 0, 8]}>
       <group ref=${bodyVisual}>
-        <!-- torso -->
-        <mesh position=${[0, 1.1, 0]} castShadow=${true}>
-          <capsuleGeometry args=${[0.28, 0.6, 4, 8]} />
-          <meshStandardMaterial color="#3f6b8a" roughness=${0.7} />
-        </mesh>
-        <!-- head -->
-        <mesh position=${[0, 1.78, 0]} castShadow=${true}>
-          <sphereGeometry args=${[0.24, 12, 12]} />
-          <meshStandardMaterial color="#d8a878" roughness=${0.8} />
-        </mesh>
-        <!-- left arm -->
-        <group ref=${leftArm} position=${[0.36, 1.35, 0]}>
-          <mesh position=${[0, -0.32, 0]} castShadow=${true}>
-            <capsuleGeometry args=${[0.08, 0.5, 4, 6]} />
-            <meshStandardMaterial color="#d8a878" roughness=${0.8} />
-          </mesh>
-        </group>
-        <!-- right arm -->
-        <group ref=${rightArm} position=${[-0.36, 1.35, 0]}>
-          <mesh position=${[0, -0.32, 0]} castShadow=${true}>
-            <capsuleGeometry args=${[0.08, 0.5, 4, 6]} />
-            <meshStandardMaterial color="#d8a878" roughness=${0.8} />
-          </mesh>
-          ${equippedWeaponId && html`<${HeldWeapon} id=${equippedWeaponId} />`}
-        </group>
-        <!-- left leg -->
-        <group ref=${leftLeg} position=${[0.14, 0.75, 0]}>
-          <mesh position=${[0, -0.35, 0]} castShadow=${true}>
-            <capsuleGeometry args=${[0.1, 0.55, 4, 6]} />
-            <meshStandardMaterial color="#5a4632" roughness=${0.8} />
-          </mesh>
-        </group>
-        <!-- right leg -->
-        <group ref=${rightLeg} position=${[-0.14, 0.75, 0]}>
-          <mesh position=${[0, -0.35, 0]} castShadow=${true}>
-            <capsuleGeometry args=${[0.1, 0.55, 4, 6]} />
-            <meshStandardMaterial color="#5a4632" roughness=${0.8} />
-          </mesh>
-        </group>
+        <${HumanFigure}
+          skinKey="skinPale"
+          clothColor="#3f6b8a"
+          accentColor="#8a6a3c"
+          hairColor="#2b1b10"
+          armL=${leftArm} armR=${rightArm}
+          legL=${leftLeg} legR=${rightLeg}
+          weapon=${equippedWeaponId || null}
+          face=${-1}
+          torsoWrap=${true}
+        />
       </group>
     </group>
     <group ref=${fpWeapon} visible=${false}>
@@ -3951,50 +6093,17 @@ function RemotePlayer() {
 
   return html`
     <group ref=${group} visible=${visible} position=${[remotePlayer.position[0], remotePlayer.position[1], remotePlayer.position[2]]}>
-      <!-- torso — yellow tribal vest like the host team -->
-      <mesh position=${[0, 1.1, 0]} castShadow=${true}>
-        <capsuleGeometry args=${[0.28, 0.6, 4, 8]} />
-        <meshStandardMaterial color="#c9a020" roughness=${0.7} />
-      </mesh>
-      <!-- head -->
-      <mesh position=${[0, 1.78, 0]} castShadow=${true}>
-        <sphereGeometry args=${[0.24, 12, 12]} />
-        <meshStandardMaterial color="#d8a878" roughness=${0.8} />
-      </mesh>
-      <!-- headband — tribe color -->
-      <mesh position=${[0, 1.85, 0]} castShadow=${true}>
-        <torusGeometry args=${[0.25, 0.035, 6, 12]} />
-        <meshStandardMaterial color="#f0d020" roughness=${0.6} />
-      </mesh>
-      <!-- left arm -->
-      <group ref=${leftArm} position=${[0.36, 1.35, 0]}>
-        <mesh position=${[0, -0.32, 0]} castShadow=${true}>
-          <capsuleGeometry args=${[0.08, 0.5, 4, 6]} />
-          <meshStandardMaterial color="#d8a878" roughness=${0.8} />
-        </mesh>
-      </group>
-      <!-- right arm -->
-      <group ref=${rightArm} position=${[-0.36, 1.35, 0]}>
-        <mesh position=${[0, -0.32, 0]} castShadow=${true}>
-          <capsuleGeometry args=${[0.08, 0.5, 4, 6]} />
-          <meshStandardMaterial color="#d8a878" roughness=${0.8} />
-        </mesh>
-        ${weaponId && html`<${HeldWeapon} id=${weaponId} />`}
-      </group>
-      <!-- left leg — yellow trousers -->
-      <group ref=${leftLeg} position=${[0.14, 0.75, 0]}>
-        <mesh position=${[0, -0.35, 0]} castShadow=${true}>
-          <capsuleGeometry args=${[0.1, 0.55, 4, 6]} />
-          <meshStandardMaterial color="#8a7010" roughness=${0.8} />
-        </mesh>
-      </group>
-      <!-- right leg -->
-      <group ref=${rightLeg} position=${[-0.14, 0.75, 0]}>
-        <mesh position=${[0, -0.35, 0]} castShadow=${true}>
-          <capsuleGeometry args=${[0.1, 0.55, 4, 6]} />
-          <meshStandardMaterial color="#8a7010" roughness=${0.8} />
-        </mesh>
-      </group>
+      <${HumanFigure}
+        skinKey="skinPale"
+        clothColor="#c9a020"
+        accentColor="#f0d020"
+        hairColor="#3a2415"
+        armL=${leftArm} armR=${rightArm}
+        legL=${leftLeg} legR=${rightLeg}
+        weapon=${weaponId || null}
+        face=${-1}
+        torsoWrap=${true}
+      />
     </group>
   `;
 }
@@ -4089,31 +6198,31 @@ function Cave({ id, mx, mz, r }) {
     <group position=${[cx, y, cz]} rotation=${[0, yaw, 0]}>
       <mesh position=${[-1.25, 0.85, 0]} castShadow=${true}>
         <boxGeometry args=${[0.85, 2.3, 1.3]} />
-        <meshStandardMaterial color="#4a4545" roughness=${0.95} flatShading=${true} />
+        <meshStandardMaterial ...${grainTiled('rock', [1.4, 1.4])} color="#4a4545" roughness=${0.95} />
       </mesh>
       <mesh position=${[1.25, 0.85, 0]} castShadow=${true}>
         <boxGeometry args=${[0.85, 2.3, 1.3]} />
-        <meshStandardMaterial color="#4a4545" roughness=${0.95} flatShading=${true} />
+        <meshStandardMaterial ...${grainTiled('rock', [1.4, 1.4])} color="#4a4545" roughness=${0.95} />
       </mesh>
       <mesh position=${[0, 2.25, 0]} castShadow=${true}>
         <boxGeometry args=${[3.1, 0.95, 1.3]} />
-        <meshStandardMaterial color="#3e3a3a" roughness=${0.95} flatShading=${true} />
+        <meshStandardMaterial ...${grainTiled('rock', [1.4, 1.4])} color="#3e3a3a" roughness=${0.95} />
       </mesh>
       <mesh position=${[0, 1.05, 0.38]}>
         <boxGeometry args=${[2.1, 1.9, 0.15]} />
-        <meshStandardMaterial color="#080606" roughness=${1} />
+        <meshStandardMaterial ...${grainTiled('cloth', [2.2, 2.2])} color="#080606" roughness=${1} />
       </mesh>
       <mesh position=${[-1.85, 0.28, 0.75]} castShadow=${true}>
         <dodecahedronGeometry args=${[0.52, 0]} />
-        <meshStandardMaterial color="#57504e" roughness=${0.9} flatShading=${true} />
+        <meshStandardMaterial ...${grainTiled('rock', [1.4, 1.4])} color="#57504e" roughness=${0.9} />
       </mesh>
       <mesh position=${[1.65, 0.24, 0.6]} castShadow=${true}>
         <dodecahedronGeometry args=${[0.43, 0]} />
-        <meshStandardMaterial color="#524d4b" roughness=${0.9} flatShading=${true} />
+        <meshStandardMaterial ...${grainTiled('rock', [1.4, 1.4])} color="#524d4b" roughness=${0.9} />
       </mesh>
       <mesh position=${[0.3, 0.18, 1.1]} castShadow=${true}>
         <dodecahedronGeometry args=${[0.35, 0]} />
-        <meshStandardMaterial color="#4e4a48" roughness=${0.9} flatShading=${true} />
+        <meshStandardMaterial ...${grainTiled('rock', [1.4, 1.4])} color="#4e4a48" roughness=${0.9} />
       </mesh>
     </group>
   `;
@@ -4295,6 +6404,9 @@ const WORKBENCH_POS = [-4, 0, 9];
 // Kito the shop trader - tall, warm, colorful, feather behind ear.
 function Kito() {
   const wave = useRef();
+  // Declared so HumanFigure renders legs; Kito stands still, so nothing drives them.
+  const legL = useRef();
+  const legR = useRef();
 
   useEffect(() => {
     return registerInteractable({
@@ -4307,81 +6419,59 @@ function Kito() {
     });
   }, []);
 
+  // His left arm is held up in greeting and waves. Positive rotation.z swings
+  // that arm up and away from the body, so ~1.9rad is "hand above the shoulder".
   useFrame((state) => {
     if (wave.current) {
-      wave.current.rotation.z = Math.sin(state.clock.elapsedTime * 1.5) * 0.15 - 0.2;
+      wave.current.rotation.z = 1.9 + Math.sin(state.clock.elapsedTime * 3) * 0.3;
     }
   });
 
   return html`
     <group position=${KITO_POS}>
-      <!-- legs -->
-      <mesh position=${[0.12, 0.75, 0]} castShadow=${true}>
-        <capsuleGeometry args=${[0.11, 0.6, 4, 6]} />
-        <meshStandardMaterial color="#8a6a3a" />
-      </mesh>
-      <mesh position=${[-0.12, 0.75, 0]} castShadow=${true}>
-        <capsuleGeometry args=${[0.11, 0.6, 4, 6]} />
-        <meshStandardMaterial color="#8a6a3a" />
-      </mesh>
-      <!-- torso / vest -->
-      <mesh position=${[0, 1.35, 0]} castShadow=${true}>
-        <capsuleGeometry args=${[0.32, 0.7, 4, 8]} />
-        <meshStandardMaterial color="#c2542f" />
-      </mesh>
-      <mesh position=${[0, 1.35, 0.05]} castShadow=${true}>
-        <boxGeometry args=${[0.5, 0.7, 0.15]} />
-        <meshStandardMaterial color="#7a4a2a" />
-      </mesh>
-      <!-- head -->
-      <mesh position=${[0, 2.15, 0]} castShadow=${true}>
-        <sphereGeometry args=${[0.26, 14, 14]} />
-        <meshStandardMaterial color="#5a3a22" roughness=${0.7} />
-      </mesh>
-      <!-- braided hair with beads -->
-      <mesh position=${[0.18, 2.0, -0.15]} castShadow=${true}>
-        <cylinderGeometry args=${[0.04, 0.04, 0.5, 6]} />
-        <meshStandardMaterial color="#1a1a1a" />
-      </mesh>
-      <mesh position=${[0.18, 1.7, -0.18]}>
-        <sphereGeometry args=${[0.05, 8, 8]} />
-        <meshStandardMaterial color="#e0a13c" />
-      </mesh>
-      <!-- feather behind ear -->
-      <mesh position=${[-0.28, 2.25, -0.05]} rotation=${[0, 0, 0.5]}>
-        <coneGeometry args=${[0.04, 0.32, 6]} />
-        <meshStandardMaterial color="#e0453c" />
-      </mesh>
-      <!-- waving arm -->
-      <group ref=${wave} position=${[0.38, 1.65, 0]}>
-        <mesh position=${[0, -0.28, 0]} castShadow=${true}>
-          <capsuleGeometry args=${[0.09, 0.5, 4, 6]} />
-          <meshStandardMaterial color="#5a3a22" />
-        </mesh>
+      <!-- Kito himself: the same anatomy as everyone else, a touch bigger, in a
+           trader's red vest with braided hair and a feather. -->
+      <group scale=${1.06}>
+        <${HumanFigure}
+          skinKey="skin"
+          clothColor="#c2542f"
+          accentColor="#e0a13c"
+          hairColor="#160f09"
+          armL=${wave}
+          face=${-1}
+          torsoWrap=${true}
+          legL=${legL}
+          legR=${legR}
+        />
+        <!-- braid hanging down his back, with a bead on the end -->
+        <mesh geometry=${humanGeo('foreArm')} material=${hairMat('#160f09')}
+          position=${[0.085, 1.74, -0.11]} rotation=${[-0.22, 0, 0.1]}
+          scale=${[0.035, 0.42, 0.035]} castShadow=${true} />
+        <mesh geometry=${humanGeo('ballLow')} material=${plainMat('bead', { color: '#e0a13c', roughness: 0.35, metalness: 0.3 })}
+          position=${[0.095, 1.31, -0.145]} scale=${[0.032, 0.032, 0.032]} />
+        <!-- feather tucked behind one ear -->
+        <mesh geometry=${humanGeo('cone')} material=${clothMat('#e0453c')}
+          position=${[-0.12, 1.80, -0.05]} rotation=${[-0.25, 0, 0.6]}
+          scale=${[0.026, 0.30, 0.026]} castShadow=${true} />
       </group>
-      <!-- other arm -->
-      <mesh position=${[-0.38, 1.35, 0]} castShadow=${true}>
-        <capsuleGeometry args=${[0.09, 0.5, 4, 6]} />
-        <meshStandardMaterial color="#5a3a22" />
-      </mesh>
 
       <!-- shop stall -->
       <group position=${[-1.4, 0, -0.4]}>
         <mesh position=${[0, 0.5, 0]} castShadow=${true} receiveShadow=${true}>
           <boxGeometry args=${[1.6, 1, 0.6]} />
-          <meshStandardMaterial color="#8a5a2b" />
+          <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#8a5a2b" />
         </mesh>
         <mesh position=${[0, 1.4, 0]} rotation=${[0.35, 0, 0]} castShadow=${true}>
           <boxGeometry args=${[2, 0.1, 1]} />
-          <meshStandardMaterial color="#caa45a" />
+          <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#caa45a" />
         </mesh>
         <mesh position=${[-0.9, 1.7, 0]} castShadow=${true}>
           <cylinderGeometry args=${[0.04, 0.04, 2, 6]} />
-          <meshStandardMaterial color="#5a4632" />
+          <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#5a4632" />
         </mesh>
         <mesh position=${[0.9, 1.7, 0]} castShadow=${true}>
           <cylinderGeometry args=${[0.04, 0.04, 2, 6]} />
-          <meshStandardMaterial color="#5a4632" />
+          <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#5a4632" />
         </mesh>
       </group>
     </group>
@@ -4405,19 +6495,19 @@ function Workbench() {
     <group position=${WORKBENCH_POS}>
       <mesh position=${[0, 0.4, 0]} castShadow=${true} receiveShadow=${true}>
         <boxGeometry args=${[1.4, 0.1, 0.9]} />
-        <meshStandardMaterial color="#8a5a2b" />
+        <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#8a5a2b" />
       </mesh>
       ${[[-0.6, -0.35], [0.6, -0.35], [-0.6, 0.35], [0.6, 0.35]].map(
         (p, i) => html`
         <mesh key=${i} position=${[p[0], 0.2, p[1]]} castShadow=${true}>
           <boxGeometry args=${[0.1, 0.4, 0.1]} />
-          <meshStandardMaterial color="#6a4222" />
+          <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#6a4222" />
         </mesh>
       `
       )}
       <mesh position=${[0.2, 0.5, 0.1]} rotation=${[0, 0.3, 0]} castShadow=${true}>
         <boxGeometry args=${[0.08, 0.08, 0.6]} />
-        <meshStandardMaterial color="#aaaaaa" metalness=${0.6} roughness=${0.4} />
+        <meshStandardMaterial ...${grainTiled('rock', [1.4, 1.4])} color="#aaaaaa" metalness=${0.6} roughness=${0.4} />
       </mesh>
     </group>
   `;
@@ -4619,37 +6709,63 @@ function Boar({ id, position }) {
 
   return html`
     <group ref=${group} position=${position}>
-      <mesh position=${[0, 0.45, 0]} castShadow=${true}>
-        <boxGeometry args=${[0.5, 0.4, 1]} />
-        <meshStandardMaterial color="#6b4a35" roughness=${0.9} flatShading=${true} />
-      </mesh>
-      <mesh position=${[0, 0.55, 0.6]} castShadow=${true}>
-        <boxGeometry args=${[0.35, 0.3, 0.4]} />
-        <meshStandardMaterial color="#5a3c28" roughness=${0.9} flatShading=${true} />
-      </mesh>
-      <mesh position=${[0, 0.45, 0.85]} rotation=${[Math.PI / 2, 0, 0]} castShadow=${true}>
-        <coneGeometry args=${[0.12, 0.3, 6]} />
-        <meshStandardMaterial color="#caa48a" flatShading=${true} />
-      </mesh>
-      <mesh position=${[0.18, 0.75, 0.65]} rotation=${[0.3, 0, 0.3]}>
-        <coneGeometry args=${[0.08, 0.2, 5]} />
-        <meshStandardMaterial color="#5a3c28" flatShading=${true} />
-      </mesh>
-      <mesh position=${[-0.18, 0.75, 0.65]} rotation=${[0.3, 0, -0.3]}>
-        <coneGeometry args=${[0.08, 0.2, 5]} />
-        <meshStandardMaterial color="#5a3c28" flatShading=${true} />
-      </mesh>
-      <group ref=${legFL} position=${[0.18, 0.25, 0.35]}>
-        <mesh position=${[0, -0.12, 0]}><cylinderGeometry args=${[0.06, 0.06, 0.25, 5]} /><meshStandardMaterial color="#3a2a1c" /></mesh>
+      <!-- barrel body: a lathed drum, heavier at the shoulder than the rump -->
+      <mesh geometry=${humanGeo('torso')} material=${furMat('boarFur')}
+        position=${[0, 0.70, 0.40]} rotation=${[Math.PI / 2, 0, 0]}
+        scale=${[0.21, 0.85, 0.20]} castShadow=${true} receiveShadow=${true} />
+      <!-- shoulder hump, the giveaway silhouette of a wild pig -->
+      <mesh geometry=${humanGeo('ballLow')} material=${furMat('boarFur')}
+        position=${[0, 0.78, 0.24]} scale=${[0.21, 0.17, 0.22]} castShadow=${true} />
+      <!-- wedge head and snout -->
+      <mesh geometry=${humanGeo('ballLow')} material=${furMat('boarFur')}
+        position=${[0, 0.62, 0.58]} scale=${[0.15, 0.15, 0.21]} castShadow=${true} />
+      <mesh geometry=${humanGeo('cone')} material=${plainMat('snout', { color: '#b89480', roughness: 0.65 })}
+        position=${[0, 0.56, 0.72]} rotation=${[Math.PI / 2, 0, 0]}
+        scale=${[0.09, 0.20, 0.09]} castShadow=${true} />
+      <!-- tusks -->
+      <mesh geometry=${humanGeo('cone')} material=${plainMat('tusk', { color: '#e8e0cc', roughness: 0.35 })}
+        position=${[0.065, 0.56, 0.78]} rotation=${[-0.5, 0, 0.25]} scale=${[0.018, 0.14, 0.018]} />
+      <mesh geometry=${humanGeo('cone')} material=${plainMat('tusk', { color: '#e8e0cc', roughness: 0.35 })}
+        position=${[-0.065, 0.56, 0.78]} rotation=${[-0.5, 0, -0.25]} scale=${[0.018, 0.14, 0.018]} />
+      <!-- eyes -->
+      <mesh geometry=${humanGeo('ballLow')} material=${plainMat('animalEye', { color: '#171008', roughness: 0.25 })}
+        position=${[0.095, 0.68, 0.66]} scale=${[0.024, 0.024, 0.02]} />
+      <mesh geometry=${humanGeo('ballLow')} material=${plainMat('animalEye', { color: '#171008', roughness: 0.25 })}
+        position=${[-0.095, 0.68, 0.66]} scale=${[0.024, 0.024, 0.02]} />
+      <!-- ears -->
+      <mesh geometry=${humanGeo('cone')} material=${furMat('boarFur')}
+        position=${[0.115, 0.76, 0.50]} rotation=${[-0.35, 0, 0.45]} scale=${[0.07, 0.15, 0.04]} castShadow=${true} />
+      <mesh geometry=${humanGeo('cone')} material=${furMat('boarFur')}
+        position=${[-0.115, 0.76, 0.50]} rotation=${[-0.35, 0, -0.45]} scale=${[0.07, 0.15, 0.04]} castShadow=${true} />
+      <!-- bristle ridge along the spine -->
+      <mesh geometry=${humanGeo('cone')} material=${plainMat('bristle', { color: '#1d140c', roughness: 0.9 })}
+        position=${[0, 0.88, 0.14]} rotation=${[0.25, 0, 0]} scale=${[0.04, 0.14, 0.16]} />
+      <!-- tail -->
+      <mesh geometry=${humanGeo('foreArm')} material=${furMat('boarFur')}
+        position=${[0, 0.74, -0.44]} rotation=${[-1.1, 0, 0]} scale=${[0.025, 0.20, 0.025]} />
+      <group ref=${legFL} position=${[0.19, 0.48, 0.30]}>
+        <mesh geometry=${humanGeo('shin')} material=${furMat('boarFur')}
+          scale=${[0.062, 0.40, 0.062]} castShadow=${true} />
+        <mesh geometry=${humanGeo('box')} material=${plainMat('hoof', { color: '#2a1d12', roughness: 0.5 })}
+          position=${[0, -0.41, 0.01]} scale=${[0.07, 0.05, 0.09]} />
       </group>
-      <group ref=${legFR} position=${[-0.18, 0.25, 0.35]}>
-        <mesh position=${[0, -0.12, 0]}><cylinderGeometry args=${[0.06, 0.06, 0.25, 5]} /><meshStandardMaterial color="#3a2a1c" /></mesh>
+      <group ref=${legFR} position=${[-0.19, 0.48, 0.30]}>
+        <mesh geometry=${humanGeo('shin')} material=${furMat('boarFur')}
+          scale=${[0.062, 0.40, 0.062]} castShadow=${true} />
+        <mesh geometry=${humanGeo('box')} material=${plainMat('hoof', { color: '#2a1d12', roughness: 0.5 })}
+          position=${[0, -0.41, 0.01]} scale=${[0.07, 0.05, 0.09]} />
       </group>
-      <group ref=${legBL} position=${[0.18, 0.25, -0.35]}>
-        <mesh position=${[0, -0.12, 0]}><cylinderGeometry args=${[0.06, 0.06, 0.25, 5]} /><meshStandardMaterial color="#3a2a1c" /></mesh>
+      <group ref=${legBL} position=${[0.19, 0.48, -0.34]}>
+        <mesh geometry=${humanGeo('shin')} material=${furMat('boarFur')}
+          scale=${[0.065, 0.40, 0.065]} castShadow=${true} />
+        <mesh geometry=${humanGeo('box')} material=${plainMat('hoof', { color: '#2a1d12', roughness: 0.5 })}
+          position=${[0, -0.41, 0.01]} scale=${[0.07, 0.05, 0.09]} />
       </group>
-      <group ref=${legBR} position=${[-0.18, 0.25, -0.35]}>
-        <mesh position=${[0, -0.12, 0]}><cylinderGeometry args=${[0.06, 0.06, 0.25, 5]} /><meshStandardMaterial color="#3a2a1c" /></mesh>
+      <group ref=${legBR} position=${[-0.19, 0.48, -0.34]}>
+        <mesh geometry=${humanGeo('shin')} material=${furMat('boarFur')}
+          scale=${[0.065, 0.40, 0.065]} castShadow=${true} />
+        <mesh geometry=${humanGeo('box')} material=${plainMat('hoof', { color: '#2a1d12', roughness: 0.5 })}
+          position=${[0, -0.41, 0.01]} scale=${[0.07, 0.05, 0.09]} />
       </group>
     </group>
   `;
@@ -4670,35 +6786,75 @@ function Monkey({ id, position }) {
 
   return html`
     <group ref=${group} position=${position}>
-      <mesh position=${[0, 0.5, 0]} castShadow=${true}>
-        <capsuleGeometry args=${[0.18, 0.3, 4, 8]} />
-        <meshStandardMaterial color="#8a5a3a" roughness=${0.9} />
-      </mesh>
-      <mesh position=${[0, 0.85, 0]} castShadow=${true}>
-        <sphereGeometry args=${[0.16, 10, 10]} />
-        <meshStandardMaterial color="#a9764e" roughness=${0.9} />
-      </mesh>
-      <mesh position=${[0, 0.82, 0.13]}>
-        <circleGeometry args=${[0.09, 8]} />
-        <meshStandardMaterial color="#e8d2b0" />
-      </mesh>
-      <mesh position=${[0.16, 0.55, -0.05]} rotation=${[0, 0, -0.4]} castShadow=${true}>
-        <capsuleGeometry args=${[0.06, 0.35, 4, 6]} />
-        <meshStandardMaterial color="#8a5a3a" />
-      </mesh>
-      <mesh position=${[-0.16, 0.55, -0.05]} rotation=${[0, 0, 0.4]} castShadow=${true}>
-        <capsuleGeometry args=${[0.06, 0.35, 4, 6]} />
-        <meshStandardMaterial color="#8a5a3a" />
-      </mesh>
-      <mesh position=${[0, 0.55, -0.35]} rotation=${[1.0, 0, 0]} castShadow=${true}>
-        <capsuleGeometry args=${[0.04, 0.5, 4, 6]} />
-        <meshStandardMaterial color="#8a5a3a" />
-      </mesh>
-      <group ref=${legL} position=${[0.1, 0.32, 0]}>
-        <mesh position=${[0, -0.12, 0]}><capsuleGeometry args=${[0.06, 0.2, 4, 6]} /><meshStandardMaterial color="#6b4226" /></mesh>
+      <!-- hunched torso -->
+      <mesh geometry=${humanGeo('torso')} material=${furMat('monkeyFur')}
+        position=${[0, 0.72, 0]} rotation=${[0.18, 0, 0]}
+        scale=${[0.145, 0.36, 0.125]} castShadow=${true} receiveShadow=${true} />
+      <mesh geometry=${humanGeo('ballLow')} material=${furMat('monkeyFur')}
+        position=${[0, 0.40, 0.02]} scale=${[0.115, 0.095, 0.105]} castShadow=${true} />
+      <!-- head, muzzle and face patch -->
+      <mesh geometry=${humanGeo('ball')} material=${furMat('monkeyFur')}
+        position=${[0, 0.85, 0.01]} scale=${[0.125, 0.135, 0.125]} castShadow=${true} />
+      <mesh geometry=${humanGeo('ballLow')} material=${plainMat('monkeyFace', { color: '#d8b48c', roughness: 0.6 })}
+        position=${[0, 0.825, 0.095]} scale=${[0.082, 0.072, 0.062]} />
+      <mesh geometry=${humanGeo('ballLow')} material=${plainMat('monkeyMuzzle', { color: '#c49a72', roughness: 0.6 })}
+        position=${[0, 0.80, 0.135]} scale=${[0.045, 0.034, 0.038]} />
+      <mesh geometry=${humanGeo('ballLow')} material=${plainMat('animalEye', { color: '#171008', roughness: 0.25 })}
+        position=${[0.040, 0.862, 0.120]} scale=${[0.019, 0.019, 0.014]} />
+      <mesh geometry=${humanGeo('ballLow')} material=${plainMat('animalEye', { color: '#171008', roughness: 0.25 })}
+        position=${[-0.040, 0.862, 0.120]} scale=${[0.019, 0.019, 0.014]} />
+      <!-- big round ears -->
+      <mesh geometry=${humanGeo('ballLow')} material=${plainMat('monkeyFace', { color: '#d8b48c', roughness: 0.6 })}
+        position=${[0.125, 0.862, -0.005]} scale=${[0.022, 0.048, 0.044]} castShadow=${true} />
+      <mesh geometry=${humanGeo('ballLow')} material=${plainMat('monkeyFace', { color: '#d8b48c', roughness: 0.6 })}
+        position=${[-0.125, 0.862, -0.005]} scale=${[0.022, 0.048, 0.044]} castShadow=${true} />
+      <!-- long arms, bent at the elbow and hanging low like a real monkey's -->
+      <group position=${[0.155, 0.80, 0.0]} rotation=${[0, 0, -0.34]}>
+        <mesh geometry=${humanGeo('upperArm')} material=${furMat('monkeyFur')}
+          scale=${[0.048, 0.21, 0.048]} castShadow=${true} />
+        <group position=${[0, -0.21, 0]} rotation=${[0.42, 0, 0]}>
+          <mesh geometry=${humanGeo('foreArm')} material=${furMat('monkeyFur')}
+            scale=${[0.042, 0.20, 0.042]} castShadow=${true} />
+          <mesh geometry=${humanGeo('ballLow')} material=${plainMat('monkeyFace', { color: '#d8b48c', roughness: 0.6 })}
+            position=${[0, -0.21, 0]} scale=${[0.034, 0.042, 0.026]} />
+        </group>
       </group>
-      <group ref=${legR} position=${[-0.1, 0.32, 0]}>
-        <mesh position=${[0, -0.12, 0]}><capsuleGeometry args=${[0.06, 0.2, 4, 6]} /><meshStandardMaterial color="#6b4226" /></mesh>
+      <group position=${[-0.155, 0.80, 0.0]} rotation=${[0, 0, 0.34]}>
+        <mesh geometry=${humanGeo('upperArm')} material=${furMat('monkeyFur')}
+          scale=${[0.048, 0.21, 0.048]} castShadow=${true} />
+        <group position=${[0, -0.21, 0]} rotation=${[0.42, 0, 0]}>
+          <mesh geometry=${humanGeo('foreArm')} material=${furMat('monkeyFur')}
+            scale=${[0.042, 0.20, 0.042]} castShadow=${true} />
+          <mesh geometry=${humanGeo('ballLow')} material=${plainMat('monkeyFace', { color: '#d8b48c', roughness: 0.6 })}
+            position=${[0, -0.21, 0]} scale=${[0.034, 0.042, 0.026]} />
+        </group>
+      </group>
+      <!-- curling tail, built from a few tapering links -->
+      <mesh geometry=${humanGeo('foreArm')} material=${furMat('monkeyFur')}
+        position=${[0, 0.52, -0.10]} rotation=${[-1.15, 0, 0]} scale=${[0.030, 0.26, 0.030]} />
+      <mesh geometry=${humanGeo('foreArm')} material=${furMat('monkeyFur')}
+        position=${[0, 0.42, -0.33]} rotation=${[-2.10, 0, 0]} scale=${[0.024, 0.22, 0.024]} />
+      <mesh geometry=${humanGeo('foreArm')} material=${furMat('monkeyFur')}
+        position=${[0, 0.58, -0.40]} rotation=${[-3.00, 0, 0]} scale=${[0.018, 0.16, 0.018]} />
+      <group ref=${legL} position=${[0.085, 0.42, 0]}>
+        <mesh geometry=${humanGeo('thigh')} material=${furMat('monkeyFur')}
+          scale=${[0.058, 0.22, 0.058]} castShadow=${true} />
+        <group position=${[0, -0.22, 0]} rotation=${[-0.30, 0, 0]}>
+          <mesh geometry=${humanGeo('shin')} material=${furMat('monkeyFur')}
+            scale=${[0.050, 0.19, 0.050]} castShadow=${true} />
+          <mesh geometry=${humanGeo('box')} material=${plainMat('monkeyFace', { color: '#d8b48c', roughness: 0.6 })}
+            position=${[0, -0.20, 0.035]} scale=${[0.055, 0.03, 0.11]} />
+        </group>
+      </group>
+      <group ref=${legR} position=${[-0.085, 0.42, 0]}>
+        <mesh geometry=${humanGeo('thigh')} material=${furMat('monkeyFur')}
+          scale=${[0.058, 0.22, 0.058]} castShadow=${true} />
+        <group position=${[0, -0.22, 0]} rotation=${[-0.30, 0, 0]}>
+          <mesh geometry=${humanGeo('shin')} material=${furMat('monkeyFur')}
+            scale=${[0.050, 0.19, 0.050]} castShadow=${true} />
+          <mesh geometry=${humanGeo('box')} material=${plainMat('monkeyFace', { color: '#d8b48c', roughness: 0.6 })}
+            position=${[0, -0.20, 0.035]} scale=${[0.055, 0.03, 0.11]} />
+        </group>
       </group>
     </group>
   `;
@@ -4726,41 +6882,6 @@ function Animals() {
 // they just hang at the sides. `weapon` is a HeldWeapon id, carried in the right hand —
 // turned 180 degrees because HeldWeapon is modelled for the player, who faces -Z, while
 // these figures face +Z.
-function TribalFigure({ color, armL = null, armR = null, weapon = null }) {
-  return html`
-    <${Fragment}>
-      <mesh position=${[0, 1.0, 0]} castShadow=${true}>
-        <capsuleGeometry args=${[0.26, 0.55, 4, 8]} />
-        <meshStandardMaterial color=${color} roughness=${0.85} flatShading=${true} />
-      </mesh>
-      <mesh position=${[0, 1.65, 0]} castShadow=${true}>
-        <sphereGeometry args=${[0.22, 12, 12]} />
-        <meshStandardMaterial color="#a9764e" roughness=${0.8} />
-      </mesh>
-      <mesh position=${[0, 2.0, 0]} castShadow=${true}>
-        <coneGeometry args=${[0.18, 0.32, 5]} />
-        <meshStandardMaterial color=${color} flatShading=${true} />
-      </mesh>
-      <group ref=${armL} position=${[0.30, 1.32, 0]}>
-        <mesh position=${[0, -0.24, 0]} castShadow=${true}>
-          <capsuleGeometry args=${[0.07, 0.42, 4, 6]} />
-          <meshStandardMaterial color="#a9764e" />
-        </mesh>
-      </group>
-      <group ref=${armR} position=${[-0.30, 1.32, 0]}>
-        <mesh position=${[0, -0.24, 0]} castShadow=${true}>
-          <capsuleGeometry args=${[0.07, 0.42, 4, 6]} />
-          <meshStandardMaterial color="#a9764e" />
-        </mesh>
-        ${weapon && html`
-          <group rotation=${[0, Math.PI, 0]}>
-            <${HeldWeapon} id=${weapon} />
-          </group>
-        `}
-      </group>
-    <//>
-  `;
-}
 
 // ---------- Hostile tribe member: wanders near its camp, attacks if the player gets close ----------
 function TribeMember({ id, spawn, color }) {
@@ -4824,13 +6945,8 @@ function TribeMember({ id, spawn, color }) {
 
   return html`
     <group ref=${group} position=${spawn}>
-      <${TribalFigure} color=${color} armL=${armL} armR=${armR} weapon=${weaponForEntity(id)} />
-      <group ref=${legL} position=${[0.12, 0.55, 0]}>
-        <mesh position=${[0, -0.3, 0]} castShadow=${true}><capsuleGeometry args=${[0.09, 0.5, 4, 6]} /><meshStandardMaterial color="#5a4632" /></mesh>
-      </group>
-      <group ref=${legR} position=${[-0.12, 0.55, 0]}>
-        <mesh position=${[0, -0.3, 0]} castShadow=${true}><capsuleGeometry args=${[0.09, 0.5, 4, 6]} /><meshStandardMaterial color="#5a4632" /></mesh>
-      </group>
+      <${TribalFigure} color=${color} armL=${armL} armR=${armR}
+        legL=${legL} legR=${legR} weapon=${weaponForEntity(id)} />
     </group>
   `;
 }
@@ -4865,7 +6981,7 @@ function TribeCamp({ tribe }) {
         `)}
         <mesh position=${[0, 1.5, 0]} castShadow=${true}>
           <cylinderGeometry args=${[0.15, 0.15, 3, 6]} />
-          <meshStandardMaterial color="#5a3c22" />
+          <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#5a3c22" />
         </mesh>
         <mesh position=${[0, 3.2, 0]} castShadow=${true}>
           <coneGeometry args=${[0.4, 0.6, 5]} />
@@ -4920,15 +7036,15 @@ function PlayerTribeBase() {
     <group position=${BASE_CENTER}>
       <mesh position=${[0, 1.5, 0]} castShadow=${true}>
         <cylinderGeometry args=${[0.15, 0.15, 3, 6]} />
-        <meshStandardMaterial color="#5a3c22" />
+        <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#5a3c22" />
       </mesh>
       <mesh position=${[0, 3.2, 0]} castShadow=${true}>
         <coneGeometry args=${[0.45, 0.7, 5]} />
-        <meshStandardMaterial color="#ffe27a" flatShading=${true} />
+        <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#ffe27a" />
       </mesh>
       <mesh position=${[0, 2.2, 0.05]} castShadow=${true}>
         <planeGeometry args=${[0.8, 1]} />
-        <meshStandardMaterial color="#c9a227" side=${THREE.DoubleSide} />
+        <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#c9a227" side=${THREE.DoubleSide} />
       </mesh>
     </group>
   `;
@@ -4942,19 +7058,19 @@ function FriendBase() {
     <group position=${FRIEND_BASE_CENTER}>
       <mesh position=${[0, 1.5, 0]} castShadow=${true}>
         <cylinderGeometry args=${[0.15, 0.15, 3, 6]} />
-        <meshStandardMaterial color="#5a3c22" />
+        <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#5a3c22" />
       </mesh>
       <mesh position=${[0, 3.2, 0]} castShadow=${true}>
         <coneGeometry args=${[0.4, 0.6, 5]} />
-        <meshStandardMaterial color="#ffe27a" flatShading=${true} />
+        <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#ffe27a" />
       </mesh>
       <mesh position=${[0, 2.2, 0.05]} castShadow=${true}>
         <planeGeometry args=${[0.7, 0.9]} />
-        <meshStandardMaterial color="#c9a227" side=${THREE.DoubleSide} />
+        <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#c9a227" side=${THREE.DoubleSide} />
       </mesh>
       <mesh position=${[0, 0.05, 0]} receiveShadow=${true}>
         <cylinderGeometry args=${[2.5, 2.5, 0.06, 16]} />
-        <meshStandardMaterial color="#b89a30" roughness=${0.9} />
+        <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#b89a30" roughness=${0.9} />
       </mesh>
     </group>
   `;
@@ -5022,19 +7138,6 @@ function useGuardWander(group, spawn, speed = 1) {
 }
 
 // Shared limbs+weapon for the player's tribe warriors (guards and escorts alike).
-function WarriorFigure({ legL, legR, armL = null, armR = null, weapon = null, color = PLAYER_TRIBE_COLOR }) {
-  return html`
-    <${Fragment}>
-      <${TribalFigure} color=${color} armL=${armL} armR=${armR} weapon=${weapon} />
-      <group ref=${legL} position=${[0.12, 0.55, 0]}>
-        <mesh position=${[0, -0.3, 0]} castShadow=${true}><capsuleGeometry args=${[0.09, 0.5, 4, 6]} /><meshStandardMaterial color="#5a4632" /></mesh>
-      </group>
-      <group ref=${legR} position=${[-0.12, 0.55, 0]}>
-        <mesh position=${[0, -0.3, 0]} castShadow=${true}><capsuleGeometry args=${[0.09, 0.5, 4, 6]} /><meshStandardMaterial color="#5a4632" /></mesh>
-      </group>
-    <//>
-  `;
-}
 
 // ---------- A recruited warrior, stands guard and patrols near the tribe base ----------
 function PlayerWarrior({ spawn, color = PLAYER_TRIBE_COLOR }) {
@@ -5291,13 +7394,8 @@ function Raider({ id, startPosition, color, targetPos = BASE_CENTER, targetTribe
 
   return html`
     <group ref=${group} position=${startPosition}>
-      <${TribalFigure} color=${color} armL=${armL} armR=${armR} weapon=${weaponForEntity(id)} />
-      <group ref=${legL} position=${[0.12, 0.55, 0]}>
-        <mesh position=${[0, -0.3, 0]} castShadow=${true}><capsuleGeometry args=${[0.09, 0.5, 4, 6]} /><meshStandardMaterial color="#3a2a1c" /></mesh>
-      </group>
-      <group ref=${legR} position=${[-0.12, 0.55, 0]}>
-        <mesh position=${[0, -0.3, 0]} castShadow=${true}><capsuleGeometry args=${[0.09, 0.5, 4, 6]} /><meshStandardMaterial color="#3a2a1c" /></mesh>
-      </group>
+      <${TribalFigure} color=${color} armL=${armL} armR=${armR}
+        legL=${legL} legR=${legR} weapon=${weaponForEntity(id)} />
     </group>
   `;
 }
@@ -5345,7 +7443,7 @@ function DistantTribeCamp({ tribe }) {
         `)}
         <mesh position=${[0, 2.0, 0]} castShadow=${true}>
           <cylinderGeometry args=${[0.18, 0.18, 4, 6]} />
-          <meshStandardMaterial color="#3a2a10" />
+          <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#3a2a10" />
         </mesh>
         <mesh position=${[0, 4.2, 0]} castShadow=${true}>
           <coneGeometry args=${[0.5, 0.7, 5]} />
@@ -5413,13 +7511,8 @@ function DistantRaider({ id, startPosition, color, targetPos }) {
 
   return html`
     <group ref=${group} position=${startPosition}>
-      <${TribalFigure} color=${color} armL=${armL} armR=${armR} weapon=${weaponForEntity(id)} />
-      <group ref=${legL} position=${[0.12, 0.55, 0]}>
-        <mesh position=${[0, -0.3, 0]} castShadow=${true}><capsuleGeometry args=${[0.09, 0.5, 4, 6]} /><meshStandardMaterial color="#2a1a0c" /></mesh>
-      </group>
-      <group ref=${legR} position=${[-0.12, 0.55, 0]}>
-        <mesh position=${[0, -0.3, 0]} castShadow=${true}><capsuleGeometry args=${[0.09, 0.5, 4, 6]} /><meshStandardMaterial color="#2a1a0c" /></mesh>
-      </group>
+      <${TribalFigure} color=${color} armL=${armL} armR=${armR}
+        legL=${legL} legR=${legR} weapon=${weaponForEntity(id)} />
       <mesh position=${[0, 1.3, 0.3]} rotation=${[Math.PI / 2.4, 0, 0]} castShadow=${true}>
         <cylinderGeometry args=${[0.025, 0.025, 1.1, 5]} />
         <meshStandardMaterial color="#2a1a0c" />
@@ -5503,13 +7596,8 @@ function InterTribalRaider({ id, startPosition, color, targetPos }) {
 
   return html`
     <group ref=${group} position=${startPosition}>
-      <${TribalFigure} color=${color} armL=${armL} armR=${armR} weapon=${weaponForEntity(id)} />
-      <group ref=${legL} position=${[0.12, 0.55, 0]}>
-        <mesh position=${[0, -0.3, 0]} castShadow=${true}><capsuleGeometry args=${[0.09, 0.5, 4, 6]} /><meshStandardMaterial color="#5a4632" /></mesh>
-      </group>
-      <group ref=${legR} position=${[-0.12, 0.55, 0]}>
-        <mesh position=${[0, -0.3, 0]} castShadow=${true}><capsuleGeometry args=${[0.09, 0.5, 4, 6]} /><meshStandardMaterial color="#5a4632" /></mesh>
-      </group>
+      <${TribalFigure} color=${color} armL=${armL} armR=${armR}
+        legL=${legL} legR=${legR} weapon=${weaponForEntity(id)} />
     </group>
   `;
 }
@@ -5554,11 +7642,11 @@ function Building({ building }) {
       <group position=${position} rotation=${[0, rotation, 0]}>
         <mesh position=${[0, 0.6, 0]} castShadow=${true} receiveShadow=${true}>
           <boxGeometry args=${[2, 1.2, 2]} />
-          <meshStandardMaterial color="#caa45a" roughness=${0.85} />
+          <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#caa45a" roughness=${0.85} />
         </mesh>
         <mesh position=${[0, 1.5, 0]} castShadow=${true}>
           <coneGeometry args=${[1.6, 1.2, 4]} />
-          <meshStandardMaterial color="#8a5a2b" flatShading=${true} roughness=${0.9} />
+          <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#8a5a2b" roughness=${0.9} />
         </mesh>
       </group>
     `;
@@ -5569,15 +7657,15 @@ function Building({ building }) {
       <group position=${position} rotation=${[0, rotation, 0]}>
         <mesh position=${[0, 2, 0]} castShadow=${true} receiveShadow=${true}>
           <cylinderGeometry args=${[0.3, 0.4, 4, 6]} />
-          <meshStandardMaterial color="#8a5a2b" roughness=${0.9} />
+          <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#8a5a2b" roughness=${0.9} />
         </mesh>
         <mesh position=${[0, 4.1, 0]} castShadow=${true} receiveShadow=${true}>
           <boxGeometry args=${[1.6, 0.2, 1.6]} />
-          <meshStandardMaterial color="#6a4222" roughness=${0.9} />
+          <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#6a4222" roughness=${0.9} />
         </mesh>
         <mesh position=${[0, 4.7, 0]} castShadow=${true}>
           <coneGeometry args=${[1.2, 1, 4]} />
-          <meshStandardMaterial color="#caa45a" flatShading=${true} />
+          <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#caa45a" />
         </mesh>
       </group>
     `;
@@ -5587,7 +7675,7 @@ function Building({ building }) {
     return html`
       <mesh position=${position} rotation=${[0, rotation, 0]} castShadow=${true} receiveShadow=${true}>
         <boxGeometry args=${[3, 1.4, 0.3]} />
-        <meshStandardMaterial color="#7a5a3a" roughness=${0.9} />
+        <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#7a5a3a" roughness=${0.9} />
       </mesh>
     `;
   }
@@ -5596,7 +7684,7 @@ function Building({ building }) {
   return html`
     <mesh position=${[position[0], 0.4, position[2]]} rotation=${[0, rotation, 0]} castShadow=${true} receiveShadow=${true}>
       <boxGeometry args=${[1, 0.8, 1]} />
-      <meshStandardMaterial color="#6a4222" roughness=${0.9} />
+      <meshStandardMaterial ...${grainTiled('bark', [1.6, 1.6])} color="#6a4222" roughness=${0.9} />
     </mesh>
   `;
 }
@@ -5818,18 +7906,18 @@ function TribePanel() {
       <div class="panel" onClick=${(e) => e.stopPropagation()}>
         <h2>Your Tribe</h2>
         <p class="desc">
-          <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${PLAYER_TRIBE_COLOR};margin-right:4px;vertical-align:middle;"></span>
+          <span style=${{ display: 'inline-block', width: '10px', height: '10px', borderRadius: '50%', background: PLAYER_TRIBE_COLOR, marginRight: '4px', verticalAlign: 'middle' }}></span>
           Home camp (yellow) + ${defeatedCount} conquered team${defeatedCount === 1 ? '' : 's'}.
           ${activeTribeIds.length < ENEMY_TRIBES.length ? ' More rival tribes will arrive.' : ''}
         </p>
         ${myTeams.length > 0 ? html`
-          <div class="shop-item" style="flex-direction:column;gap:4px;">
+          <div class="shop-item" style=${{ flexDirection: 'column', gap: '4px' }}>
             <div class="name">Your Teams</div>
             ${myTeams.map((t) => html`
-              <div key=${t.id} style="display:flex;align-items:center;gap:8px;font-size:13px;">
-                <span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:${t.color};flex-shrink:0;border:1px solid #fff4;"></span>
+              <div key=${t.id} style=${{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px' }}>
+                <span style=${{ display: 'inline-block', width: '12px', height: '12px', borderRadius: '50%', background: t.color, flexShrink: 0, border: '1px solid #fff4' }}></span>
                 <span>${t.name}</span>
-                <span style="color:#aaa;margin-left:auto;">Garrison ${garrisonHP[t.id] ?? 0}/100 HP</span>
+                <span style=${{ color: '#aaa', marginLeft: 'auto' }}>Garrison ${garrisonHP[t.id] ?? 0}/100 HP</span>
               </div>
             `)}
           </div>
@@ -6565,6 +8653,8 @@ function SettingsPanel() {
   const setLookSens = useGame((s) => s.setLookSens);
   const invertY = useGame((s) => s.invertY);
   const setInvertY = useGame((s) => s.setInvertY);
+  const graphicsQuality = useGame((s) => s.graphicsQuality);
+  const setGraphicsQuality = useGame((s) => s.setGraphicsQuality);
   const [tab, setTab] = useState('controls');
   const [listening, setListening] = useState(null); // action id waiting for a key
   const cancelRef = useRef(null);
@@ -6660,15 +8750,74 @@ function SettingsPanel() {
     <//>
   `;
 
+  const preset = GRAPHICS_PRESETS[graphicsQuality] || gfx();
+  const graphicsTab = html`
+    <${Fragment}>
+      <p class="set-hint">
+        Everything in the world is generated at runtime — the textures, the trees, the
+        grass, the sky. Turning this down trims the expensive parts (ground cover,
+        shadow resolution, how much detail each plant gets) rather than changing how
+        the game plays. It takes effect immediately and you won't lose your position.
+      </p>
+      <h3 class="inv-section">Quality</h3>
+      <div class="set-row">
+        <span class="set-label">Preset</span>
+        <div class="gfx-presets">
+          ${GRAPHICS_ORDER.map((key) => html`
+            <button
+              key=${key}
+              class="key-btn ${graphicsQuality === key ? 'listening' : ''}"
+              onClick=${() => setGraphicsQuality(key)}
+            >${GRAPHICS_PRESETS[key].label}</button>
+          `)}
+        </div>
+      </div>
+      <h3 class="inv-section">What that gives you</h3>
+      <div class="set-row">
+        <span class="set-label">Grass drawn around you</span>
+        <strong class="set-value">${preset.grassRadius > 0 ? preset.grassRadius + 'm' : 'off'}</strong>
+      </div>
+      <div class="set-row">
+        <span class="set-label">Shadow map</span>
+        <strong class="set-value">${preset.shadowMap}px</strong>
+      </div>
+      <div class="set-row">
+        <span class="set-label">Plants in the world</span>
+        <strong class="set-value">${preset.foliage}</strong>
+      </div>
+      <div class="set-row">
+        <span class="set-label">Plant detail</span>
+        <strong class="set-value">
+          ${preset.treeDetail === 0 ? 'trunks and canopies'
+            : preset.treeDetail === 1 ? 'roots, branches, leaves'
+            : 'everything, including vines'}
+        </strong>
+      </div>
+      <div class="set-row">
+        <span class="set-label">Render scale</span>
+        <strong class="set-value">${preset.dpr.toFixed(2)}x</strong>
+      </div>
+      <div class="set-row">
+        <span class="set-label">Sky reflections refresh</span>
+        <strong class="set-value">${preset.envSeconds > 0 ? 'every ' + preset.envSeconds + 's' : 'off'}</strong>
+      </div>
+      <p class="set-hint">
+        If the game feels heavy, <strong>Grass</strong> and <strong>Render scale</strong> are
+        the two that cost the most — drop a preset and both come down together.
+      </p>
+    <//>
+  `;
+
   return html`
     <div class="panel-overlay" onClick=${() => setActivePanel(null)}>
       <div class="panel" onClick=${(e) => e.stopPropagation()}>
         <h2>Settings</h2>
         <div class="tabs">
           <button class=${tab === 'controls' ? 'active' : ''} onClick=${() => setTab('controls')}>Controls</button>
+          <button class=${tab === 'graphics' ? 'active' : ''} onClick=${() => setTab('graphics')}>Graphics</button>
           <button class=${tab === 'general' ? 'active' : ''} onClick=${() => setTab('general')}>General</button>
         </div>
-        ${tab === 'controls' ? controlsTab : generalTab}
+        ${tab === 'controls' ? controlsTab : tab === 'graphics' ? graphicsTab : generalTab}
         <p class="close-hint">${keyLabel(keybinds.settings)} or Esc to close</p>
       </div>
     </div>
@@ -6888,7 +9037,7 @@ function Hud() {
         ${notifOpen && html`
           <div class="notif-panel">
             <h3>NOTIFICATIONS</h3>
-            ${notifications.length === 0 && html`<div style="color:rgba(255,255,255,0.3);font-size:12px;">No notifications yet.</div>`}
+            ${notifications.length === 0 && html`<div style=${{ color: 'rgba(255,255,255,0.3)', fontSize: '12px' }}>No notifications yet.</div>`}
             ${[...notifications].reverse().map((n) => {
               const age = Math.floor((Date.now() - n.time) / 60000);
               const ts = age < 1 ? 'now' : age < 60 ? age + 'm' : Math.floor(age / 60) + 'h';
@@ -6992,7 +9141,10 @@ function StartScreen() {
   // minimap has it ready on spawn instead of hitching a frame on its first draw.
   useEffect(() => {
     const id = setTimeout(getMapTerrainCanvas, 50);
-    return () => clearTimeout(id);
+    // Build the procedural surfaces now too, so spawning doesn't stutter while
+    // the ground, the trees and everyone's skin are all generated at once.
+    const cancelWarm = warmSurfaces();
+    return () => { clearTimeout(id); cancelWarm(); };
   }, []);
 
   return html`
@@ -7052,6 +9204,35 @@ class ErrorBoundary extends React.Component {
 
 // ============================================================
 // App.js - top-level composition
+// Renderer setup that can't be expressed as Canvas props. Filmic tone mapping
+// is what turns the raw lighting into something that reads as photographic
+// rather than washed out, and it's the single biggest "realism" switch here.
+function onCanvasCreated(state) {
+  const gl = state.gl;
+  gl.toneMapping = THREE.ACESFilmicToneMapping;
+  gl.toneMappingExposure = 1.05;
+  gl.outputColorSpace = THREE.SRGBColorSpace;
+  gl.shadowMap.enabled = true;
+  gl.shadowMap.type = THREE.PCFSoftShadowMap;
+  // Shadow maps are reallocated when the quality preset changes; without this
+  // the old map lingers and self-shadowing artefacts creep back in.
+  gl.shadowMap.autoUpdate = true;
+}
+
+// Render resolution follows the quality preset. Changing it live (rather than
+// remounting the Canvas) matters because a remount would reset the scene and
+// teleport the player back to spawn.
+function RendererTuning() {
+  const { gl } = useThree();
+  const quality = useGame((s) => s.graphicsQuality);
+  useEffect(() => {
+    const q = GRAPHICS_PRESETS[quality] || gfx();
+    const cap = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
+    gl.setPixelRatio(Math.min(q.dpr, cap));
+  }, [gl, quality]);
+  return null;
+}
+
 // ============================================================
 function App() {
   const started = useGame((s) => s.started);
@@ -7060,7 +9241,13 @@ function App() {
 
   return html`
     <${Fragment}>
-      <${Canvas} shadows=${true} camera=${{ fov: 70, near: 0.1, far: 500, position: [0, 2, 14] }}>
+      <${Canvas}
+        shadows=${{ type: THREE.PCFSoftShadowMap }}
+        gl=${{ antialias: true, powerPreference: 'high-performance', alpha: false }}
+        camera=${{ fov: 70, near: 0.1, far: 500, position: [0, 2, 14] }}
+        onCreated=${onCanvasCreated}
+      >
+        <${RendererTuning} />
         <${World} />
         <${Player} />
         <${RemotePlayer} />
@@ -7090,6 +9277,7 @@ function App() {
         <${CoinDrops} />
         <${CoinDropManager} />
       <//>
+      <div class="grade-overlay"></div>
       <${Hud} />
     <//>
   `;
