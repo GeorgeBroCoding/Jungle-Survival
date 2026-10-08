@@ -3235,6 +3235,204 @@ function buildBladeAlpha(size) {
   return cv;
 }
 
+// ---------- Leaf clusters ----------
+// A canopy made of solid lumps reads as broccoli however good the texture on
+// it is, because the silhouette is wrong: real foliage is mostly holes. So the
+// canopy is built from alpha-cut cards instead, each one a sprig of leaves, and
+// the shape of the tree comes from how they are scattered.
+//
+// Alpha *test*, not blending: a cut-out writes depth, which matters here
+// because the post chain reads the depth buffer for occlusion, fog and the
+// distance blur. Blended foliage would be invisible to all three. It also means
+// three.js copies the map onto the depth material for shadows, so the leaves
+// cast leaf-shaped shadows rather than rectangles.
+function drawOneLeaf(ctx, x, y, angle, len, wid, shade) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(angle);
+  ctx.beginPath();
+  // A pointed oval: two quadratics meeting at the tip and the stem.
+  ctx.moveTo(0, 0);
+  ctx.quadraticCurveTo(wid, -len * 0.42, 0, -len);
+  ctx.quadraticCurveTo(-wid, -len * 0.42, 0, 0);
+  ctx.fillStyle = shade;
+  ctx.fill();
+  // Midrib, then a few side veins angled toward the tip.
+  ctx.strokeStyle = 'rgba(18,42,14,0.5)';
+  ctx.lineWidth = Math.max(0.6, len * 0.028);
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(0, -len);
+  ctx.stroke();
+  ctx.lineWidth = Math.max(0.4, len * 0.016);
+  ctx.strokeStyle = 'rgba(18,42,14,0.3)';
+  for (let v = 1; v <= 4; v++) {
+    const vy = -len * (v / 5);
+    const vw = wid * (1 - v / 6) * 0.8;
+    ctx.beginPath();
+    ctx.moveTo(0, vy);
+    ctx.lineTo(vw, vy - len * 0.12);
+    ctx.moveTo(0, vy);
+    ctx.lineTo(-vw, vy - len * 0.12);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function buildLeafCardSurface(size) {
+  const cv = makeCanvas(size);
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, size, size);
+  const rand = mulberry32(5150);
+  const cx = size * 0.5;
+  const base = size * 0.97;
+
+  // The twig the sprig hangs off.
+  ctx.strokeStyle = '#59431f';
+  ctx.lineWidth = size * 0.016;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(cx, base);
+  ctx.quadraticCurveTo(cx + size * 0.02, size * 0.5, cx, size * 0.22);
+  ctx.stroke();
+
+  const GREENS = ['#2f6b22', '#3d8a2c', '#4fa036', '#28581d', '#5bb341', '#356f27'];
+  const count = 17;
+  for (let i = 0; i < count; i++) {
+    const t = i / (count - 1);
+    const side = (i % 2) ? 1 : -1;
+    const ax = cx + side * size * 0.018;
+    const ay = base - t * size * 0.78;
+    // Leaves sweep up and outward, shorter toward the tip of the sprig.
+    const ang = side * (0.5 + rand() * 0.55) + (rand() - 0.5) * 0.2;
+    const len = size * (0.30 + rand() * 0.15) * (1 - t * 0.5);
+    const wid = len * (0.30 + rand() * 0.14);
+    drawOneLeaf(ctx, ax, ay, ang, len, wid, GREENS[Math.floor(rand() * GREENS.length)]);
+  }
+  // A couple of leaves crowning the tip so the sprig does not end in a stick.
+  for (let i = 0; i < 3; i++) {
+    const ang = (rand() - 0.5) * 0.7;
+    const len = size * (0.20 + rand() * 0.1);
+    drawOneLeaf(ctx, cx, size * 0.24, ang, len, len * 0.34, GREENS[Math.floor(rand() * GREENS.length)]);
+  }
+
+  // Height comes from the alpha: where there is leaf, there is relief. Using
+  // luminance instead would carve the veins into the silhouette.
+  const img = ctx.getImageData(0, 0, size, size);
+  const height = new Float32Array(size * size);
+  const rough = new Float32Array(size * size);
+  for (let i = 0; i < height.length; i++) {
+    const a = img.data[i * 4 + 3] / 255;
+    const l = (img.data[i * 4] + img.data[i * 4 + 1] + img.data[i * 4 + 2]) / 765;
+    height[i] = a * (0.45 + l * 0.55);
+    rough[i] = 0.62 + (1 - l) * 0.25;
+  }
+  return {
+    map: texFrom(cv, [1, 1], true),
+    normalMap: texFrom(normalMapFromHeight(height, size, 2.2), [1, 1], false),
+    roughnessMap: texFrom(greyCanvasFromField(rough, size, 0, 1), [1, 1], false),
+  };
+}
+
+// ---------- Wind ----------
+// One uniform block shared by every material that sways, so the whole forest
+// moves as one weather system rather than each tree keeping its own time.
+const windUniforms = {
+  override: null,
+  uWindTime: { value: 0 },
+  uWindStrength: { value: 0.09 },
+  uSunDirView: { value: new THREE.Vector3(0, 0, -1) },
+  uSunTint: { value: new THREE.Color('#ffe9c4') },
+  uLeafTrans: { value: 0 },
+};
+
+const WIND_GLSL = `
+  uniform float uWindTime;
+  uniform float uWindStrength;
+  // Displacement is applied in WORLD space, after the instance matrix. Doing it
+  // in object space would rotate the sway with each card, and since the cards
+  // are randomly oriented the forest would shimmer instead of lean.
+  vec3 jkWind(vec3 wp) {
+    // A broad wave rolling across the forest. Squaring it gives long calm
+    // stretches broken by short gusts, which is what wind actually does and
+    // what makes the ripple visible as it crosses the canopy.
+    float travel = wp.x * 0.055 + wp.z * 0.042 - uWindTime * 0.55;
+    float gust = sin(travel) * 0.5 + 0.5;
+    gust = gust * gust;
+    float amp = uWindStrength * (0.22 + 1.1 * gust);
+    // Nothing moves at ground level; the top of the canopy moves most.
+    amp *= clamp((wp.y - 0.5) * 0.16, 0.0, 1.0);
+    float ph = wp.x * 0.8 + wp.z * 0.95;
+    return vec3(
+      sin(uWindTime * 1.9 + ph) * amp,
+      sin(uWindTime * 3.1 + ph * 1.7) * amp * 0.2,
+      cos(uWindTime * 1.6 + ph * 1.2) * amp * 0.75
+    );
+  }
+`;
+
+const PROJECT_WITH_WIND = [
+  'vec4 mvPosition = vec4( transformed, 1.0 );',
+  '#ifdef USE_BATCHING',
+  '  mvPosition = batchingMatrix * mvPosition;',
+  '#endif',
+  '#ifdef USE_INSTANCING',
+  '  mvPosition = instanceMatrix * mvPosition;',
+  '#endif',
+  'vec4 jkWorld = modelMatrix * mvPosition;',
+  'jkWorld.xyz += jkWind( jkWorld.xyz );',
+  'mvPosition = viewMatrix * jkWorld;',
+  'gl_Position = projectionMatrix * mvPosition;',
+].join('\n');
+
+// Light coming through a leaf rather than off it. Cheap approximation: look for
+// the camera being roughly opposite the sun, and let thin edges pass more.
+const LEAF_TRANSLUCENCY = [
+  '#include <lights_fragment_end>',
+  '#ifdef JK_TRANSLUCENT',
+  '  vec3 jkView = normalize( vViewPosition );',
+  '  float jkBack = max( 0.0, dot( jkView, -uSunDirView ) );',
+  '  float jkThin = 1.0 - abs( dot( normalize( normal ), jkView ) );',
+  '  reflectedLight.directDiffuse += uSunTint * pow( jkBack, 3.0 )',
+  '    * ( 0.3 + 0.7 * jkThin ) * uLeafTrans * diffuseColor.rgb;',
+  '#endif',
+].join('\n');
+
+const windPatchStats = { wind: 0, windFailed: 0, trans: 0, transFailed: 0 };
+
+// Adds the shared wind uniforms and (optionally) the backlit term to a
+// material. Guarded on the chunks it rewrites, verified against three r160.
+function makeWindy(mat, translucent) {
+  mat.onBeforeCompile = (shader) => {
+    try {
+      shader.uniforms.uWindTime = windUniforms.uWindTime;
+      shader.uniforms.uWindStrength = windUniforms.uWindStrength;
+      if (shader.vertexShader.indexOf('#include <project_vertex>') !== -1) {
+        shader.vertexShader = WIND_GLSL + '\n' + shader.vertexShader.replace(
+          '#include <project_vertex>', PROJECT_WITH_WIND);
+        windPatchStats.wind++;
+      } else {
+        windPatchStats.windFailed++;
+      }
+      if (translucent) {
+        shader.uniforms.uSunDirView = windUniforms.uSunDirView;
+        shader.uniforms.uSunTint = windUniforms.uSunTint;
+        shader.uniforms.uLeafTrans = windUniforms.uLeafTrans;
+        if (shader.fragmentShader.indexOf('#include <lights_fragment_end>') !== -1) {
+          shader.fragmentShader = '#define JK_TRANSLUCENT\nuniform vec3 uSunDirView;\n'
+            + 'uniform vec3 uSunTint;\nuniform float uLeafTrans;\n'
+            + shader.fragmentShader.replace('#include <lights_fragment_end>', LEAF_TRANSLUCENCY);
+          windPatchStats.trans++;
+        } else {
+          windPatchStats.transFailed++;
+        }
+      }
+    } catch (e) { /* plain material rather than a broken one */ }
+  };
+  mat.customProgramCacheKey = () => (translucent ? 'jk-wind-trans' : 'jk-wind');
+  return mat;
+}
+
 // Lazily built, shared across every material that wants them. Building all of
 // these up front would stall the first frame, so each is made on first access.
 const SURFACES = {};
@@ -3244,6 +3442,7 @@ function surface(name) {
   if (name === 'ground') s = buildGroundSurface(256);
   else if (name === 'bark') s = buildBarkSurface(256);
   else if (name === 'leaf') s = buildLeafSurface(256);
+  else if (name === 'leafCard') s = buildLeafCardSurface(256);
   else if (name === 'rock') s = buildRockSurface(256);
   else if (name === 'skin') s = buildSkinSurface(128, makeRamp([[0, '#8a5c38'], [0.5, '#a9764e'], [1, '#c89468']]));
   else if (name === 'skinPale') s = buildSkinSurface(128, makeRamp([[0, '#b07d52'], [0.5, '#d8a878'], [1, '#efc49a']]));
@@ -3262,7 +3461,7 @@ function surface(name) {
 // once. So the start screen builds them ahead of time, one per tick, which keeps
 // the menu responsive and means the world is fully dressed before you see it.
 const WARM_ORDER = [
-  'ground', 'bark', 'leaf', 'rock',
+  'ground', 'bark', 'leaf', 'leafCard', 'rock',
   'skin', 'skinPale', 'cloth', 'hide', 'boarFur', 'monkeyFur',
 ];
 let warmStarted = false;
@@ -4013,6 +4212,26 @@ function DayNightSystem() {
     skyRuntime.fogColor.copy(tmp.fog);
     skyRuntime.sunI = sky.sunI;
     skyRuntime.star = sky.star;
+
+    // --- wind and leaf backlighting ---
+    windUniforms.uWindTime.value = clockAccum.current;
+    // A slow breathing of the overall strength on top of the per-gust wave, so
+    // the forest has quiet minutes and restless ones.
+    windUniforms.uWindStrength.value = 0.075 + 0.035 * Math.sin(clockAccum.current * 0.043);
+    windUniforms.uSunTint.value.copy(sky.sunColor);
+    windUniforms.uLeafTrans.value = Math.min(1.4, sky.sunI) * 0.85;
+    // The translucency term works in view space, so the sun direction has to
+    // come along for the ride.
+    windUniforms.uSunDirView.value.copy(dir).transformDirection(camera.matrixWorldInverse);
+    // Console override, applied last so it wins. Without this, setting one of
+    // these from outside does nothing: the assignments above run every frame,
+    // before the draw, so the override is gone by the time anything renders.
+    if (windUniforms.override) {
+      for (const k in windUniforms.override) {
+        const u = windUniforms[k];
+        if (u && typeof windUniforms.override[k] === 'number') u.value = windUniforms.override[k];
+      }
+    }
     if (scene.fog) {
       scene.fog.color.copy(tmp.fog);
       scene.fog.near = sky.fogN;
@@ -4714,6 +4933,25 @@ function vegGeo(key) {
   } else if (key === 'canopySmall') {
     g = new THREE.IcosahedronGeometry(1, 1);
     displaceGeometry(g, 0.3, 3.1, 1.9);
+  } else if (key === 'leafCard') {
+    // A sprig of leaves on a quad, bowed slightly so it catches light across
+    // its face instead of flipping between fully lit and fully flat.
+    g = new THREE.PlaneGeometry(1, 1, 2, 2);
+    const cp = g.attributes.position;
+    for (let i = 0; i < cp.count; i++) {
+      const x = cp.getX(i), y = cp.getY(i);
+      cp.setZ(i, (0.25 - x * x) * 0.55 + (0.25 - y * y) * 0.2);
+    }
+    g.computeVertexNormals();
+    // The sprig grows upward from the bottom of the card, so pivot there.
+    g.translate(0, 0.5, 0);
+    // A white vertex-colour attribute, which is what actually lets the
+    // per-instance tint reach the output. three.js only multiplies vColor into
+    // diffuseColor under USE_COLOR - USE_INSTANCING_COLOR alone computes the
+    // varying and then never reads it - and USE_COLOR without this attribute
+    // would multiply by the default (0,0,0) and render every leaf black.
+    const cw = new Float32Array(g.attributes.position.count * 3).fill(1);
+    g.setAttribute('color', new THREE.BufferAttribute(cw, 3));
   } else if (key === 'leaf') {
     g = buildLeafGeometry(8, 0.42, 0.17, 0.55);
   } else if (key === 'frond') {
@@ -4749,11 +4987,39 @@ function vegGeo(key) {
 // Which material each geometry key is drawn with.
 function vegMat(key) {
   if (key === 'trunk' || key === 'branch' || key === 'root' || key === 'vine') {
-    return surfaceMat('bark', 'bark', [1.6, 2.4], { roughness: 0.95, envMapIntensity: 0.2 });
+    // Wind on the trunk too: the sway scales with height, so the base stays
+    // planted and the whole tree leans as one instead of the leaves sliding
+    // around a rigid stick.
+    return stdMat('barkWind', () => {
+      const t = surfaceTiled('bark', [1.6, 2.4]);
+      return makeWindy(new THREE.MeshStandardMaterial({
+        map: t.map, normalMap: t.normalMap, roughnessMap: t.roughnessMap,
+        roughness: 0.95, envMapIntensity: 0.2,
+      }), false);
+    });
+  }
+  if (key === 'leafCard') {
+    return stdMat('leafCard', () => {
+      const t = surfaceTiled('leafCard', [1, 1]);
+      return makeWindy(new THREE.MeshStandardMaterial({
+        map: t.map, normalMap: t.normalMap, roughnessMap: t.roughnessMap,
+        // Alpha test rather than blending: cut-outs write depth, which the
+        // post chain needs, and they need no sorting.
+        alphaTest: 0.32,
+        transparent: false,
+        side: THREE.DoubleSide,
+        roughness: 0.72, envMapIntensity: 0.3,
+        vertexColors: true,
+      }), true);
+    });
   }
   if (key === 'canopy' || key === 'canopySmall' || key === 'leaf' || key === 'frond' || key === 'needleSkirt') {
-    return surfaceMat('leaf', 'leaf', [1.8, 1.8], {
-      roughness: 0.68, envMapIntensity: 0.35, side: THREE.DoubleSide,
+    return stdMat('leafWind', () => {
+      const t = surfaceTiled('leaf', [1.8, 1.8]);
+      return makeWindy(new THREE.MeshStandardMaterial({
+        map: t.map, normalMap: t.normalMap, roughnessMap: t.roughnessMap,
+        roughness: 0.68, envMapIntensity: 0.35, side: THREE.DoubleSide,
+      }), true);
     });
   }
   if (key === 'snowCap') {
@@ -4801,45 +5067,83 @@ function buildJungleTreeModel(rand, detail) {
     }
   }
 
-  // Branches reaching up and out toward where the canopy blobs will sit.
-  const canopyY = h * 0.82;
-  const spread = 1.5 + rand() * 1.1;
-  const blobs = detail > 0 ? 5 + Math.floor(rand() * 3) : 3;
-  for (let i = 0; i < blobs; i++) {
-    const a = (i / blobs) * Math.PI * 2 + rand() * 0.7;
-    const d = spread * (0.35 + rand() * 0.75);
-    const by = canopyY + (rand() - 0.4) * h * 0.16;
-    const bx = Math.cos(a) * d;
-    const bz = Math.sin(a) * d;
-    if (detail > 0 && i < 4) {
-      const len = Math.sqrt(bx * bx + bz * bz + 1);
+  // Branches reaching up and out, with a secondary fork on each at full
+  // detail. The foliage hangs off where these end, so the canopy gets its
+  // shape from the branching rather than from a blob placed over the top.
+  const canopyY = h * 0.80;
+  const spread = 1.7 + rand() * 1.2;
+  const limbs = detail > 0 ? 5 + Math.floor(rand() * 3) : 3;
+  const tips = [];
+  for (let i = 0; i < limbs; i++) {
+    const a = (i / limbs) * Math.PI * 2 + rand() * 0.6;
+    const d = spread * (0.5 + rand() * 0.55);
+    const by = canopyY - h * 0.24 + rand() * h * 0.1;
+    const tilt = 0.6 + rand() * 0.4;
+    const len = Math.sqrt(d * d + 1.1);
+    tips.push([Math.cos(a) * d, by + d * 0.5, Math.sin(a) * d, d]);
+    if (detail > 0) {
       parts.push({
         k: 'branch',
-        p: [0, canopyY - h * 0.22, 0],
-        r: [Math.cos(a) * 0.75, -a, -Math.sin(a) * 0.75],
-        s: [rad * 0.42, len * 1.25, rad * 0.42],
+        p: [0, by, 0],
+        r: [Math.cos(a) * tilt, -a, -Math.sin(a) * tilt],
+        s: [rad * 0.40, len * 1.2, rad * 0.40],
       });
+      if (detail > 1) {
+        const a2 = a + (rand() - 0.5) * 1.5;
+        parts.push({
+          k: 'branch',
+          p: [Math.cos(a) * d * 0.6, by + d * 0.3, Math.sin(a) * d * 0.6],
+          r: [Math.cos(a2) * 0.85, -a2, -Math.sin(a2) * 0.85],
+          s: [rad * 0.24, len * 0.6, rad * 0.24],
+        });
+      }
     }
-    // Flattened ellipsoids: a canopy is wide and shallow, not a ball.
-    const bs = 0.95 + rand() * 0.75;
+  }
+
+  // The canopy itself: alpha-cut sprigs scattered through a flattened shell,
+  // clustered toward the branch ends. Light tints only - the card's own
+  // texture carries the colour, and instance colour multiplies it.
+  const CARD_TINTS = ['#d6ecbc', '#c2dea8', '#aed096', '#e6f3cf', '#b8d79c'];
+  const cards = detail === 0 ? 22 : detail === 1 ? 46 : 74;
+  for (let i = 0; i < cards; i++) {
+    let px, py, pz;
+    const tip = tips[Math.floor(rand() * tips.length)];
+    if (tip && rand() < 0.62) {
+      // Most foliage bunches around where a branch ends.
+      const bunch = 0.42 + rand() * 0.5;
+      px = tip[0] + (rand() - 0.5) * bunch;
+      py = tip[1] + (rand() - 0.5) * bunch * 0.75;
+      pz = tip[2] + (rand() - 0.5) * bunch;
+    } else {
+      // The rest fill the crown so it is not see-through.
+      const a = rand() * Math.PI * 2;
+      const phi = Math.acos(1 - 2 * rand());
+      const rr = 0.35 + 0.65 * Math.pow(rand(), 0.6);
+      px = Math.sin(phi) * Math.cos(a) * spread * rr;
+      pz = Math.sin(phi) * Math.sin(a) * spread * rr;
+      py = canopyY + Math.cos(phi) * spread * 0.5 * rr;
+    }
+    const cs = 0.55 + rand() * 0.62;
     parts.push({
-      k: i % 2 === 0 ? 'canopy' : 'canopySmall',
-      p: [bx, by, bz],
-      r: [rand() * 0.5, rand() * 6.28, rand() * 0.5],
-      s: [bs * 1.15, bs * 0.68, bs * 1.15],
-      c: ['#9fd98a', '#86c773', '#6fae5e', '#b6e39c'][Math.floor(rand() * 4)],
+      k: 'leafCard',
+      p: [px, py, pz],
+      // Random orientation: real foliage has no preferred facing, and the
+      // cards are double-sided so nothing turns inside out.
+      r: [(rand() - 0.5) * 2.0, rand() * 6.28, (rand() - 0.5) * 1.4],
+      s: [cs, cs, cs],
+      c: CARD_TINTS[Math.floor(rand() * CARD_TINTS.length)],
     });
   }
 
   // Big drooping leaves hanging off the underside of the canopy.
   if (detail > 0) {
-    const leaves = 5 + Math.floor(rand() * 5);
+    const leaves = 4 + Math.floor(rand() * 4);
     for (let i = 0; i < leaves; i++) {
       const a = rand() * Math.PI * 2;
       const d = spread * (0.5 + rand() * 0.6);
       parts.push({
         k: 'leaf',
-        p: [Math.cos(a) * d, canopyY - 0.35 - rand() * 0.5, Math.sin(a) * d],
+        p: [Math.cos(a) * d, canopyY - 0.45 - rand() * 0.6, Math.sin(a) * d],
         r: [2.0 + rand() * 0.7, a, 0],
         s: [1, 1.2 + rand() * 0.9, 1],
       });
@@ -4933,30 +5237,83 @@ function buildPineModel(rand, detail, snowy) {
 
 function buildBushModel(rand, detail, swamp) {
   const parts = [];
-  const blobs = detail > 0 ? 3 + Math.floor(rand() * 3) : 2;
-  for (let i = 0; i < blobs; i++) {
-    const s = 0.32 + rand() * 0.3;
+  // Same treatment as the canopy: a shrub is a cluster of sprigs, not a lump
+  // of green. A few short woody stems hold them up so it has some structure
+  // underneath rather than floating leaves.
+  const tint = swamp
+    ? ['#9ab78a', '#88a87a', '#7d9c72', '#a6c096']
+    : ['#d6ecbc', '#c2dea8', '#aed096', '#e6f3cf'];
+  const stems = detail > 0 ? 3 + Math.floor(rand() * 3) : 2;
+  for (let i = 0; i < stems; i++) {
+    const a = (i / stems) * Math.PI * 2 + rand() * 0.8;
+    const lean = 0.35 + rand() * 0.4;
     parts.push({
-      k: 'canopySmall',
-      p: [(rand() - 0.5) * 0.5, 0.26 + rand() * 0.34, (rand() - 0.5) * 0.5],
-      r: [rand() * 6.28, rand() * 6.28, rand() * 6.28],
-      s: [s * 1.2, s * 0.9, s * 1.2],
-      c: swamp
-        ? ['#4a6b3a', '#3d5c30', '#55754a'][Math.floor(rand() * 3)]
-        : ['#7fc46a', '#67ad57', '#96d47f'][Math.floor(rand() * 3)],
+      k: 'branch',
+      p: [Math.cos(a) * 0.06, 0, Math.sin(a) * 0.06],
+      r: [Math.cos(a) * lean, -a, -Math.sin(a) * lean],
+      s: [0.028, 0.42 + rand() * 0.26, 0.028],
     });
   }
-  // Fronds poking out of the mass so the silhouette isn't just lumps.
+  const cards = detail === 0 ? 7 : detail === 1 ? 13 : 20;
+  for (let i = 0; i < cards; i++) {
+    const a = rand() * Math.PI * 2;
+    const d = Math.pow(rand(), 0.6) * 0.46;
+    const cs = 0.42 + rand() * 0.34;
+    parts.push({
+      k: 'leafCard',
+      p: [Math.cos(a) * d, 0.16 + rand() * 0.42, Math.sin(a) * d],
+      r: [(rand() - 0.5) * 1.7, rand() * 6.28, (rand() - 0.5) * 1.3],
+      s: [cs, cs, cs],
+      c: tint[Math.floor(rand() * tint.length)],
+    });
+  }
+  // A few broad fronds breaking the outline, which is what stops a shrub
+  // reading as a ball of foliage.
   if (detail > 0) {
-    const n = 4 + Math.floor(rand() * 5);
+    const n = 3 + Math.floor(rand() * 4);
     for (let i = 0; i < n; i++) {
       const a = (i / n) * Math.PI * 2 + rand() * 0.6;
       parts.push({
         k: 'leaf',
-        p: [Math.cos(a) * 0.14, 0.14 + rand() * 0.2, Math.sin(a) * 0.14],
-        r: [0.55 + rand() * 0.7, a, 0],
-        s: [0.95, 0.65 + rand() * 0.45, 0.95],
-        c: swamp ? '#5a7a46' : '#86c773',
+        p: [Math.cos(a) * 0.15, 0.12 + rand() * 0.2, Math.sin(a) * 0.15],
+        r: [0.6 + rand() * 0.7, a, 0],
+        s: [0.95, 0.6 + rand() * 0.4, 0.95],
+      });
+    }
+  }
+  return parts;
+}
+
+// Ferns: the bottom of the three layers. Fronds radiating from a crown, which
+// is the shape that makes a forest floor read as overgrown rather than mown.
+function buildFernModel(rand, detail, swamp) {
+  const parts = [];
+  const fronds = detail === 0 ? 5 : detail === 1 ? 8 : 11;
+  for (let i = 0; i < fronds; i++) {
+    const a = (i / fronds) * Math.PI * 2 + rand() * 0.5;
+    // Outer fronds splay almost flat, inner ones stand up - a fern is a
+    // shuttlecock, not a starburst.
+    const t = rand();
+    const droop = 0.75 + t * 0.75;
+    const len = 0.55 + rand() * 0.5;
+    parts.push({
+      k: 'frond',
+      p: [Math.cos(a) * 0.05, 0.1 + (1 - t) * 0.16, Math.sin(a) * 0.05],
+      r: [droop, a, 0],
+      s: [0.68 + rand() * 0.2, len, 0.68 + rand() * 0.2],
+    });
+  }
+  if (detail > 0) {
+    const sprigs = swamp ? 4 : 3;
+    for (let i = 0; i < sprigs; i++) {
+      const a = rand() * Math.PI * 2;
+      const cs = 0.3 + rand() * 0.22;
+      parts.push({
+        k: 'leafCard',
+        p: [Math.cos(a) * 0.16, 0.08 + rand() * 0.18, Math.sin(a) * 0.16],
+        r: [(rand() - 0.5) * 1.2, rand() * 6.28, (rand() - 0.5) * 0.9],
+        s: [cs, cs, cs],
+        c: swamp ? '#92ad84' : '#c8e2ae',
       });
     }
   }
@@ -5431,6 +5788,11 @@ function DecorativeFoliage() {
       const x = Math.cos(angle) * dist;
       const z = Math.sin(angle) * dist;
       if (Math.hypot(x, z) < 10) continue;
+      // Keep a clearing around where the player appears. The exclusion above is
+      // measured from the world origin, but spawn is 8m off it, so undergrowth
+      // could land close enough that the third-person camera started inside a
+      // fern.
+      if (Math.hypot(x - PLAYER_SPAWN[0], z - PLAYER_SPAWN[2]) < 7) continue;
       const pondDist = Math.hypot(x - POND_CENTER[0], z - POND_CENTER[1]);
       if (pondDist < 14) continue; // keep the water clear
       const y = getTerrainHeight(x, z);
@@ -5441,8 +5803,9 @@ function DecorativeFoliage() {
         // filling the gaps between.
         const roll = rand();
         if (pondDist < 32 && roll > 0.55) add(buildPalmModel(rand, detail), x, y, z, 0.8 + rand() * 0.5, 3.1);
-        else if (roll > 0.34) add(buildJungleTreeModel(rand, detail), x, y, z, s, 4.6);
-        else add(buildBushModel(rand, detail, false), x, y, z, s * 0.95, 1.2);
+        else if (roll > 0.30) add(buildJungleTreeModel(rand, detail), x, y, z, s, 4.6);
+        else if (roll > 0.14) add(buildBushModel(rand, detail, false), x, y, z, s * 0.95, 1.2);
+        else add(buildFernModel(rand, detail, false), x, y, z, 0.8 + rand() * 0.6, 0.5);
       } else if (biome === 1) {
         if (rand() > 0.5) add(buildCactusModel(rand, detail), x, y, z, 0.7 + rand() * 0.7, 0);
         else if (rand() > 0.7) add(buildRockModel(rand, detail), x, y, z, 0.4 + rand() * 0.8, 0);
@@ -5454,8 +5817,10 @@ function DecorativeFoliage() {
         else if (rand() > 0.6) add(buildPineModel(rand, detail, false), x, y, z, s * 0.85, 2.4);
       } else {
         // Swamp: low dark growth with the occasional palm standing out of it.
-        if (rand() > 0.72) add(buildPalmModel(rand, detail), x, y, z, 0.75 + rand() * 0.5, 3.1);
-        else add(buildBushModel(rand, detail, true), x, y, z, s * 1.05, 1.4);
+        const swampRoll = rand();
+        if (swampRoll > 0.72) add(buildPalmModel(rand, detail), x, y, z, 0.75 + rand() * 0.5, 3.1);
+        else if (swampRoll > 0.34) add(buildBushModel(rand, detail, true), x, y, z, s * 1.05, 1.4);
+        else add(buildFernModel(rand, detail, true), x, y, z, 0.9 + rand() * 0.7, 0.6);
       }
     }
     // The harvestable trees and bushes shade you just as much as the decorative
@@ -6677,7 +7042,7 @@ function Player() {
 
   return html`
     <${Fragment}>
-    <group ref=${group} position=${[0, 0, 8]}>
+    <group ref=${group} position=${PLAYER_SPAWN}>
       <${ContactShadow} radius=${0.44} />
       <group ref=${bodyVisual}>
         <${HumanFigure}
@@ -10965,6 +11330,8 @@ if (typeof window !== 'undefined') {
     player: playerTransform,
     canopyCoverAt,
     shaderPatchStats,
+    windPatchStats,
+    wind: windUniforms,
     // Exposed so a headless run can aim the camera. It is the same channel the
     // touch look-drag writes to, and it accumulates, so driving it from outside
     // cannot fight a real input - it just adds to it.
