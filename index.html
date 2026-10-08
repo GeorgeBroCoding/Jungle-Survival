@@ -3369,6 +3369,10 @@ const WIND_GLSL = `
   // the tip bends and the root does not; everything else leaves it at 1 and
   // moves as a whole.
   float jkBladeUp = 1.0;
+  // How tall the plant actually is, in metres. Displacement has to be a
+  // fraction of this, not a fixed distance: a fixed 0.3m push is a gentle lean
+  // on a fern and lays a 20cm blade of grass flat on the ground.
+  float jkPlantH = 1.0;
 
   // Displacement is applied in WORLD space, after the instance matrix. Doing it
   // in object space would rotate the sway with each card, and since the cards
@@ -3383,6 +3387,10 @@ const WIND_GLSL = `
     float amp = uWindStrength * (0.22 + 1.1 * gust);
     // Nothing moves at ground level; the top of the canopy moves most.
     amp *= clamp((wp.y - 0.5) * 0.16, 0.0, 1.0);
+    // Scale to the plant: a small plant leans by a small distance. Without
+    // this a gust that nudges a tree crown sends a blade of grass sideways by
+    // several times its own height.
+    amp *= jkBladeUp * jkPlantH;
     float ph = wp.x * 0.8 + wp.z * 0.95;
     return vec3(
       sin(uWindTime * 1.9 + ph) * amp,
@@ -3395,7 +3403,12 @@ const WIND_GLSL = `
   // the footfall ages, which is the spring-back: the plant is never animated,
   // it just stops being pushed.
   vec3 jkTrample(vec3 wp) {
-    vec3 push = vec3(0.0);
+    // Direction is a weighted sum of the nearby footfalls, but the *amount* is
+    // the single strongest one. Summing the amount piles up: walking leaves
+    // eight overlapping footfalls, and a plant caught by four of them used to
+    // be shoved four times as far as one footfall ever should.
+    vec2 dirSum = vec2(0.0);
+    float strongest = 0.0;
     for (int i = 0; i < ${JK_TRAIL_SLOTS}; i++) {
       vec4 t = uTrail[i];
       if (t.w < 0.0) continue;
@@ -3406,12 +3419,20 @@ const WIND_GLSL = `
       if (dist > 1.3) continue;
       float fresh = 1.0 - clamp(t.w / uTrailLife, 0.0, 1.0);
       float near = 1.0 - smoothstep(0.2, 1.3, dist);
+      float w = near * fresh;
       vec2 flat2 = d.xz;
       float fl = length(flat2);
       vec2 dir = fl > 0.001 ? flat2 / fl : vec2(1.0, 0.0);
-      push += vec3(dir.x, -0.18 * near, dir.y) * near * fresh;
+      dirSum += dir * w;
+      strongest = max(strongest, w);
     }
-    return push * jkBladeUp * 0.6 * uTrampleScale;
+    float dl = length(dirSum);
+    if (dl < 0.0001) return vec3(0.0);
+    vec2 away = dirSum / dl;
+    // A trampled plant leans most of the way over but never further than it is
+    // tall, so the push is a fraction of its own height.
+    float amt = strongest * jkBladeUp * jkPlantH * 0.55 * uTrampleScale;
+    return vec3(away.x * amt, -0.3 * amt, away.y * amt);
   }
 
   float jkInstHash(vec3 p) {
@@ -3439,7 +3460,16 @@ const PROJECT_WITH_WIND = [
   '  float jkKeep = 1.0 - smoothstep( uLodNear, uLodFar, jkDist ) * uLodCull;',
   '  if ( jkInstHash( jkInstOrigin ) > jkKeep ) jkWorld.xyz = vec3( 0.0, -9999.0, 0.0 );',
   '#endif',
-  'jkWorld.xyz += jkWind( jkWorld.xyz ) + jkTrample( jkWorld.xyz );',
+  // Rock does not move at all, and bark sways but is not trampled - walking
+  // past a trunk used to bend its base a half metre out of the ground, because
+  // the trample radius is 1.3m and a trunk base is well inside it.
+  '#ifndef JK_STILL',
+  '  #ifdef JK_NOTRAMPLE',
+  '    jkWorld.xyz += jkWind( jkWorld.xyz );',
+  '  #else',
+  '    jkWorld.xyz += jkWind( jkWorld.xyz ) + jkTrample( jkWorld.xyz );',
+  '  #endif',
+  '#endif',
   '#ifdef JK_MOSS',
   '  vJkWorldPos = jkWorld.xyz;',
   '  #ifdef USE_INSTANCING',
@@ -3516,6 +3546,8 @@ function makeWindy(mat, opts) {
       shader.uniforms.uTrampleScale = windUniforms.uTrampleScale;
       let prelude = WIND_GLSL;
       let defines = '';
+      if (o.still) defines += '#define JK_STILL\n';
+      if (o.noTrample) defines += '#define JK_NOTRAMPLE\n';
       if (o.leafLod) {
         shader.uniforms.uLodNear = windUniforms.uLodNear;
         shader.uniforms.uLodFar = windUniforms.uLodFar;
@@ -3561,7 +3593,8 @@ function makeWindy(mat, opts) {
     } catch (e) { /* plain material rather than a broken one */ }
   };
   mat.customProgramCacheKey = () => 'jk-veg-'
-    + (o.translucent ? 't' : '') + (o.mossy ? 'm' : '') + (o.leafLod ? 'l' : '');
+    + (o.translucent ? 't' : '') + (o.mossy ? 'm' : '') + (o.leafLod ? 'l' : '')
+    + (o.still ? 's' : '') + (o.noTrample ? 'n' : '');
   return mat;
 }
 
@@ -5163,7 +5196,7 @@ function vegMat(key) {
       return makeWindy(new THREE.MeshStandardMaterial({
         map: t.map, normalMap: t.normalMap, roughnessMap: t.roughnessMap,
         roughness: 0.95, envMapIntensity: 0.2,
-      }), { mossy: true });
+      }), { mossy: true, noTrample: true });
     });
   }
   if (key === 'leafCard') {
@@ -5181,7 +5214,18 @@ function vegMat(key) {
       }), { translucent: true, leafLod: true });
     });
   }
-  if (key === 'canopy' || key === 'canopySmall' || key === 'leaf' || key === 'frond' || key === 'needleSkirt') {
+  if (key === 'canopy' || key === 'canopySmall' || key === 'needleSkirt') {
+    // Whole-tree shapes. Same look as a frond, but a pine's skirt sits on the
+    // ground and must not fold away when you walk past it.
+    return stdMat('leafWindStiff', () => {
+      const t = surfaceTiled('leaf', [1.8, 1.8]);
+      return makeWindy(new THREE.MeshStandardMaterial({
+        map: t.map, normalMap: t.normalMap, roughnessMap: t.roughnessMap,
+        roughness: 0.68, envMapIntensity: 0.35, side: THREE.DoubleSide,
+      }), { translucent: true, noTrample: true });
+    });
+  }
+  if (key === 'leaf' || key === 'frond') {
     return stdMat('leafWind', () => {
       const t = surfaceTiled('leaf', [1.8, 1.8]);
       return makeWindy(new THREE.MeshStandardMaterial({
@@ -5201,7 +5245,7 @@ function vegMat(key) {
       return makeWindy(new THREE.MeshStandardMaterial({
         map: t.map, normalMap: t.normalMap, roughnessMap: t.roughnessMap,
         roughness: 0.95, envMapIntensity: 0.3,
-      }), { mossy: true });
+      }), { mossy: true, still: true });
     });
   }
   if (key === 'cactus') {
@@ -5259,24 +5303,24 @@ const TREE_SPECIES = {
   jungleGiant: {
     height: [6.5, 9.5], radius: [0.28, 0.42], depth: 3, split: [2, 3],
     spread: 0.56, upBias: 0.38, lenFall: 0.74, radFall: 0.62, firstFork: 0.45,
-    clump: [9, 14], clumpR: 0.62, cardSize: [0.55, 1.05],
-    buttress: 5, vines: 3, droopLeaves: 5,
+    clump: [16, 21], clumpR: 0.70, cardSize: [0.36, 0.58],
+    buttress: 5, vines: 3, bigLeaf: 2, bigLeafSize: 0.52,
     tints: ['#d6ecbc', '#c2dea8', '#aed096', '#e6f3cf'],
   },
   // Understorey broadleaf: shorter, forks low, and carries a wide bushy head.
   broadleaf: {
     height: [3.4, 5.4], radius: [0.18, 0.27], depth: 3, split: [2, 3],
     spread: 0.70, upBias: 0.26, lenFall: 0.76, radFall: 0.64, firstFork: 0.34,
-    clump: [9, 14], clumpR: 0.60, cardSize: [0.5, 0.95],
-    buttress: 0, vines: 1, droopLeaves: 3,
+    clump: [16, 21], clumpR: 0.68, cardSize: [0.34, 0.55],
+    buttress: 0, vines: 1, bigLeaf: 2, bigLeafSize: 0.46,
     tints: ['#cde7b0', '#b5d79b', '#a0c98a', '#dcefc4'],
   },
   // Dry country: a short trunk that forks hard and spreads into a flat crown.
   acacia: {
     height: [3.0, 4.6], radius: [0.19, 0.28], depth: 3, split: [2, 3],
     spread: 1.05, upBias: -0.18, lenFall: 0.80, radFall: 0.62, firstFork: 0.42,
-    clump: [7, 11], clumpR: 0.75, cardSize: [0.35, 0.72],
-    buttress: 0, vines: 0, droopLeaves: 0, flatten: 0.42,
+    clump: [12, 16], clumpR: 0.82, cardSize: [0.27, 0.45],
+    buttress: 0, vines: 0, bigLeaf: 0, flatten: 0.42,
     tints: ['#cfdfa4', '#bcd092', '#aabf84', '#dde9bb'],
   },
   // Standing deadwood: all structure, no leaves. Does a lot for a treeline.
@@ -5284,33 +5328,36 @@ const TREE_SPECIES = {
     height: [4.0, 7.0], radius: [0.20, 0.32], depth: 4, split: [2, 3],
     spread: 0.78, upBias: 0.30, lenFall: 0.70, radFall: 0.58, firstFork: 0.44,
     clump: [0, 0], clumpR: 0, cardSize: [0, 0],
-    buttress: 0, vines: 0, droopLeaves: 0, bark: '#6d6457',
+    buttress: 0, vines: 0, bigLeaf: 0, bark: '#6d6457',
     tints: [],
   },
   // Swamp edge: props itself up out of the water on stilt roots.
   mangrove: {
     height: [3.2, 5.0], radius: [0.17, 0.24], depth: 3, split: [2, 3],
     spread: 0.72, upBias: 0.28, lenFall: 0.76, radFall: 0.64, firstFork: 0.34,
-    clump: [8, 12], clumpR: 0.55, cardSize: [0.4, 0.85],
-    buttress: 0, stilts: 6, vines: 1, droopLeaves: 2,
+    clump: [14, 19], clumpR: 0.62, cardSize: [0.31, 0.50],
+    buttress: 0, stilts: 6, vines: 1, bigLeaf: 1, bigLeafSize: 0.44,
     tints: ['#a8c493', '#93b57f', '#879e74', '#bcd3a6'],
   },
 };
 
 // One terminal clump of foliage. Tight and roughly spherical: this is what
 // makes the crown read as bushy rather than as a scatter of loose leaves.
-function addLeafClump(parts, rand, sp, detail, x, y, z, scale) {
+function addLeafClump(parts, rand, sp, detail, x, y, z, scale, countScale) {
   if (!sp.tints.length) return;
   const lo = sp.clump[0], hi = sp.clump[1];
-  let n = lo + Math.floor(rand() * (hi - lo + 1));
+  let n = Math.round((lo + Math.floor(rand() * (hi - lo + 1))) * (countScale || 1));
   if (detail === 0) n = Math.max(1, Math.round(n * 0.4));
   else if (detail === 1) n = Math.max(2, Math.round(n * 0.7));
   const R = sp.clumpR * scale;
+  // The clump's volume grows with the limb, but a single sprig is a sprig
+  // whatever branch it is on - a leaf does not get bigger because the tree is.
+  const csScale = 0.75 + 0.25 * scale;
   for (let i = 0; i < n; i++) {
     const a = rand() * Math.PI * 2;
     const phi = Math.acos(1 - 2 * rand());
     const rr = Math.pow(rand(), 0.45) * R;
-    const cs = (sp.cardSize[0] + rand() * (sp.cardSize[1] - sp.cardSize[0])) * scale;
+    const cs = (sp.cardSize[0] + rand() * (sp.cardSize[1] - sp.cardSize[0])) * csScale;
     parts.push({
       k: 'leafCard',
       p: [
@@ -5321,6 +5368,28 @@ function addLeafClump(parts, rand, sp, detail, x, y, z, scale) {
       r: [(rand() - 0.5) * 2.0, rand() * 6.28, (rand() - 0.5) * 1.4],
       s: [cs, cs, cs],
       c: sp.tints[Math.floor(rand() * sp.tints.length)],
+    });
+  }
+  // An occasional broad single leaf hanging off a branch end, as an accent on
+  // the silhouette. These used to be metre-and-a-half slabs floating around the
+  // trunk at mid-crown with nothing joining them to the tree, which is exactly
+  // how they read.
+  if (!sp.bigLeaf || detail === 0 || rand() > 0.3) return;
+  const big = 1 + Math.floor(rand() * sp.bigLeaf);
+  // bigLeafSize is the leaf's LENGTH. The leaf geometry is already a unit-long
+  // blade a third as wide, so a uniform scale keeps it leaf-shaped.
+  const bs = (sp.bigLeafSize || 0.45) * csScale;
+  for (let i = 0; i < big; i++) {
+    const a = rand() * Math.PI * 2;
+    const rr = R * (0.3 + rand() * 0.5);
+    const bl = bs * (0.85 + rand() * 0.35);
+    parts.push({
+      k: 'leaf',
+      // Hung from just below the clump centre and drooping outward, so it
+      // reads as growing off the branch end rather than hovering.
+      p: [x + Math.cos(a) * rr, y - R * (0.1 + rand() * 0.3), z + Math.sin(a) * rr],
+      r: [1.5 + rand() * 0.9, a, (rand() - 0.5) * 0.5],
+      s: [bl, bl, bl],
     });
   }
 }
@@ -5337,8 +5406,24 @@ function growLimb(parts, rand, sp, detail, x, y, z, dx, dy, dz, len, rad, depth)
   const ex = x + dx * len, ey = y + dy * len, ez = z + dz * len;
 
   if (depth >= sp.depth || len < 0.26) {
-    addLeafClump(parts, rand, sp, detail, ex, ey, ez, Math.min(1.5, len * 1.5 + 0.35));
+    const sc = Math.min(1.3, len * 1.2 + 0.4);
+    addLeafClump(parts, rand, sp, detail, ex, ey, ez, sc);
+    // A second, smaller clump back along the limb. One clump per tip leaves the
+    // branch between the forks bare, which is what made the crowns read as
+    // twigs with pompoms on rather than as foliage.
+    if (detail > 0 && sp.tints.length) {
+      const b = 0.5 + rand() * 0.2;
+      addLeafClump(parts, rand, sp, detail,
+        x + dx * len * b, y + dy * len * b, z + dz * len * b, sc * 0.72, 0.6);
+    }
     return;
+  }
+
+  // Foliage at the forks as well as the tips. Hanging leaves only off the last
+  // generation leaves the primary limbs bare all the way through the crown,
+  // and on a big tree those are 4m sticks poking out above the canopy.
+  if (detail > 0 && sp.tints.length) {
+    addLeafClump(parts, rand, sp, detail, ex, ey, ez, Math.min(1.1, len * 0.8 + 0.3), 0.4);
   }
 
   const basis = [0, 0, 0, 0, 0, 0];
@@ -5430,21 +5515,9 @@ function buildTreeModel(rand, detail, speciesKey) {
     ny += sp.upBias * 0.5;
     const nl = Math.hypot(nx, ny, nz) || 1;
     growLimb(parts, rand, sp, detail, 0, boleH, 0, nx / nl, ny / nl, nz / nl,
-      crownLen * (0.85 + rand() * 0.3), rad * 0.72, 1);
+      crownLen * (0.72 + rand() * 0.28), rad * 0.72, 1);
   }
 
-  if (sp.droopLeaves && detail > 0) {
-    for (let i = 0; i < sp.droopLeaves; i++) {
-      const a = rand() * Math.PI * 2;
-      const d = 0.6 + rand() * 1.1;
-      parts.push({
-        k: 'leaf',
-        p: [Math.cos(a) * d, boleH + crownLen * (0.4 + rand() * 0.7), Math.sin(a) * d],
-        r: [2.0 + rand() * 0.7, a, 0],
-        s: [1, 1.1 + rand() * 0.8, 1],
-      });
-    }
-  }
   if (sp.vines && detail > 1) {
     for (let i = 0; i < sp.vines; i++) {
       const a = rand() * Math.PI * 2;
@@ -5836,8 +5909,12 @@ function buildGrassBladeGeometry() {
   const tip = [0.60, 0.82, 0.34];
   for (let i = 0; i <= steps; i++) {
     const t = i / steps;
-    const hw = 0.040 * (1 - t) * (1 - t * 0.35) + 0.0022;
-    const z = 0.13 * t * t; // blades arch over rather than standing to attention
+    // Slim. At 8cm across the base these read as arrowheads rather than
+    // grass, and a wide blade is also a lot more fill to pay for.
+    const hw = 0.021 * (1 - t) * (1 - t * 0.35) + 0.0018;
+    // Only enough arch to give the blade some normal variation; the real
+    // curve is applied in the shader, where the instance's height is known.
+    const z = 0.02 * t * t;
     positions.push(-hw, t, z, hw, t, z);
     uvs.push(0, t, 1, t);
     for (let k = 0; k < 2; k++) {
@@ -5938,14 +6015,37 @@ function GrassField() {
       shader.vertexShader = shader.vertexShader.replace('#include <begin_vertex>', [
         'vec3 transformed = vec3( position );',
         'float bladeUp = clamp( position.y, 0.0, 1.0 );',
+        // The blade geometry is one unit tall and the instance matrix squashes
+        // it to 0.18-0.70m while leaving the width near 1. So a displacement
+        // written in object space comes out magnified by 1/heightScale: the
+        // same code that leans a tall blade over by a tenth lays a short one
+        // flat on the ground. Everything below is therefore expressed as a
+        // FRACTION of the blade's own height and converted back here.
+        '#ifdef USE_INSTANCING',
+        '  float jkSY = length( instanceMatrix[1].xyz );',
+        '  float jkSX = max( length( instanceMatrix[0].xyz ), 0.001 );',
+        '#else',
+        '  float jkSY = 1.0;',
+        '  float jkSX = 1.0;',
+        '#endif',
+        'float jkAspect = jkSY / jkSX;',
+        'jkPlantH = jkSY;',
         // Two sines at different rates: a slow roll with a faster flutter on
         // top, so gusts never look metronomic.
         'float sway = sin( uTime * 1.7 + aPhase ) * 0.6 + sin( uTime * 3.3 + aPhase * 1.9 ) * 0.25;',
-        'float bend = bladeUp * bladeUp * uWind;',
-        'transformed.x += sway * bend;',
-        'transformed.z += cos( uTime * 1.3 + aPhase * 0.7 ) * bend * 0.55;',
-        // Hand the height up the blade to the world-space trample below.
-        'jkBladeUp = bladeUp * bladeUp;',
+        'float up2 = bladeUp * bladeUp;',
+        // Resting arch. It lives here rather than in the geometry for the same
+        // reason: baked into the vertices it is a fixed distance, so short
+        // blades were born already bent double.
+        'float leanZ = up2 * 0.17 + cos( uTime * 1.3 + aPhase * 0.7 ) * up2 * uWind * 1.35 * 0.55;',
+        'float leanX = sway * up2 * uWind * 1.35;',
+        'transformed.x += leanX * jkAspect;',
+        'transformed.z += leanZ * jkAspect;',
+        // A leaning blade is still the same length, so it loses height as it
+        // goes over instead of stretching.
+        'transformed.y -= ( leanX * leanX + leanZ * leanZ ) * 0.5 * bladeUp;',
+        // Hand the height up the blade to the world-space wind and trample.
+        'jkBladeUp = up2;',
       ].join('\n'));
     };
     return m;
@@ -6038,7 +6138,7 @@ function GrassField() {
           continue;
         }
         const h = GRASS_BLADE_H * (0.45 + rand() * 1.25);
-        const w = 0.8 + rand() * 0.7;
+        const w = 0.8 + rand() * 0.55;
         sc.e.set((rand() - 0.5) * 0.28, rand() * Math.PI * 2, (rand() - 0.5) * 0.28);
         sc.q.setFromEuler(sc.e);
         sc.v.set(x, getTerrainHeight(x, z) - 0.03, z);
