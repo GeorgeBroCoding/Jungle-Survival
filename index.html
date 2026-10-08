@@ -1236,7 +1236,7 @@ function saveInputSettings() {
 const GRAPHICS_KEY = 'jungleking.graphics.v1';
 const GRAPHICS_PRESETS = {
   low: {
-    label: 'Low', grassRadius: 0, grassPerCell: 0, foliage: 150,
+    label: 'Low', grassRadius: 12, grassPerCell: 22, foliage: 150,
     shadowMap: 1024, shadowExtent: 48, envSeconds: 0, dpr: 1.0,
     vines: false, treeDetail: 0, waterSegments: 24,
     // Eye adaptation stays on even here: it is a grid lookup and a lerp per
@@ -1245,34 +1245,34 @@ const GRAPHICS_PRESETS = {
     fireLights: 1, fireShadows: false, contactShadows: false, eyeAdapt: true,
     post: false, ssaoSamples: 0, aoStrength: 0, bloomLevels: 1, bloom: 0,
     godRays: false, dof: false, vignette: 0, grain: 0, heightFog: 0, heatHaze: false,
-    dustMotes: 0,
+    dustMotes: 0, fallingLeaves: 0,
   },
   medium: {
-    label: 'Medium', grassRadius: 20, grassPerCell: 5, foliage: 220,
+    label: 'Medium', grassRadius: 20, grassPerCell: 55, foliage: 220,
     shadowMap: 2048, shadowExtent: 40, envSeconds: 4, dpr: 1.35,
     vines: false, treeDetail: 1, waterSegments: 48,
     fireLights: 2, fireShadows: false, contactShadows: true, eyeAdapt: true,
     post: true, ssaoSamples: 8, aoStrength: 0.65, bloomLevels: 3, bloom: 0.28,
     godRays: false, dof: false, vignette: 0.26, grain: 0.012, heightFog: 1, heatHaze: false,
-    dustMotes: 140,
+    dustMotes: 140, fallingLeaves: 24,
   },
   high: {
-    label: 'High', grassRadius: 30, grassPerCell: 8, foliage: 300,
+    label: 'High', grassRadius: 28, grassPerCell: 95, foliage: 300,
     shadowMap: 2048, shadowExtent: 34, envSeconds: 2, dpr: 1.6,
     vines: true, treeDetail: 2, waterSegments: 72,
     fireLights: 2, fireShadows: true, contactShadows: true, eyeAdapt: true,
     post: true, ssaoSamples: 12, aoStrength: 0.75, bloomLevels: 4, bloom: 0.30,
     godRays: true, dof: true, vignette: 0.28, grain: 0.014, heightFog: 1, heatHaze: true,
-    dustMotes: 240,
+    dustMotes: 240, fallingLeaves: 40,
   },
   ultra: {
-    label: 'Ultra', grassRadius: 42, grassPerCell: 12, foliage: 380,
+    label: 'Ultra', grassRadius: 38, grassPerCell: 130, foliage: 380,
     shadowMap: 4096, shadowExtent: 30, envSeconds: 1.2, dpr: 2.0,
     vines: true, treeDetail: 2, waterSegments: 96,
     fireLights: 3, fireShadows: true, contactShadows: true, eyeAdapt: true,
     post: true, ssaoSamples: 16, aoStrength: 0.8, bloomLevels: 5, bloom: 0.32,
     godRays: true, dof: true, vignette: 0.30, grain: 0.015, heightFog: 1, heatHaze: true,
-    dustMotes: 340,
+    dustMotes: 340, fallingLeaves: 60,
   },
 };
 
@@ -3334,9 +3334,13 @@ function buildLeafCardSurface(size) {
   };
 }
 
-// ---------- Wind ----------
+// ---------- Wind, trampling, moss and foliage LOD ----------
 // One uniform block shared by every material that sways, so the whole forest
 // moves as one weather system rather than each tree keeping its own time.
+// JK_TRAIL slots carry recent footfalls: the first eight are the player's
+// trail, which ages and springs back, and the last four track nearby animals.
+const JK_TRAIL_SLOTS = 12;
+const JK_TRAIL_PLAYER = 8;
 const windUniforms = {
   override: null,
   uWindTime: { value: 0 },
@@ -3344,11 +3348,28 @@ const windUniforms = {
   uSunDirView: { value: new THREE.Vector3(0, 0, -1) },
   uSunTint: { value: new THREE.Color('#ffe9c4') },
   uLeafTrans: { value: 0 },
+  uTrail: { value: Array.from({ length: JK_TRAIL_SLOTS }, () => new THREE.Vector4(0, -1000, 0, -1)) },
+  uTrailLife: { value: 2.4 },
+  uTrampleScale: { value: 1 },
+  uGrassWind: { value: 0.16 },
+  uMossAmount: { value: 0.55 },
+  uMossColor: { value: new THREE.Color('#5c7a3a') },
+  uLodNear: { value: 45 },
+  uLodFar: { value: 150 },
+  uLodCull: { value: 0.7 },
 };
 
 const WIND_GLSL = `
   uniform float uWindTime;
   uniform float uWindStrength;
+  uniform vec4 uTrail[${JK_TRAIL_SLOTS}];
+  uniform float uTrailLife;
+  uniform float uTrampleScale;
+  // How far up the plant this vertex sits. Grass overwrites it per vertex so
+  // the tip bends and the root does not; everything else leaves it at 1 and
+  // moves as a whole.
+  float jkBladeUp = 1.0;
+
   // Displacement is applied in WORLD space, after the instance matrix. Doing it
   // in object space would rotate the sway with each card, and since the cards
   // are randomly oriented the forest would shimmer instead of lean.
@@ -3369,6 +3390,33 @@ const WIND_GLSL = `
       cos(uWindTime * 1.6 + ph * 1.2) * amp * 0.75
     );
   }
+
+  // Push away from anything that has walked past recently. The push fades as
+  // the footfall ages, which is the spring-back: the plant is never animated,
+  // it just stops being pushed.
+  vec3 jkTrample(vec3 wp) {
+    vec3 push = vec3(0.0);
+    for (int i = 0; i < ${JK_TRAIL_SLOTS}; i++) {
+      vec4 t = uTrail[i];
+      if (t.w < 0.0) continue;
+      vec3 d = wp - t.xyz;
+      // 3D distance on purpose: a canopy six metres up is not disturbed by
+      // someone walking under it.
+      float dist = length(d);
+      if (dist > 1.3) continue;
+      float fresh = 1.0 - clamp(t.w / uTrailLife, 0.0, 1.0);
+      float near = 1.0 - smoothstep(0.2, 1.3, dist);
+      vec2 flat2 = d.xz;
+      float fl = length(flat2);
+      vec2 dir = fl > 0.001 ? flat2 / fl : vec2(1.0, 0.0);
+      push += vec3(dir.x, -0.18 * near, dir.y) * near * fresh;
+    }
+    return push * jkBladeUp * 0.6 * uTrampleScale;
+  }
+
+  float jkInstHash(vec3 p) {
+    return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+  }
 `;
 
 const PROJECT_WITH_WIND = [
@@ -3380,7 +3428,26 @@ const PROJECT_WITH_WIND = [
   '  mvPosition = instanceMatrix * mvPosition;',
   '#endif',
   'vec4 jkWorld = modelMatrix * mvPosition;',
-  'jkWorld.xyz += jkWind( jkWorld.xyz );',
+  '#if defined( JK_LEAFLOD ) && defined( USE_INSTANCING )',
+  // Stochastic level of detail: past uLodNear a growing random fraction of the
+  // sprigs are dropped. Overdraw is what foliage actually costs, and thinning
+  // the far crowns is invisible while they are a few pixels across. Dropped
+  // cards are folded far below the world rather than skipped, so no chunk
+  // further down the shader is left reading something that was never set.
+  '  vec3 jkInstOrigin = vec3( instanceMatrix[3][0], instanceMatrix[3][1], instanceMatrix[3][2] );',
+  '  float jkDist = distance( jkWorld.xyz, cameraPosition );',
+  '  float jkKeep = 1.0 - smoothstep( uLodNear, uLodFar, jkDist ) * uLodCull;',
+  '  if ( jkInstHash( jkInstOrigin ) > jkKeep ) jkWorld.xyz = vec3( 0.0, -9999.0, 0.0 );',
+  '#endif',
+  'jkWorld.xyz += jkWind( jkWorld.xyz ) + jkTrample( jkWorld.xyz );',
+  '#ifdef JK_MOSS',
+  '  vJkWorldPos = jkWorld.xyz;',
+  '  #ifdef USE_INSTANCING',
+  '    vJkWorldNormal = normalize( mat3( modelMatrix ) * mat3( instanceMatrix ) * objectNormal );',
+  '  #else',
+  '    vJkWorldNormal = normalize( mat3( modelMatrix ) * objectNormal );',
+  '  #endif',
+  '#endif',
   'mvPosition = viewMatrix * jkWorld;',
   'gl_Position = projectionMatrix * mvPosition;',
 ].join('\n');
@@ -3398,23 +3465,87 @@ const LEAF_TRANSLUCENCY = [
   '#endif',
 ].join('\n');
 
-const windPatchStats = { wind: 0, windFailed: 0, trans: 0, transFailed: 0 };
+// Moss grows on what faces the sky and stays damp, so it is keyed off the
+// world normal and broken up with noise rather than painted into the texture -
+// a mossy bark map would put moss on every trunk, evenly, including the
+// underside of branches.
+const MOSS_GLSL = `
+  varying vec3 vJkWorldPos;
+  varying vec3 vJkWorldNormal;
+  uniform float uMossAmount;
+  uniform vec3 uMossColor;
+  float jkHash3(vec3 p) {
+    p = fract(p * 0.3183099 + vec3(0.11, 0.17, 0.23));
+    p *= 17.0;
+    return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+  }
+  float jkNoise3(vec3 x) {
+    vec3 i = floor(x), f = fract(x);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(
+      mix(mix(jkHash3(i + vec3(0,0,0)), jkHash3(i + vec3(1,0,0)), f.x),
+          mix(jkHash3(i + vec3(0,1,0)), jkHash3(i + vec3(1,1,0)), f.x), f.y),
+      mix(mix(jkHash3(i + vec3(0,0,1)), jkHash3(i + vec3(1,0,1)), f.x),
+          mix(jkHash3(i + vec3(0,1,1)), jkHash3(i + vec3(1,1,1)), f.x), f.y), f.z);
+  }
+`;
 
-// Adds the shared wind uniforms and (optionally) the backlit term to a
-// material. Guarded on the chunks it rewrites, verified against three r160.
-function makeWindy(mat, translucent) {
+const MOSS_APPLY = [
+  '#include <map_fragment>',
+  '#ifdef JK_MOSS',
+  '  float jkUp = clamp( vJkWorldNormal.y, 0.0, 1.0 );',
+  '  float jkPatch = jkNoise3( vJkWorldPos * 0.7 );',
+  '  float jkFine = jkNoise3( vJkWorldPos * 3.1 );',
+  '  float jkMoss = smoothstep( 0.15, 0.8, jkUp ) * smoothstep( 0.42, 0.78, jkPatch ) * uMossAmount;',
+  '  diffuseColor.rgb = mix( diffuseColor.rgb, uMossColor * ( 0.65 + 0.7 * jkFine ), jkMoss );',
+  '#endif',
+].join('\n');
+
+const windPatchStats = { wind: 0, windFailed: 0, trans: 0, transFailed: 0, moss: 0, mossFailed: 0 };
+
+// Adds the shared uniforms and whichever of the extras this material wants.
+// Guarded on the chunks it rewrites, verified against three r160.
+function makeWindy(mat, opts) {
+  const o = opts || {};
   mat.onBeforeCompile = (shader) => {
     try {
       shader.uniforms.uWindTime = windUniforms.uWindTime;
       shader.uniforms.uWindStrength = windUniforms.uWindStrength;
+      shader.uniforms.uTrail = windUniforms.uTrail;
+      shader.uniforms.uTrailLife = windUniforms.uTrailLife;
+      shader.uniforms.uTrampleScale = windUniforms.uTrampleScale;
+      let prelude = WIND_GLSL;
+      let defines = '';
+      if (o.leafLod) {
+        shader.uniforms.uLodNear = windUniforms.uLodNear;
+        shader.uniforms.uLodFar = windUniforms.uLodFar;
+        shader.uniforms.uLodCull = windUniforms.uLodCull;
+        prelude = 'uniform float uLodNear;\nuniform float uLodFar;\nuniform float uLodCull;\n' + prelude;
+        defines += '#define JK_LEAFLOD\n';
+      }
+      if (o.mossy) {
+        shader.uniforms.uMossAmount = windUniforms.uMossAmount;
+        shader.uniforms.uMossColor = windUniforms.uMossColor;
+        prelude = 'varying vec3 vJkWorldPos;\nvarying vec3 vJkWorldNormal;\n' + prelude;
+        defines += '#define JK_MOSS\n';
+      }
       if (shader.vertexShader.indexOf('#include <project_vertex>') !== -1) {
-        shader.vertexShader = WIND_GLSL + '\n' + shader.vertexShader.replace(
-          '#include <project_vertex>', PROJECT_WITH_WIND);
+        shader.vertexShader = defines + prelude + '\n'
+          + shader.vertexShader.replace('#include <project_vertex>', PROJECT_WITH_WIND);
         windPatchStats.wind++;
       } else {
         windPatchStats.windFailed++;
       }
-      if (translucent) {
+      if (o.mossy) {
+        if (shader.fragmentShader.indexOf('#include <map_fragment>') !== -1) {
+          shader.fragmentShader = '#define JK_MOSS\n' + MOSS_GLSL + '\n'
+            + shader.fragmentShader.replace('#include <map_fragment>', MOSS_APPLY);
+          windPatchStats.moss++;
+        } else {
+          windPatchStats.mossFailed++;
+        }
+      }
+      if (o.translucent) {
         shader.uniforms.uSunDirView = windUniforms.uSunDirView;
         shader.uniforms.uSunTint = windUniforms.uSunTint;
         shader.uniforms.uLeafTrans = windUniforms.uLeafTrans;
@@ -3429,8 +3560,53 @@ function makeWindy(mat, translucent) {
       }
     } catch (e) { /* plain material rather than a broken one */ }
   };
-  mat.customProgramCacheKey = () => (translucent ? 'jk-wind-trans' : 'jk-wind');
+  mat.customProgramCacheKey = () => 'jk-veg-'
+    + (o.translucent ? 't' : '') + (o.mossy ? 'm' : '') + (o.leafLod ? 'l' : '');
   return mat;
+}
+
+// ---------- The trample trail ----------
+// Footfalls are dropped into a ring buffer as the player moves and age out;
+// animals write into reserved slots every frame. Plants read the whole buffer.
+function applyWindOverride() {
+  if (!windUniforms.override) return;
+  for (const k in windUniforms.override) {
+    const u = windUniforms[k];
+    if (u && typeof windUniforms.override[k] === 'number') u.value = windUniforms.override[k];
+  }
+}
+
+const trailState = { idx: 0, lastX: 1e9, lastZ: 1e9 };
+function updateTrampleTrail(delta) {
+  const slots = windUniforms.uTrail.value;
+  const life = windUniforms.uTrailLife.value;
+  for (let i = 0; i < JK_TRAIL_PLAYER; i++) {
+    if (slots[i].w >= 0) {
+      slots[i].w += delta;
+      if (slots[i].w > life) slots[i].w = -1;
+    }
+  }
+  const px = playerTransform.position[0];
+  const py = playerTransform.position[1];
+  const pz = playerTransform.position[2];
+  if (Math.hypot(px - trailState.lastX, pz - trailState.lastZ) > 0.3) {
+    trailState.lastX = px;
+    trailState.lastZ = pz;
+    slots[trailState.idx % JK_TRAIL_PLAYER].set(px, py + 0.15, pz, 0);
+    trailState.idx++;
+  }
+  // Animals get live slots rather than a trail - they are always somewhere, and
+  // a boar standing in a fern should hold it open.
+  let n = JK_TRAIL_PLAYER;
+  for (const id in entityRegistry.animals) {
+    if (n >= JK_TRAIL_SLOTS) break;
+    const a = entityRegistry.animals[id];
+    if (!a) continue;
+    if (Math.hypot(a[0] - px, a[2] - pz) > 26) continue;
+    slots[n].set(a[0], a[1] + 0.2, a[2], 0);
+    n++;
+  }
+  for (; n < JK_TRAIL_SLOTS; n++) slots[n].w = -1;
 }
 
 // Lazily built, shared across every material that wants them. Building all of
@@ -4223,15 +4399,7 @@ function DayNightSystem() {
     // The translucency term works in view space, so the sun direction has to
     // come along for the ride.
     windUniforms.uSunDirView.value.copy(dir).transformDirection(camera.matrixWorldInverse);
-    // Console override, applied last so it wins. Without this, setting one of
-    // these from outside does nothing: the assignments above run every frame,
-    // before the draw, so the override is gone by the time anything renders.
-    if (windUniforms.override) {
-      for (const k in windUniforms.override) {
-        const u = windUniforms[k];
-        if (u && typeof windUniforms.override[k] === 'number') u.value = windUniforms.override[k];
-      }
-    }
+    updateTrampleTrail(delta);
     if (scene.fog) {
       scene.fog.color.copy(tmp.fog);
       scene.fog.near = sky.fogN;
@@ -4995,7 +5163,7 @@ function vegMat(key) {
       return makeWindy(new THREE.MeshStandardMaterial({
         map: t.map, normalMap: t.normalMap, roughnessMap: t.roughnessMap,
         roughness: 0.95, envMapIntensity: 0.2,
-      }), false);
+      }), { mossy: true });
     });
   }
   if (key === 'leafCard') {
@@ -5010,7 +5178,7 @@ function vegMat(key) {
         side: THREE.DoubleSide,
         roughness: 0.72, envMapIntensity: 0.3,
         vertexColors: true,
-      }), true);
+      }), { translucent: true, leafLod: true });
     });
   }
   if (key === 'canopy' || key === 'canopySmall' || key === 'leaf' || key === 'frond' || key === 'needleSkirt') {
@@ -5019,7 +5187,7 @@ function vegMat(key) {
       return makeWindy(new THREE.MeshStandardMaterial({
         map: t.map, normalMap: t.normalMap, roughnessMap: t.roughnessMap,
         roughness: 0.68, envMapIntensity: 0.35, side: THREE.DoubleSide,
-      }), true);
+      }), { translucent: true });
     });
   }
   if (key === 'snowCap') {
@@ -5028,7 +5196,13 @@ function vegMat(key) {
     }));
   }
   if (key === 'boulder' || key === 'pebble') {
-    return surfaceMat('rock', 'rock', [1.4, 1.4], { roughness: 0.95, envMapIntensity: 0.3 });
+    return stdMat('rockMoss', () => {
+      const t = surfaceTiled('rock', [1.4, 1.4]);
+      return makeWindy(new THREE.MeshStandardMaterial({
+        map: t.map, normalMap: t.normalMap, roughnessMap: t.roughnessMap,
+        roughness: 0.95, envMapIntensity: 0.3,
+      }), { mossy: true });
+    });
   }
   if (key === 'cactus') {
     return stdMat('cactus', () => {
@@ -5045,127 +5219,250 @@ function vegMat(key) {
 // Each returns a part list. `detail` comes from the graphics preset: 0 drops the
 // fiddly extras, 2 is everything.
 
-function buildJungleTreeModel(rand, detail) {
-  const parts = [];
-  const h = 5.4 + rand() * 3.4;            // trunk height
-  const rad = 0.17 + rand() * 0.09;        // trunk radius at the base
-  const lean = (rand() - 0.5) * 0.09;
-  parts.push({ k: 'trunk', p: [0, 0, 0], r: [lean, rand() * 6.28, lean * 0.7], s: [rad, h, rad] });
+// ---------- Trees ----------
+// Built by actually growing them: a trunk that splits into limbs, which split
+// again, each child shorter and thinner than its parent and bent toward the
+// light. Foliage hangs only off the ends, in tight clumps, the way it does on a
+// real tree - scattering leaves evenly through a sphere is what made the old
+// canopies read as a green cloud with a stick under it.
+//
+// Branches point in arbitrary directions, so parts carry a quaternion rather
+// than Euler angles; `aimQuat` turns a direction into one.
+const _aimUp = new THREE.Vector3(0, 1, 0);
+const _aimDir = new THREE.Vector3();
+const _aimQuat = new THREE.Quaternion();
+function aimQuat(dx, dy, dz) {
+  _aimDir.set(dx, dy, dz);
+  if (_aimDir.lengthSq() < 1e-9) _aimDir.set(0, 1, 0);
+  _aimDir.normalize();
+  _aimQuat.setFromUnitVectors(_aimUp, _aimDir);
+  return [_aimQuat.x, _aimQuat.y, _aimQuat.z, _aimQuat.w];
+}
 
-  // Buttress roots flaring out of the base - the thing that most says "jungle".
-  if (detail > 0) {
-    const roots = 3 + Math.floor(rand() * 3);
-    for (let i = 0; i < roots; i++) {
-      const a = (i / roots) * Math.PI * 2 + rand() * 0.5;
+// An orthonormal pair perpendicular to `d`, so children can be fanned around
+// the parent limb whatever direction it happens to point.
+function perpBasis(dx, dy, dz, out) {
+  let ux = 0, uy = 1, uz = 0;
+  if (Math.abs(dy) > 0.94) { ux = 1; uy = 0; uz = 0; }
+  let ax = uy * dz - uz * dy, ay = uz * dx - ux * dz, az = ux * dy - uy * dx;
+  let l = Math.hypot(ax, ay, az) || 1;
+  ax /= l; ay /= l; az /= l;
+  const bx = dy * az - dz * ay, by = dz * ax - dx * az, bz = dx * ay - dy * ax;
+  out[0] = ax; out[1] = ay; out[2] = az;
+  out[3] = bx; out[4] = by; out[5] = bz;
+  return out;
+}
+
+const TREE_SPECIES = {
+  // The classic rainforest emergent: a long clean bole, buttress roots, and
+  // everything happening right at the top.
+  jungleGiant: {
+    height: [6.5, 9.5], radius: [0.28, 0.42], depth: 3, split: [2, 3],
+    spread: 0.56, upBias: 0.38, lenFall: 0.74, radFall: 0.62, firstFork: 0.45,
+    clump: [9, 14], clumpR: 0.62, cardSize: [0.55, 1.05],
+    buttress: 5, vines: 3, droopLeaves: 5,
+    tints: ['#d6ecbc', '#c2dea8', '#aed096', '#e6f3cf'],
+  },
+  // Understorey broadleaf: shorter, forks low, and carries a wide bushy head.
+  broadleaf: {
+    height: [3.4, 5.4], radius: [0.18, 0.27], depth: 3, split: [2, 3],
+    spread: 0.70, upBias: 0.26, lenFall: 0.76, radFall: 0.64, firstFork: 0.34,
+    clump: [9, 14], clumpR: 0.60, cardSize: [0.5, 0.95],
+    buttress: 0, vines: 1, droopLeaves: 3,
+    tints: ['#cde7b0', '#b5d79b', '#a0c98a', '#dcefc4'],
+  },
+  // Dry country: a short trunk that forks hard and spreads into a flat crown.
+  acacia: {
+    height: [3.0, 4.6], radius: [0.19, 0.28], depth: 3, split: [2, 3],
+    spread: 1.05, upBias: -0.18, lenFall: 0.80, radFall: 0.62, firstFork: 0.42,
+    clump: [7, 11], clumpR: 0.75, cardSize: [0.35, 0.72],
+    buttress: 0, vines: 0, droopLeaves: 0, flatten: 0.42,
+    tints: ['#cfdfa4', '#bcd092', '#aabf84', '#dde9bb'],
+  },
+  // Standing deadwood: all structure, no leaves. Does a lot for a treeline.
+  deadTree: {
+    height: [4.0, 7.0], radius: [0.20, 0.32], depth: 4, split: [2, 3],
+    spread: 0.78, upBias: 0.30, lenFall: 0.70, radFall: 0.58, firstFork: 0.44,
+    clump: [0, 0], clumpR: 0, cardSize: [0, 0],
+    buttress: 0, vines: 0, droopLeaves: 0, bark: '#6d6457',
+    tints: [],
+  },
+  // Swamp edge: props itself up out of the water on stilt roots.
+  mangrove: {
+    height: [3.2, 5.0], radius: [0.17, 0.24], depth: 3, split: [2, 3],
+    spread: 0.72, upBias: 0.28, lenFall: 0.76, radFall: 0.64, firstFork: 0.34,
+    clump: [8, 12], clumpR: 0.55, cardSize: [0.4, 0.85],
+    buttress: 0, stilts: 6, vines: 1, droopLeaves: 2,
+    tints: ['#a8c493', '#93b57f', '#879e74', '#bcd3a6'],
+  },
+};
+
+// One terminal clump of foliage. Tight and roughly spherical: this is what
+// makes the crown read as bushy rather than as a scatter of loose leaves.
+function addLeafClump(parts, rand, sp, detail, x, y, z, scale) {
+  if (!sp.tints.length) return;
+  const lo = sp.clump[0], hi = sp.clump[1];
+  let n = lo + Math.floor(rand() * (hi - lo + 1));
+  if (detail === 0) n = Math.max(1, Math.round(n * 0.4));
+  else if (detail === 1) n = Math.max(2, Math.round(n * 0.7));
+  const R = sp.clumpR * scale;
+  for (let i = 0; i < n; i++) {
+    const a = rand() * Math.PI * 2;
+    const phi = Math.acos(1 - 2 * rand());
+    const rr = Math.pow(rand(), 0.45) * R;
+    const cs = (sp.cardSize[0] + rand() * (sp.cardSize[1] - sp.cardSize[0])) * scale;
+    parts.push({
+      k: 'leafCard',
+      p: [
+        x + Math.sin(phi) * Math.cos(a) * rr,
+        y + Math.cos(phi) * rr * (sp.flatten ? sp.flatten : 0.8),
+        z + Math.sin(phi) * Math.sin(a) * rr,
+      ],
+      r: [(rand() - 0.5) * 2.0, rand() * 6.28, (rand() - 0.5) * 1.4],
+      s: [cs, cs, cs],
+      c: sp.tints[Math.floor(rand() * sp.tints.length)],
+    });
+  }
+}
+
+// Grow one limb, then its children. Depth-first; the whole tree is a few
+// hundred parts at most and it is built once, at placement.
+function growLimb(parts, rand, sp, detail, x, y, z, dx, dy, dz, len, rad, depth) {
+  parts.push({
+    k: 'branch',
+    p: [x, y, z],
+    q: aimQuat(dx, dy, dz),
+    s: [rad, len, rad],
+  });
+  const ex = x + dx * len, ey = y + dy * len, ez = z + dz * len;
+
+  if (depth >= sp.depth || len < 0.26) {
+    addLeafClump(parts, rand, sp, detail, ex, ey, ez, Math.min(1.5, len * 1.5 + 0.35));
+    return;
+  }
+
+  const basis = [0, 0, 0, 0, 0, 0];
+  perpBasis(dx, dy, dz, basis);
+  const kids = sp.split[0] + (rand() < 0.55 ? (sp.split[1] - sp.split[0]) : 0);
+  const roll = rand() * Math.PI * 2;
+  for (let i = 0; i < kids; i++) {
+    const phi = roll + (i / kids) * Math.PI * 2 + (rand() - 0.5) * 0.7;
+    const ang = sp.spread * (0.65 + rand() * 0.7);
+    const sa = Math.sin(ang), ca = Math.cos(ang);
+    const px = basis[0] * Math.cos(phi) + basis[3] * Math.sin(phi);
+    const py = basis[1] * Math.cos(phi) + basis[4] * Math.sin(phi);
+    const pz = basis[2] * Math.cos(phi) + basis[5] * Math.sin(phi);
+    let nx = dx * ca + px * sa;
+    let ny = dy * ca + py * sa;
+    let nz = dz * ca + pz * sa;
+    // Phototropism: every limb bends back toward the light a little, which is
+    // what stops a recursive tree looking like a fractal and starts it looking
+    // like something that grew.
+    ny += sp.upBias;
+    const nl = Math.hypot(nx, ny, nz) || 1;
+    nx /= nl; ny /= nl; nz /= nl;
+    const childLen = len * sp.lenFall * (0.82 + rand() * 0.34);
+    const childRad = rad * sp.radFall * (0.88 + rand() * 0.22);
+    growLimb(parts, rand, sp, detail, ex, ey, ez, nx, ny, nz, childLen, childRad, depth + 1);
+  }
+}
+
+function buildTreeModel(rand, detail, speciesKey) {
+  const sp = TREE_SPECIES[speciesKey] || TREE_SPECIES.jungleGiant;
+  const parts = [];
+  const h = sp.height[0] + rand() * (sp.height[1] - sp.height[0]);
+  const rad = sp.radius[0] + rand() * (sp.radius[1] - sp.radius[0]);
+  const lean = (rand() - 0.5) * 0.10;
+
+  // The bole: a clean length of trunk before anything forks.
+  const boleH = h * sp.firstFork;
+  parts.push({
+    k: 'trunk',
+    p: [0, 0, 0],
+    q: aimQuat(lean, 1, lean * 0.7),
+    s: [rad, boleH, rad],
+    c: sp.bark || null,
+  });
+
+  if (sp.buttress) {
+    for (let i = 0; i < sp.buttress; i++) {
+      const a = (i / sp.buttress) * Math.PI * 2 + rand() * 0.5;
       const rl = rad * (3.4 + rand() * 2.2);
       parts.push({
         k: 'root',
         p: [Math.cos(a) * rad * 0.8, 0, Math.sin(a) * rad * 0.8],
         r: [Math.cos(a) * 0.95, -a, -Math.sin(a) * 0.95],
         s: [rad * 0.85, rl, rad * 0.5],
+        c: sp.bark || null,
       });
     }
   }
-
-  // Branches reaching up and out, with a secondary fork on each at full
-  // detail. The foliage hangs off where these end, so the canopy gets its
-  // shape from the branching rather than from a blob placed over the top.
-  const canopyY = h * 0.80;
-  const spread = 1.7 + rand() * 1.2;
-  const limbs = detail > 0 ? 5 + Math.floor(rand() * 3) : 3;
-  const tips = [];
-  for (let i = 0; i < limbs; i++) {
-    const a = (i / limbs) * Math.PI * 2 + rand() * 0.6;
-    const d = spread * (0.5 + rand() * 0.55);
-    const by = canopyY - h * 0.24 + rand() * h * 0.1;
-    const tilt = 0.6 + rand() * 0.4;
-    const len = Math.sqrt(d * d + 1.1);
-    tips.push([Math.cos(a) * d, by + d * 0.5, Math.sin(a) * d, d]);
-    if (detail > 0) {
+  if (sp.stilts) {
+    // Mangrove props: legs angling out of the trunk down into the mud.
+    for (let i = 0; i < sp.stilts; i++) {
+      const a = (i / sp.stilts) * Math.PI * 2 + rand() * 0.4;
+      const up = boleH * (0.35 + rand() * 0.35);
+      const out = 0.5 + rand() * 0.5;
       parts.push({
         k: 'branch',
-        p: [0, by, 0],
-        r: [Math.cos(a) * tilt, -a, -Math.sin(a) * tilt],
-        s: [rad * 0.40, len * 1.2, rad * 0.40],
+        p: [0, up, 0],
+        q: aimQuat(Math.cos(a) * out, -up, Math.sin(a) * out),
+        s: [rad * 0.42, Math.hypot(out, up) * 1.04, rad * 0.42],
+        c: sp.bark || null,
       });
-      if (detail > 1) {
-        const a2 = a + (rand() - 0.5) * 1.5;
-        parts.push({
-          k: 'branch',
-          p: [Math.cos(a) * d * 0.6, by + d * 0.3, Math.sin(a) * d * 0.6],
-          r: [Math.cos(a2) * 0.85, -a2, -Math.sin(a2) * 0.85],
-          s: [rad * 0.24, len * 0.6, rad * 0.24],
-        });
-      }
     }
   }
 
-  // The canopy itself: alpha-cut sprigs scattered through a flattened shell,
-  // clustered toward the branch ends. Light tints only - the card's own
-  // texture carries the colour, and instance colour multiplies it.
-  const CARD_TINTS = ['#d6ecbc', '#c2dea8', '#aed096', '#e6f3cf', '#b8d79c'];
-  const cards = detail === 0 ? 22 : detail === 1 ? 46 : 74;
-  for (let i = 0; i < cards; i++) {
-    let px, py, pz;
-    const tip = tips[Math.floor(rand() * tips.length)];
-    if (tip && rand() < 0.62) {
-      // Most foliage bunches around where a branch ends.
-      const bunch = 0.42 + rand() * 0.5;
-      px = tip[0] + (rand() - 0.5) * bunch;
-      py = tip[1] + (rand() - 0.5) * bunch * 0.75;
-      pz = tip[2] + (rand() - 0.5) * bunch;
-    } else {
-      // The rest fill the crown so it is not see-through.
-      const a = rand() * Math.PI * 2;
-      const phi = Math.acos(1 - 2 * rand());
-      const rr = 0.35 + 0.65 * Math.pow(rand(), 0.6);
-      px = Math.sin(phi) * Math.cos(a) * spread * rr;
-      pz = Math.sin(phi) * Math.sin(a) * spread * rr;
-      py = canopyY + Math.cos(phi) * spread * 0.5 * rr;
-    }
-    const cs = 0.55 + rand() * 0.62;
-    parts.push({
-      k: 'leafCard',
-      p: [px, py, pz],
-      // Random orientation: real foliage has no preferred facing, and the
-      // cards are double-sided so nothing turns inside out.
-      r: [(rand() - 0.5) * 2.0, rand() * 6.28, (rand() - 0.5) * 1.4],
-      s: [cs, cs, cs],
-      c: CARD_TINTS[Math.floor(rand() * CARD_TINTS.length)],
-    });
+  // Grow the crown from the top of the bole.
+  const crownLen = h * (1 - sp.firstFork) * 0.62;
+  const basis = [0, 0, 0, 0, 0, 0];
+  perpBasis(lean, 1, lean * 0.7, basis);
+  const trunkKids = sp.split[0] + (rand() < 0.7 ? (sp.split[1] - sp.split[0]) : 0);
+  const roll0 = rand() * Math.PI * 2;
+  for (let i = 0; i < trunkKids; i++) {
+    const phi = roll0 + (i / trunkKids) * Math.PI * 2 + (rand() - 0.5) * 0.5;
+    const ang = sp.spread * (0.55 + rand() * 0.5);
+    const sa = Math.sin(ang), ca = Math.cos(ang);
+    const px = basis[0] * Math.cos(phi) + basis[3] * Math.sin(phi);
+    const py = basis[1] * Math.cos(phi) + basis[4] * Math.sin(phi);
+    const pz = basis[2] * Math.cos(phi) + basis[5] * Math.sin(phi);
+    let nx = lean * ca + px * sa, ny = ca + py * sa, nz = lean * 0.7 * ca + pz * sa;
+    ny += sp.upBias * 0.5;
+    const nl = Math.hypot(nx, ny, nz) || 1;
+    growLimb(parts, rand, sp, detail, 0, boleH, 0, nx / nl, ny / nl, nz / nl,
+      crownLen * (0.85 + rand() * 0.3), rad * 0.72, 1);
   }
 
-  // Big drooping leaves hanging off the underside of the canopy.
-  if (detail > 0) {
-    const leaves = 4 + Math.floor(rand() * 4);
-    for (let i = 0; i < leaves; i++) {
+  if (sp.droopLeaves && detail > 0) {
+    for (let i = 0; i < sp.droopLeaves; i++) {
       const a = rand() * Math.PI * 2;
-      const d = spread * (0.5 + rand() * 0.6);
+      const d = 0.6 + rand() * 1.1;
       parts.push({
         k: 'leaf',
-        p: [Math.cos(a) * d, canopyY - 0.45 - rand() * 0.6, Math.sin(a) * d],
+        p: [Math.cos(a) * d, boleH + crownLen * (0.4 + rand() * 0.7), Math.sin(a) * d],
         r: [2.0 + rand() * 0.7, a, 0],
-        s: [1, 1.2 + rand() * 0.9, 1],
+        s: [1, 1.1 + rand() * 0.8, 1],
       });
     }
   }
-
-  // Hanging vines. Cheap, and they do a lot for the jungle read.
-  if (detail > 1) {
-    const vines = 2 + Math.floor(rand() * 3);
-    for (let i = 0; i < vines; i++) {
+  if (sp.vines && detail > 1) {
+    for (let i = 0; i < sp.vines; i++) {
       const a = rand() * Math.PI * 2;
-      const d = spread * (0.4 + rand() * 0.7);
-      const vl = 1.4 + rand() * 2.6;
+      const d = 0.5 + rand() * 1.2;
       parts.push({
         k: 'vine',
-        p: [Math.cos(a) * d, canopyY - 0.4, Math.sin(a) * d],
+        p: [Math.cos(a) * d, boleH + crownLen * 0.5, Math.sin(a) * d],
         r: [0, 0, (rand() - 0.5) * 0.25],
-        s: [0.035, vl, 0.035],
+        s: [0.035, 1.4 + rand() * 2.6, 0.035],
       });
     }
   }
   return parts;
+}
+
+// Kept so existing callers and saves keep working.
+function buildJungleTreeModel(rand, detail) {
+  return buildTreeModel(rand, detail, 'jungleGiant');
 }
 
 function buildPalmModel(rand, detail) {
@@ -5428,9 +5725,13 @@ function groupModelInstances(instances) {
     q.setFromEuler(e);
     parent.compose(v.set(inst.position[0], inst.position[1], inst.position[2]), q, sc.set(s, s, s));
     for (const part of inst.model) {
-      const r = part.r || [0, 0, 0];
-      e.set(r[0], r[1], r[2]);
-      q.setFromEuler(e);
+      if (part.q) {
+        q.set(part.q[0], part.q[1], part.q[2], part.q[3]);
+      } else {
+        const r = part.r || [0, 0, 0];
+        e.set(r[0], r[1], r[2]);
+        q.setFromEuler(e);
+      }
       local.compose(v.set(part.p[0], part.p[1], part.p[2]), q, sc.set(part.s[0], part.s[1], part.s[2]));
       m.multiplyMatrices(parent, local);
       let g = byKey.get(part.k);
@@ -5518,7 +5819,7 @@ function Bush({ position, scale = 1 }) {
 // so a cell looks identical every time you walk back over it.
 // ============================================================
 const GRASS_CELL = 2.6;
-const GRASS_BLADE_H = 0.55;
+const GRASS_BLADE_H = 0.40;
 // Packs a signed cell coordinate pair into one integer for Map keys - cheaper
 // than building strings every time the player crosses a cell boundary.
 const GRASS_KEY_BIAS = 4096;
@@ -5535,7 +5836,7 @@ function buildGrassBladeGeometry() {
   const tip = [0.60, 0.82, 0.34];
   for (let i = 0; i <= steps; i++) {
     const t = i / steps;
-    const hw = 0.024 * (1 - t) * (1 - t * 0.35) + 0.0015;
+    const hw = 0.040 * (1 - t) * (1 - t * 0.35) + 0.0022;
     const z = 0.13 * t * t; // blades arch over rather than standing to attention
     positions.push(-hw, t, z, hw, t, z);
     uvs.push(0, t, 1, t);
@@ -5605,8 +5906,8 @@ function GrassField() {
   const quality = useGame((s) => s.graphicsQuality);
   const q = GRAPHICS_PRESETS[quality] || gfx();
   const ref = useRef();
-  const timeU = useMemo(() => ({ value: 0 }), []);
-  const windU = useMemo(() => ({ value: 0.16 }), []);
+  const timeU = windUniforms.uWindTime;
+  const windU = windUniforms.uGrassWind;
   const geo = useMemo(() => buildGrassBladeGeometry(), []);
 
   const mat = useMemo(() => {
@@ -5624,8 +5925,16 @@ function GrassField() {
       if (shader.vertexShader.indexOf('#include <begin_vertex>') === -1) return;
       shader.uniforms.uTime = timeU;
       shader.uniforms.uWind = windU;
-      shader.vertexShader =
-        'attribute float aPhase;\nuniform float uTime;\nuniform float uWind;\n' + shader.vertexShader;
+      shader.uniforms.uTrail = windUniforms.uTrail;
+      shader.uniforms.uTrailLife = windUniforms.uTrailLife;
+      shader.uniforms.uTrampleScale = windUniforms.uTrampleScale;
+      shader.uniforms.uWindTime = windUniforms.uWindTime;
+      shader.uniforms.uWindStrength = windUniforms.uWindStrength;
+      shader.vertexShader = WIND_GLSL
+        + 'attribute float aPhase;\nuniform float uTime;\nuniform float uWind;\n' + shader.vertexShader;
+      if (shader.vertexShader.indexOf('#include <project_vertex>') !== -1) {
+        shader.vertexShader = shader.vertexShader.replace('#include <project_vertex>', PROJECT_WITH_WIND);
+      }
       shader.vertexShader = shader.vertexShader.replace('#include <begin_vertex>', [
         'vec3 transformed = vec3( position );',
         'float bladeUp = clamp( position.y, 0.0, 1.0 );',
@@ -5635,6 +5944,8 @@ function GrassField() {
         'float bend = bladeUp * bladeUp * uWind;',
         'transformed.x += sway * bend;',
         'transformed.z += cos( uTime * 1.3 + aPhase * 0.7 ) * bend * 0.55;',
+        // Hand the height up the blade to the world-space trample below.
+        'jkBladeUp = bladeUp * bladeUp;',
       ].join('\n'));
     };
     return m;
@@ -5694,8 +6005,9 @@ function GrassField() {
   useFrame((_, delta) => {
     const mesh = ref.current;
     if (!mesh || plan.capacity === 0) return;
-    timeU.value += delta;
-    // Wind comes in slow gusts rather than sitting at one strength.
+    // The clock belongs to DayNightSystem now, so that a gust crossing the
+    // canopy is the same gust that moves the undergrowth. Only the grass's
+    // share of its strength is set here.
     windU.value = 0.13 + Math.sin(timeU.value * 0.23) * 0.06 + Math.sin(timeU.value * 0.07) * 0.035;
 
     const px = playerTransform.position[0];
@@ -5725,7 +6037,7 @@ function GrassField() {
           phaseAttr.array[idx] = 0;
           continue;
         }
-        const h = GRASS_BLADE_H * (0.55 + rand() * 0.9);
+        const h = GRASS_BLADE_H * (0.45 + rand() * 1.25);
         const w = 0.8 + rand() * 0.7;
         sc.e.set((rand() - 0.5) * 0.28, rand() * Math.PI * 2, (rand() - 0.5) * 0.28);
         sc.q.setFromEuler(sc.e);
@@ -5798,28 +6110,40 @@ function DecorativeFoliage() {
       const y = getTerrainHeight(x, z);
       const s = 0.7 + rand() * 0.9;
       const biome = getDominantBiome(x, z);
+      const roll = rand();
       if (biome === 0) {
-        // Woodland: mostly broadleaf jungle trees, palms near the water, bushes
-        // filling the gaps between.
-        const roll = rand();
-        if (pondDist < 32 && roll > 0.55) add(buildPalmModel(rand, detail), x, y, z, 0.8 + rand() * 0.5, 3.1);
-        else if (roll > 0.30) add(buildJungleTreeModel(rand, detail), x, y, z, s, 4.6);
-        else if (roll > 0.14) add(buildBushModel(rand, detail, false), x, y, z, s * 0.95, 1.2);
+        // Woodland: emergent giants over a broadleaf understorey, palms by the
+        // water, and the floor filled in with shrubs and ferns.
+        if (pondDist < 32 && roll > 0.72) add(buildPalmModel(rand, detail), x, y, z, 0.8 + rand() * 0.5, 3.1);
+        else if (roll > 0.56) add(buildTreeModel(rand, detail, 'jungleGiant'), x, y, z, s, 4.4);
+        else if (roll > 0.38) add(buildTreeModel(rand, detail, 'broadleaf'), x, y, z, s * 1.05, 2.8);
+        else if (roll > 0.33) add(buildTreeModel(rand, detail, 'deadTree'), x, y, z, s * 0.9, 0.6);
+        else if (roll > 0.16) add(buildBushModel(rand, detail, false), x, y, z, s * 0.95, 1.2);
         else add(buildFernModel(rand, detail, false), x, y, z, 0.8 + rand() * 0.6, 0.5);
       } else if (biome === 1) {
-        if (rand() > 0.5) add(buildCactusModel(rand, detail), x, y, z, 0.7 + rand() * 0.7, 0);
-        else if (rand() > 0.7) add(buildRockModel(rand, detail), x, y, z, 0.4 + rand() * 0.8, 0);
+        // Dry scrub: flat-topped acacias over cactus and bare rock.
+        if (roll > 0.60) add(buildTreeModel(rand, detail, 'acacia'), x, y, z, 0.9 + rand() * 0.5, 2.2);
+        else if (roll > 0.34) add(buildCactusModel(rand, detail), x, y, z, 0.7 + rand() * 0.7, 0);
+        else if (roll > 0.20) add(buildTreeModel(rand, detail, 'deadTree'), x, y, z, 0.8 + rand() * 0.4, 0.5);
+        else add(buildRockModel(rand, detail), x, y, z, 0.4 + rand() * 0.8, 0);
       } else if (biome === 2) {
-        if (rand() > 0.3) add(buildPineModel(rand, detail, true), x, y, z, s, 2.6);
-        else if (rand() > 0.6) add(buildRockModel(rand, detail), x, y, z, 0.35 + rand() * 0.6, 0);
+        // Snowline: pines, with deadwood where they have given up.
+        if (roll > 0.42) add(buildPineModel(rand, detail, true), x, y, z, s, 2.6);
+        else if (roll > 0.26) add(buildTreeModel(rand, detail, 'deadTree'), x, y, z, s * 0.85, 0.5);
+        else add(buildRockModel(rand, detail), x, y, z, 0.35 + rand() * 0.6, 0);
       } else if (biome === 3) {
-        if (rand() > 0.35) add(buildRockModel(rand, detail), x, y, z, 0.45 + rand() * 1.7, 0);
-        else if (rand() > 0.6) add(buildPineModel(rand, detail, false), x, y, z, s * 0.85, 2.4);
+        // Rocky: mostly stone, with hardy pines and standing deadwood between.
+        if (roll > 0.55) add(buildRockModel(rand, detail), x, y, z, 0.45 + rand() * 1.7, 0);
+        else if (roll > 0.33) add(buildPineModel(rand, detail, false), x, y, z, s * 0.85, 2.4);
+        else if (roll > 0.18) add(buildTreeModel(rand, detail, 'deadTree'), x, y, z, s * 0.9, 0.5);
+        else add(buildBushModel(rand, detail, false), x, y, z, s * 0.7, 0.9);
       } else {
-        // Swamp: low dark growth with the occasional palm standing out of it.
-        const swampRoll = rand();
-        if (swampRoll > 0.72) add(buildPalmModel(rand, detail), x, y, z, 0.75 + rand() * 0.5, 3.1);
-        else if (swampRoll > 0.34) add(buildBushModel(rand, detail, true), x, y, z, s * 1.05, 1.4);
+        // Swamp: mangroves on their stilts, palms standing out of the growth,
+        // and a dense floor of fern.
+        if (roll > 0.66) add(buildTreeModel(rand, detail, 'mangrove'), x, y, z, s, 2.4);
+        else if (roll > 0.54) add(buildPalmModel(rand, detail), x, y, z, 0.75 + rand() * 0.5, 3.1);
+        else if (roll > 0.46) add(buildTreeModel(rand, detail, 'deadTree'), x, y, z, s * 0.85, 0.5);
+        else if (roll > 0.26) add(buildBushModel(rand, detail, true), x, y, z, s * 1.05, 1.4);
         else add(buildFernModel(rand, detail, true), x, y, z, 0.9 + rand() * 0.7, 0.6);
       }
     }
@@ -5933,6 +6257,75 @@ function wrapHalf(v, half) {
   return r - half;
 }
 
+// ---------- Falling leaves ----------
+// A handful of leaves spiralling down, recycled in a box that follows the
+// player. They reuse the leaf-card geometry and material, so they cost one
+// extra draw call and no extra shader.
+const FALL_HALF = 9;
+const FALL_TOP = 7.5;
+
+function FallingLeaves() {
+  const quality = useGame((s) => s.graphicsQuality);
+  const q = GRAPHICS_PRESETS[quality] || gfx();
+  const count = Math.max(0, q.fallingLeaves | 0);
+  const ref = useRef();
+
+  const data = useMemo(() => {
+    const rand = mulberry32(8181);
+    const leaves = [];
+    for (let i = 0; i < count; i++) {
+      leaves.push({
+        x: (rand() * 2 - 1) * FALL_HALF,
+        y: rand() * FALL_TOP,
+        z: (rand() * 2 - 1) * FALL_HALF,
+        fall: 0.35 + rand() * 0.45,
+        spin: (rand() - 0.5) * 2.4,
+        phase: rand() * 100,
+        size: 0.18 + rand() * 0.16,
+      });
+    }
+    return { leaves, m: new THREE.Matrix4(), v: new THREE.Vector3(), q: new THREE.Quaternion(),
+             e: new THREE.Euler(), s: new THREE.Vector3() };
+  }, [count]);
+
+  useFrame((state, delta) => {
+    const mesh = ref.current;
+    if (!mesh || count === 0) return;
+    const t = state.clock.elapsedTime;
+    const px = playerTransform.position[0];
+    const py = playerTransform.position[1];
+    const pz = playerTransform.position[2];
+    const d = Math.min(0.1, delta);
+    for (let i = 0; i < data.leaves.length; i++) {
+      const L = data.leaves[i];
+      L.y -= L.fall * d;
+      // A leaf does not drop straight: it slides sideways as it tips over.
+      const swayX = Math.sin(t * 1.3 + L.phase) * 0.5;
+      const swayZ = Math.cos(t * 1.1 + L.phase * 1.7) * 0.5;
+      if (L.y < -0.5) {
+        L.y = FALL_TOP;
+        L.x = (Math.random() * 2 - 1) * FALL_HALF;
+        L.z = (Math.random() * 2 - 1) * FALL_HALF;
+      }
+      // L.x/L.z are offsets within the box, so wrapping keeps a drifting leaf
+      // inside it without ever jumping it across the player's view.
+      const wx = px + wrapHalf(L.x + swayX, FALL_HALF);
+      const wz = pz + wrapHalf(L.z + swayZ, FALL_HALF);
+      data.e.set(t * L.spin, t * L.spin * 0.7 + L.phase, Math.sin(t * 1.7 + L.phase) * 0.9);
+      data.q.setFromEuler(data.e);
+      data.v.set(wx, py + L.y, wz);
+      data.s.set(L.size, L.size, L.size);
+      data.m.compose(data.v, data.q, data.s);
+      mesh.setMatrixAt(i, data.m);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+  });
+
+  if (count === 0) return null;
+  return html`<instancedMesh ref=${ref} args=${[vegGeo('leafCard'), vegMat('leafCard'), count]}
+    castShadow=${false} receiveShadow=${true} frustumCulled=${false} />`;
+}
+
 function World() {
   return html`
     <${Fragment}>
@@ -5942,6 +6335,7 @@ function World() {
       <${Water} />
       <${GrassField} />
       <${DustMotes} />
+      <${FallingLeaves} />
       <${DecorativeFoliage} />
     <//>
   `;
@@ -10096,6 +10490,10 @@ function SettingsPanel() {
         <strong class="set-value">${preset.heightFog > 0 ? 'on' : 'off'}</strong>
       </div>
       <div class="set-row">
+        <span class="set-label">Falling leaves</span>
+        <strong class="set-value">${preset.fallingLeaves > 0 ? preset.fallingLeaves : 'off'}</strong>
+      </div>
+      <div class="set-row">
         <span class="set-label">Dust and pollen</span>
         <strong class="set-value">${preset.dustMotes > 0 ? preset.dustMotes + ' motes' : 'off'}</strong>
       </div>
@@ -11109,6 +11507,10 @@ function PostFX() {
   }, [rig]);
 
   useFrame((state, delta) => {
+    // Console overrides are applied here, at priority 1, because this runs
+    // after every priority-0 callback. Applying them inside any one of those
+    // would just let the next one overwrite them again - which it did.
+    applyWindOverride();
     // Taking a priority above 0 switches off react-three-fiber's own render
     // call - for the whole component, not just for the frames where we do
     // something. So when the chain is off we still have to draw the scene
