@@ -4330,13 +4330,23 @@ function surfaceMeanLuma(name) {
 // scales: a macro layer for the broad colour and a fine layer for the grit under
 // your feet. Both patches no-op if the shader chunks aren't where we expect, so
 // a three.js upgrade degrades to plain tiling rather than breaking.
+// onBeforeCompile hands us the shader with its #include directives still
+// unresolved, so the only thing we can test for is the directive itself. An
+// earlier version also checked that the varying (`vMapUv`) was present, which
+// sounded safer and was in fact the bug: the varying is declared inside
+// <uv_pars_fragment> and does not exist as literal text at this point, so the
+// guard failed every time and the detail blend never once ran. Verified
+// against three r160: map_fragment reads vMapUv, normal_fragment_maps reads
+// vNormalMapUv, and both varyings exist whenever their map is bound.
+const shaderPatchStats = { map: 0, normal: 0, mapFailed: 0, normalFailed: 0 };
+
 function patchMapDetail(shader, macro, detail, mean, strength) {
   const chunk = '#include <map_fragment>';
-  // Bail out unless the chunk AND the varying it reads are both where we expect.
-  // If three ever renames either, we quietly keep the plain single-scale map
-  // instead of generating GLSL that won't compile.
-  if (shader.fragmentShader.indexOf(chunk) === -1) return false;
-  if (shader.vertexShader.indexOf('vMapUv') === -1) return false;
+  if (shader.fragmentShader.indexOf(chunk) === -1) {
+    shaderPatchStats.mapFailed++;
+    return false;
+  }
+  shaderPatchStats.map++;
   shader.uniforms.uMapMacro = { value: macro };
   shader.uniforms.uMapDetail = { value: detail };
   shader.uniforms.uMapMean = { value: mean };
@@ -4355,8 +4365,11 @@ function patchMapDetail(shader, macro, detail, mean, strength) {
 
 function patchNormalDetail(shader, macro, detail, blend) {
   const chunk = '#include <normal_fragment_maps>';
-  if (shader.fragmentShader.indexOf(chunk) === -1) return false;
-  if (shader.vertexShader.indexOf('vNormalMapUv') === -1) return false;
+  if (shader.fragmentShader.indexOf(chunk) === -1) {
+    shaderPatchStats.normalFailed++;
+    return false;
+  }
+  shaderPatchStats.normal++;
   shader.uniforms.uNrmMacro = { value: macro };
   shader.uniforms.uNrmDetail = { value: detail };
   shader.uniforms.uNrmBlend = { value: blend };
@@ -5422,6 +5435,15 @@ function DecorativeFoliage() {
         if (rand() > 0.72) add(buildPalmModel(rand, detail), x, y, z, 0.75 + rand() * 0.5, 3.1);
         else add(buildBushModel(rand, detail, true), x, y, z, s * 1.05, 1.4);
       }
+    }
+    // The harvestable trees and bushes shade you just as much as the decorative
+    // ones - more, in fact, since they cluster around the spawn and the base,
+    // which is exactly where you spend your time. Leaving them out meant the
+    // eye-adaptation code thought you were standing in an open field while you
+    // were under a closed canopy, and the exposure never moved.
+    for (const node of useGame.getState().resourceNodes) {
+      if (node.type === 'wood') canopySplat(node.position[0], node.position[2], 4.6 * 1.1, 1.15);
+      else if (node.type === 'fiber') canopySplat(node.position[0], node.position[2], 1.2 * 1.2, 1.15);
     }
     canopyField.ready = true;
     return out;
@@ -8597,7 +8619,7 @@ function ShopPanel() {
         <p class="npc-name">"${line}"</p>
         <p style=${{ marginBottom: '10px' }}>
           Your meters: <strong style=${{ color: '#ffe27a' }}>${Math.floor(meters)}</strong>
-          &nbsp;&middot;&nbsp;
+           · 
           Your coins: <strong style=${{ color: '#ffd34d' }}>${coins}</strong>
         </p>
         <div class="shop-item">
@@ -9373,9 +9395,9 @@ function MapPanel() {
           <span><i style=${{ background: '#241f2e' }}></i>Cave (silver / gold)</span>
         </div>
         <p class="close-hint">
-          Scroll to zoom, drag to pan &middot; you can still walk around with
+          Scroll to zoom, drag to pan · you can still walk around with
           ${keyLabel(keybinds.moveForward)}${keyLabel(keybinds.moveLeft)}${keyLabel(keybinds.moveBack)}${keyLabel(keybinds.moveRight)}
-          while this is open &middot; ${keyLabel(keybinds.map)} or Esc to close
+          while this is open · ${keyLabel(keybinds.map)} or Esc to close
         </p>
       </div>
     </div>
@@ -9955,17 +9977,17 @@ function StartScreen() {
       </p>
       <button onClick=${() => { start(); }}>Begin Survival</button>
       <div class="controls-list">
-        ${k('moveForward')}${k('moveLeft')}${k('moveBack')}${k('moveRight')} move &middot; Hold the middle mouse button (the wheel) and move the mouse to look around, or use ${k('lookLeft')}${k('lookDown')}${k('lookUp')}${k('lookRight')}
-        &middot; ${k('jump')} jump &middot; ${k('sprint')} sprint (drains energy)
-        &middot; ${k('crouch')} crouch &middot; ${k('gather')} gather / drink &middot; ${k('interact')} talk to Kito / shop / pick up weapon &middot; ${k('craft')} craft at workbench
-        &middot; ${k('build')} build menu &middot; ${k('inventory')} inventory &middot; ${k('cycleHotbar')} cycle hotbar &middot; ${k('camera')} toggle camera &middot; Scroll zoom &middot; Esc close menus
-        &middot; ${k('map')} world map (you keep walking while it's open) &middot; ${k('settings')} settings &middot; ${k('tribe')} tribe panel
-        &middot; Left Click attack (throws spear, swings other weapons) &middot; ${k('poke')} poke with spear
-        &middot; ${k('chat')} chat with your friend (multiplayer)
-        &middot; Every key above can be remapped in ⚙️ Settings → Controls (${k('settings')})
-        &middot; Click the ⚔️ warriors panel (top left) to choose how many warriors fight alongside you
-        &middot; On touch devices: drag the left joystick to move, drag anywhere to look, and use the on-screen buttons (including 💬 for chat)
-        &middot; Click the 🌐 Multiplayer button (top right) to play together with a friend
+        ${k('moveForward')}${k('moveLeft')}${k('moveBack')}${k('moveRight')} move · Hold the middle mouse button (the wheel) and move the mouse to look around, or use ${k('lookLeft')}${k('lookDown')}${k('lookUp')}${k('lookRight')}
+        · ${k('jump')} jump · ${k('sprint')} sprint (drains energy)
+        · ${k('crouch')} crouch · ${k('gather')} gather / drink · ${k('interact')} talk to Kito / shop / pick up weapon · ${k('craft')} craft at workbench
+        · ${k('build')} build menu · ${k('inventory')} inventory · ${k('cycleHotbar')} cycle hotbar · ${k('camera')} toggle camera · Scroll zoom · Esc close menus
+        · ${k('map')} world map (you keep walking while it's open) · ${k('settings')} settings · ${k('tribe')} tribe panel
+        · Left Click attack (throws spear, swings other weapons) · ${k('poke')} poke with spear
+        · ${k('chat')} chat with your friend (multiplayer)
+        · Every key above can be remapped in ⚙️ Settings → Controls (${k('settings')})
+        · Click the ⚔️ warriors panel (top left) to choose how many warriors fight alongside you
+        · On touch devices: drag the left joystick to move, drag anywhere to look, and use the on-screen buttons (including 💬 for chat)
+        · Click the 🌐 Multiplayer button (top right) to play together with a friend
       </div>
     </div>
   `;
@@ -10001,8 +10023,35 @@ class ErrorBoundary extends React.Component {
 // Renderer setup that can't be expressed as Canvas props. Filmic tone mapping
 // is what turns the raw lighting into something that reads as photographic
 // rather than washed out, and it's the single biggest "realism" switch here.
+// A handle for driving the game from a headless browser. The only browser on
+// this machine is Chrome over the DevTools protocol, so anything not reachable
+// from JS simply cannot be checked - including what the renderer is actually
+// doing. Read-only in practice; nothing in the game reads it back.
+if (typeof window !== 'undefined') {
+  window.__jk = {
+    store: useGame,
+    graphics: graphicsSettings,
+    perf: perfStats,
+    preset: gfx,
+    player: playerTransform,
+    canopyCoverAt,
+    shaderPatchStats,
+    gl: null,
+    scene: null,
+    exposure: () => (window.__jk.gl ? window.__jk.gl.toneMappingExposure : null),
+    sky: (t) => {
+      const s = sampleSky(t);
+      return { sunI: s.sunI, ambI: s.ambI, hemiI: s.hemiI, star: s.star, fogN: s.fogN, fogF: s.fogF };
+    },
+  };
+}
+
 function onCanvasCreated(state) {
   const gl = state.gl;
+  if (typeof window !== 'undefined' && window.__jk) {
+    window.__jk.gl = gl;
+    window.__jk.scene = state.scene;
+  }
   gl.toneMapping = THREE.ACESFilmicToneMapping;
   // DayNightSystem drives this every frame from here on (eye adaptation); this
   // is just so the very first frame isn't blown out.
