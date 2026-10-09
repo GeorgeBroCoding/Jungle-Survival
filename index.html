@@ -1246,6 +1246,10 @@ const GRAPHICS_PRESETS = {
     post: false, ssaoSamples: 0, aoStrength: 0, bloomLevels: 1, bloom: 0,
     godRays: false, dof: false, vignette: 0, grain: 0, heightFog: 0, heatHaze: false,
     dustMotes: 0, fallingLeaves: 0,
+    // Water. Refraction needs the post chain's colour buffer, so Low falls
+    // back to a plain transparent surface with depth-tinted colour.
+    waterRefract: false, waterSSR: 0, waterCaustics: false, waterRipples: 0,
+    waterSpray: 0, waterMist: 0,
   },
   medium: {
     label: 'Medium', grassRadius: 20, grassPerCell: 55, foliage: 220,
@@ -1255,6 +1259,8 @@ const GRAPHICS_PRESETS = {
     post: true, ssaoSamples: 8, aoStrength: 0.65, bloomLevels: 3, bloom: 0.28,
     godRays: false, dof: false, vignette: 0.26, grain: 0.012, heightFog: 1, heatHaze: false,
     dustMotes: 140, fallingLeaves: 24,
+    waterRefract: true, waterSSR: 0, waterCaustics: true, waterRipples: 8,
+    waterSpray: 70, waterMist: 60,
   },
   high: {
     label: 'High', grassRadius: 28, grassPerCell: 95, foliage: 300,
@@ -1264,6 +1270,8 @@ const GRAPHICS_PRESETS = {
     post: true, ssaoSamples: 12, aoStrength: 0.75, bloomLevels: 4, bloom: 0.30,
     godRays: true, dof: true, vignette: 0.28, grain: 0.014, heightFog: 1, heatHaze: true,
     dustMotes: 240, fallingLeaves: 40,
+    waterRefract: true, waterSSR: 14, waterCaustics: true, waterRipples: 12,
+    waterSpray: 130, waterMist: 120,
   },
   ultra: {
     label: 'Ultra', grassRadius: 38, grassPerCell: 130, foliage: 380,
@@ -1273,6 +1281,8 @@ const GRAPHICS_PRESETS = {
     post: true, ssaoSamples: 16, aoStrength: 0.8, bloomLevels: 5, bloom: 0.32,
     godRays: true, dof: true, vignette: 0.30, grain: 0.015, heightFog: 1, heatHaze: true,
     dustMotes: 340, fallingLeaves: 60,
+    waterRefract: true, waterSSR: 22, waterCaustics: true, waterRipples: 16,
+    waterSpray: 190, waterMist: 180,
   },
 };
 
@@ -1374,6 +1384,11 @@ const touchInput = {
   lookDX: 0, lookDY: 0, // accumulated look-drag delta (pixels) since last frame
   attack: () => {}, // wired up by Player to throw/swing the equipped weapon
 };
+
+// A development hatch, next to the look-drag one above: nothing in the game
+// reads or writes it, but a headless run needs to stand somewhere specific
+// without walking the whole map at one frame a second. Player drains it.
+const debugWarp = { x: null, z: null };
 
 // ============================================================
 // multiplayer.js - optional 2-player peer-to-peer link via PeerJS
@@ -1805,6 +1820,10 @@ const POND_SURFACE_Y = 0.05;
 const POND_SHORE_Y = -0.05;  // ground at the waterline, just under the surface
 const POND_DEPTH = 2.2;      // below the shore at the centre, tapering to 0 at the rim
 const POND_BLEND_R = 30;     // natural terrain has fully resumed by here
+// The water surface is built this far past the waterline. Where the bank has
+// risen above it the depth test discards it, so the edge of the water is the
+// shape of the ground rather than the rim of a disc.
+const POND_OVERRUN = 3.0;
 
 const BASE_CENTER = [0, 0, 0];
 const PLAYER_SPAWN = [0, 0, 8]; // where you start, and where you respawn after dying
@@ -1922,6 +1941,28 @@ const CAVE_LOCATIONS = [
 ];
 
 // World resource node placement (positions are fixed for now)
+// ---------- The river ----------
+// One river, off the high ground in the north, over a ledge, and down into the
+// pond. Its centreline is a function of z rather than a spline, because
+// getTerrainHeight runs for every blade of grass in the world and the nearest
+// point on a spline is a search where this is two trig calls.
+const RIVER_Z0 = -134;      // source, up in the hills
+const RIVER_Z1 = -56;       // mouth, at the pond's north rim
+const RIVER_HALF = 3.1;     // half-width of the channel floor
+const RIVER_BANK = 7.0;     // the cut has faded back into the hillside by here
+const RIVER_DEPTH = 0.72;   // water over the bed on an ordinary stretch
+const RIVER_FALL_Z = -118;  // the ledge
+const RIVER_FALL_H = 2.6;   // and how far the water drops over it
+const RIVER_STATIONS = 79;
+
+function riverCenterX(z) {
+  const u = z - RIVER_Z1;
+  return 40 + u * 0.26 + 7 * Math.sin(u * 0.075);
+}
+function riverCenterSlope(z) {
+  return 0.26 + 0.525 * Math.cos((z - RIVER_Z1) * 0.075);
+}
+
 function generateResourceNodes() {
   const nodes = [];
   const rand = mulberry32(1337);
@@ -1975,6 +2016,18 @@ function generateResourceNodes() {
     const k = (POND_RADIUS + 2) / (d || 1);
     node.position[0] = POND_CENTER[0] + (d ? dx : 1) * k;
     node.position[2] = POND_CENTER[1] + (d ? dz : 0) * k;
+  }
+  // Same for the river. Push straight out across the channel, which is the
+  // short way to dry land and cannot land the node back in the water.
+  for (const node of nodes) {
+    const z = node.position[2];
+    if (z < RIVER_Z0 - 2 || z > RIVER_Z1 + 2) continue;
+    const d = riverDistance(node.position[0], z);
+    if (d >= RIVER_HALF + 2) continue;
+    const cx = riverCenterX(z);
+    const m = riverCenterSlope(z);
+    const push = (RIVER_HALF + 3) * Math.sqrt(1 + m * m);
+    node.position[0] = node.position[0] >= cx ? cx + push : cx - push;
   }
   return nodes;
 }
@@ -4680,7 +4733,10 @@ function pondDepth(d) {
   return POND_DEPTH * smoothstep(1 - d / POND_RADIUS);
 }
 
-function getTerrainHeight(x, z) {
+// The land before the river cut it. Split out because the river's own profile
+// has to be measured against the ground it is carving, and a function cannot
+// ask itself what it would have been.
+function baseTerrainHeight(x, z) {
   let h = 0;
   for (const hill of TERRAIN_HILLS) {
     const dx = x - hill.x;
@@ -4695,6 +4751,112 @@ function getTerrainHeight(x, z) {
     h -= pondDepth(pd);
   }
   return h;
+}
+
+// Water does not run uphill, and a cut must never raise the ground it cuts. The
+// profile is therefore built once, against the untouched land, and checked
+// against both of those rules - see test_world.
+function buildRiverProfile() {
+  const n = RIVER_STATIONS;
+  const nat = new Float32Array(n);
+  const surf = new Float32Array(n);
+  const bed = new Float32Array(n);
+  const zs = new Float32Array(n);
+  const rim = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const z = RIVER_Z0 + (RIVER_Z1 - RIVER_Z0) * (i / (n - 1));
+    zs[i] = z;
+    const cx = riverCenterX(z);
+    nat[i] = baseTerrainHeight(cx, z);
+    // What actually has to hold the water in is the rim of the cut, not the
+    // ground on the centreline. A river crossing a hillside has one bank a
+    // metre lower than the other, and sitting the surface at centreline height
+    // pours it straight down the slope.
+    const norm = 1 / Math.sqrt(1 + riverCenterSlope(z) * riverCenterSlope(z));
+    let lowest = Infinity;
+    for (let k = 0; k < 6; k++) {
+      const off = (RIVER_BANK + (k % 3) * 1.5) * (k < 3 ? 1 : -1);
+      lowest = Math.min(lowest, baseTerrainHeight(cx + off / norm, z));
+    }
+    rim[i] = lowest;
+  }
+  const fallI = Math.max(1, Math.min(n - 2, Math.round(
+    ((RIVER_FALL_Z - RIVER_Z0) / (RIVER_Z1 - RIVER_Z0)) * (n - 1))));
+  // Above the ledge the river hugs the hillside it is running down. Below it,
+  // everything the drop bought is spent on a long gentle run into the pond.
+  // The surface hugs the lip of its own banks all the way down, except at the
+  // ledge, where it is pushed a whole drop lower in one station. Below the fall
+  // it carries on descending, so the ravine the fall cuts fills itself back in
+  // as the hillside catches up - which is how a river below a waterfall looks.
+  for (let i = 0; i < n; i++) {
+    let y = rim[i] - 0.12;
+    if (i > 0) y = Math.min(y, surf[i - 1] - (i === fallI + 1 ? RIVER_FALL_H : 0));
+    // Never below the pond it is running into.
+    surf[i] = Math.max(POND_SURFACE_Y, y);
+  }
+  for (let i = 0; i < n; i++) {
+    // A plunge pool under the fall, filling back in downstream.
+    const below = i - fallI;
+    const plunge = below > 0 ? 0.95 * Math.exp(-below * 0.22) : 0;
+    bed[i] = Math.min(surf[i] - RIVER_DEPTH - plunge, nat[i] - 0.05);
+  }
+  return { n, zs, nat, rim, surf, bed, fallI, fallZ: zs[fallI], fallTop: surf[fallI],
+           fallBottom: surf[Math.min(n - 1, fallI + 1)] };
+}
+const RIVER = buildRiverProfile();
+
+// Station lookup. Linear in z, so it is an index and a lerp.
+function riverStation(z) {
+  const t = (z - RIVER_Z0) / (RIVER_Z1 - RIVER_Z0) * (RIVER.n - 1);
+  const i = Math.max(0, Math.min(RIVER.n - 2, Math.floor(t)));
+  return { i: i, f: Math.max(0, Math.min(1, t - i)) };
+}
+function riverSurfaceY(z) {
+  if (z <= RIVER_Z0) return RIVER.surf[0];
+  if (z >= RIVER_Z1) return RIVER.surf[RIVER.n - 1];
+  const st = riverStation(z);
+  // The ledge is a step, so the two stations either side of it must not be
+  // blended - that would turn the waterfall into a ramp.
+  if (st.i === RIVER.fallI) return st.f < 0.5 ? RIVER.surf[st.i] : RIVER.surf[st.i + 1];
+  return RIVER.surf[st.i] + (RIVER.surf[st.i + 1] - RIVER.surf[st.i]) * st.f;
+}
+function riverBedY(z) {
+  if (z <= RIVER_Z0) return RIVER.bed[0];
+  if (z >= RIVER_Z1) return RIVER.bed[RIVER.n - 1];
+  const st = riverStation(z);
+  return RIVER.bed[st.i] + (RIVER.bed[st.i + 1] - RIVER.bed[st.i]) * st.f;
+}
+
+// Perpendicular distance to the centreline, in metres. The division by the
+// slope is what turns "how far across in x" into a real distance where the
+// river is running diagonally.
+function riverDistance(x, z) {
+  if (z < RIVER_Z0 - RIVER_BANK || z > RIVER_Z1 + RIVER_BANK) return 1e9;
+  const m = riverCenterSlope(z);
+  return Math.abs(x - riverCenterX(z)) / Math.sqrt(1 + m * m);
+}
+
+// The height of whatever water covers this point, or -Infinity where there is
+// none. One place for "is there water here", so the spray, the ripples and the
+// wading check cannot drift apart.
+function waterSurfaceAt(x, z) {
+  const pd = Math.hypot(x - POND_CENTER[0], z - POND_CENTER[1]);
+  if (pd < POND_RADIUS + POND_OVERRUN) return POND_SURFACE_Y;
+  if (z >= RIVER_Z0 && z <= RIVER_Z1 && riverDistance(x, z) < RIVER_HALF + RIVER_OVERRUN) {
+    return riverSurfaceY(z);
+  }
+  return -Infinity;
+}
+
+function getTerrainHeight(x, z) {
+  const h = baseTerrainHeight(x, z);
+  const d = riverDistance(x, z);
+  if (d >= RIVER_BANK) return h;
+  // Flat floor out to RIVER_HALF, then banks easing back into the hillside.
+  const t = Math.max(0, (d - RIVER_HALF) / (RIVER_BANK - RIVER_HALF));
+  const w = smoothstep(1 - t);
+  // Only ever downward: the channel is cut out of the land, never built on it.
+  return Math.min(h, h * (1 - w) + riverBedY(z) * w);
 }
 
 // ---------- Biomes ----------
@@ -4911,132 +5073,806 @@ function Ground() {
   return html`<mesh geometry=${geo} material=${mat} receiveShadow=${true} />`;
 }
 
-// ---------- Water (pond) ----------
-// Alpha ring that fades the shoreline into foam. RingGeometry's UVs are a
-// centred square, so a radial gradient lines up with the rim.
-let _foamTex = null;
-function foamTexture() {
-  if (!_foamTex) {
-    const size = 256;
-    const cv = makeCanvas(size);
-    const ctx = cv.getContext('2d');
-    ctx.clearRect(0, 0, size, size);
-    const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
-    g.addColorStop(0.00, 'rgba(255,255,255,0)');
-    g.addColorStop(0.80, 'rgba(255,255,255,0)');
-    g.addColorStop(0.93, 'rgba(255,255,255,0.85)');
-    g.addColorStop(1.00, 'rgba(255,255,255,0)');
-    ctx.fillStyle = g;
-    ctx.fillRect(0, 0, size, size);
-    // Break the ring up so it reads as froth rather than a drawn circle.
-    const rand = mulberry32(6060);
-    ctx.globalCompositeOperation = 'destination-out';
-    for (let i = 0; i < 420; i++) {
-      const a = rand() * Math.PI * 2;
-      const r = size * (0.40 + rand() * 0.10);
-      ctx.beginPath();
-      ctx.arc(size / 2 + Math.cos(a) * r, size / 2 + Math.sin(a) * r, size * (0.004 + rand() * 0.016), 0, Math.PI * 2);
-      ctx.fillStyle = `rgba(0,0,0,${0.3 + rand() * 0.7})`;
-      ctx.fill();
-    }
-    ctx.globalCompositeOperation = 'source-over';
-    _foamTex = texFrom(cv, [1, 1], false);
+// ---------- Water ----------
+// Water is drawn in a pass of its own, after the opaque scene, out of its own
+// little scene graph. That is what buys refraction: by the time the water runs,
+// the colour and depth of everything behind it has already been written, so the
+// shader can bend the view through the surface and tint it by how much water
+// the sightline crosses. It also means the surface can be opaque and write
+// depth, so fog, depth of field and the god rays treat it as a real surface
+// instead of something they have to guess about.
+//
+// On Low there is no post chain and therefore no colour buffer to refract, so
+// the same shader falls back to a plain transparent surface whose colour and
+// alpha still come from the depth of water underneath. Scaled down, not
+// dropped.
+const JK_RIPPLE_SLOTS = 16;
+const JK_RIPPLE_LIFE = 2.6;
+const waterRuntime = {
+  scene: null,
+  uniforms: null,
+  ripples: [],
+  rippleIdx: 0,
+  override: null,
+  // Filled in by PostFX once per frame, just before the water pass.
+  refractTex: null,
+  depthTex: null,
+  // Live counts, for the debug handle.
+  // Driven by the weather system when there is one; until then the rain
+  // ripple source is simply switched off.
+  rain: 0,
+  stats: { ripples: 0, surfaces: 0, spray: 0 },
+};
+
+// A ripple is (x, z, age, strength). Strength <= 0 means the slot is free.
+function resetRipples() {
+  waterRuntime.ripples = [];
+  for (let i = 0; i < JK_RIPPLE_SLOTS; i++) {
+    waterRuntime.ripples.push(new THREE.Vector4(0, 0, 0, 0));
   }
-  return _foamTex;
+  waterRuntime.rippleIdx = 0;
+}
+resetRipples();
+
+// Oldest-first replacement: the ring always gives up the slot that has the
+// least life left, so a burst of splashes never wipes out a ripple that is
+// still clearly visible.
+function spawnRipple(x, z, strength) {
+  const r = waterRuntime.ripples;
+  let slot = -1, worst = -1;
+  for (let i = 0; i < r.length; i++) {
+    if (r[i].w <= 0) { slot = i; break; }
+    if (r[i].z > worst) { worst = r[i].z; slot = i; }
+  }
+  if (slot < 0) return;
+  r[slot].set(x, z, 0, strength);
+}
+
+function updateRipples(delta) {
+  const r = waterRuntime.ripples;
+  let live = 0;
+  for (let i = 0; i < r.length; i++) {
+    if (r[i].w <= 0) continue;
+    r[i].z += delta;
+    if (r[i].z > JK_RIPPLE_LIFE) r[i].w = 0;
+    else live++;
+  }
+  waterRuntime.stats.ripples = live;
+}
+
+// Seamless froth. Two scales of fbm, contrast-stretched so it breaks into
+// clumps rather than reading as grey cloud.
+let _foamNoise = null;
+function foamNoise() {
+  if (!_foamNoise) {
+    const size = 256;
+    const a = fbm(size, 5, 5, 4, 7717);
+    const b = fbm(size, 13, 13, 3, 2281);
+    const h = new Float32Array(size * size);
+    for (let i = 0; i < h.length; i++) {
+      const v = a[i] * 0.65 + b[i] * 0.35;
+      h[i] = Math.max(0, Math.min(1, (v - 0.42) * 2.6));
+    }
+    _foamNoise = texFrom(greyCanvasFromField(h, size, 0, 1), [1, 1], false);
+  }
+  return _foamNoise;
+}
+
+// The swell, and the rings that spread from anything that disturbs the water.
+// Both the height and its slope are closed form, so the fragment shader can ask
+// for the normal directly instead of sampling the height three times.
+const WATER_WAVE_GLSL = `
+  uniform float uTime;
+  uniform vec4 uRipples[${JK_RIPPLE_SLOTS}];
+  uniform float uRippleLife;
+  uniform float uSwell;
+
+  float jkWaveH(vec2 p, float t) {
+    return ( sin(p.x * 0.42 + t * 1.25) * 0.035
+           + sin(p.y * 0.33 - t * 0.95) * 0.030
+           + sin((p.x + p.y) * 0.60 + t * 1.90) * 0.015 ) * uSwell;
+  }
+
+  vec2 jkWaveSlope(vec2 p, float t) {
+    float c = cos((p.x + p.y) * 0.60 + t * 1.90) * 0.015 * 0.60;
+    return vec2(
+      cos(p.x * 0.42 + t * 1.25) * 0.035 * 0.42 + c,
+      cos(p.y * 0.33 - t * 0.95) * 0.030 * 0.33 + c
+    ) * uSwell;
+  }
+
+  // One expanding ring per live ripple. The ring travels outward at
+  // JK_RIPPLE_SPEED and fades with age; the gaussian band is what keeps it a
+  // ring instead of filling in the middle.
+  float jkRippleH(vec2 p, float t) {
+    float h = 0.0;
+    for (int i = 0; i < ${JK_RIPPLE_SLOTS}; i++) {
+      vec4 r = uRipples[i];
+      if (r.w <= 0.0) continue;
+      float rad = r.z * 1.7;
+      float e = (distance(p, r.xy) - rad) * 2.2;
+      float fade = max(0.0, 1.0 - r.z / uRippleLife);
+      h += sin(e * 4.0) * exp(-e * e) * fade * r.w;
+    }
+    return h;
+  }
+
+  vec2 jkRippleSlope(vec2 p, float t) {
+    vec2 g = vec2(0.0);
+    for (int i = 0; i < ${JK_RIPPLE_SLOTS}; i++) {
+      vec4 r = uRipples[i];
+      if (r.w <= 0.0) continue;
+      vec2 dv = p - r.xy;
+      float d = length(dv) + 1e-4;
+      float e = (d - r.z * 1.7) * 2.2;
+      float band = exp(-e * e);
+      float fade = max(0.0, 1.0 - r.z / uRippleLife);
+      // d/dd of sin(4e) * exp(-e*e), with de/dd = 2.2
+      float dh = (8.8 * cos(e * 4.0) - 4.4 * e * sin(e * 4.0)) * band * fade * r.w;
+      g += (dv / d) * dh;
+    }
+    return g;
+  }
+`;
+
+const WATER_VERT = `
+  attribute float aDepth;   // metres of water under this vertex, from the terrain
+  attribute vec2 aFlow;     // world-space flow direction; length is speed in m/s
+
+  varying vec3 vWorld;
+  varying float vGeoDepth;
+  varying vec2 vFlow;
+
+  ${WATER_WAVE_GLSL}
+
+  #include <fog_pars_vertex>
+
+  void main() {
+    vGeoDepth = aDepth;
+    vFlow = aFlow;
+    vec4 wp = modelMatrix * vec4(position, 1.0);
+    // Swell fades out in the shallows. A wave cannot be taller than the water
+    // it is in, and without this the surface saws up through the shoreline.
+    float room = clamp(aDepth * 2.5, 0.0, 1.0);
+    wp.y += jkWaveH(wp.xz, uTime) * room + jkRippleH(wp.xz, uTime) * room;
+    vWorld = wp.xyz;
+    vec4 mvPosition = viewMatrix * wp;
+    gl_Position = projectionMatrix * mvPosition;
+    #include <fog_vertex>
+  }
+`;
+
+// Built lazily: it splices in DEPTH_GLSL and ATMO_GLSL, which are declared
+// further down the file, so evaluating this at module scope would hit the
+// temporal dead zone.
+function waterFrag() {
+  return `
+  uniform vec2 uResolution;
+  uniform vec3 uCamPos;
+  uniform vec3 uSunDir;
+  uniform float uSkyGain;
+  uniform float uTurbidity;
+  uniform float uRayleigh;
+  uniform float uMieC;
+  uniform float uMieG;
+  uniform sampler2D tNormal;
+  uniform sampler2D tFoam;
+  uniform vec3 uAbsorb;      // per-channel extinction, 1/metre
+  uniform vec3 uScatter;     // what the water itself glows back at you
+  uniform float uNormalScale;
+  uniform float uRefract;
+  uniform float uFoamWidth;
+  uniform float uFoamAmount;
+  uniform float uMaxDepth;
+  uniform float uOpacity;
+  uniform vec3 uSunColor;
+  uniform float uCaustic;
+
+  #ifdef JK_REFRACT
+    uniform sampler2D tRefract;
+  #endif
+
+  varying vec3 vWorld;
+  varying float vGeoDepth;
+  varying vec2 vFlow;
+
+  ${WATER_WAVE_GLSL}
+  ${ATMO_GLSL}
+
+  #ifdef JK_DEPTHTEX
+    // Linear metres from the eye, written out by a copy pass. It cannot be the
+    // scene's own depth attachment: that is bound for depth testing while the
+    // water draws, and sampling it at the same time is a feedback loop.
+    uniform sampler2D tSceneDepth;
+    uniform float uNear;
+    uniform float uFar;
+    float jkEyeDist(float d) {
+      float ndc = d * 2.0 - 1.0;
+      return (2.0 * uNear * uFar) / (uFar + uNear - ndc * (uFar - uNear));
+    }
+  #endif
+
+  #include <fog_pars_fragment>
+
+  #ifdef JK_CAUSTICS
+  // The bright web on the bottom of a pool: sunlight focused by the lens the
+  // rippling surface makes. Three rounds of domain warping fold a pair of sine
+  // waves into a cellular net, and the sharp power turns its zero crossings
+  // into the thin bright lines.
+  float jkCaustic(vec2 p, float t) {
+    vec2 q = p * 3.4;
+    float v = 0.0;
+    for (int i = 0; i < 3; i++) {
+      q += vec2(sin(q.y * 1.7 + t * 0.6), cos(q.x * 1.5 - t * 0.5)) * 0.35;
+      v += sin(q.x * 2.1 + t * 0.9) * sin(q.y * 1.9 - t * 0.7);
+    }
+    return pow(max(0.0, 1.0 - abs(v / 3.0)), 9.0);
+  }
+  #endif
+
+  // Flow-mapped detail. Scrolling one sample along the flow stretches the
+  // texture without bound, so two copies run half a cycle apart and cross-fade;
+  // neither ever travels more than half a period before it is replaced.
+  vec2 jkDetailSlope(vec2 p, float speed) {
+    vec2 dir = speed > 0.001 ? vFlow / speed : vec2(0.0, 0.0);
+    float p0 = fract(uTime * max(speed, 0.35) * 0.35);
+    float p1 = fract(p0 + 0.5);
+    vec2 base = p * 0.85;
+    vec3 n0 = texture2D(tNormal, base - dir * p0 * 0.6 + vec2(uTime * 0.012, uTime * 0.008)).xyz;
+    vec3 n1 = texture2D(tNormal, base * 2.3 - dir * p1 * 0.6 - vec2(uTime * 0.009, uTime * 0.015)).xyz;
+    vec2 s0 = n0.xy * 2.0 - 1.0;
+    vec2 s1 = n1.xy * 2.0 - 1.0;
+    float w = abs(0.5 - p0) * 2.0;
+    return mix(s0, s1, w) * uNormalScale;
+  }
+
+  void main() {
+    vec2 suv = gl_FragCoord.xy / uResolution;
+    vec3 V = normalize(uCamPos - vWorld);
+    float speed = length(vFlow);
+
+    vec2 slope = jkWaveSlope(vWorld.xz, uTime)
+               + jkRippleSlope(vWorld.xz, uTime)
+               + jkDetailSlope(vWorld.xz, speed);
+    vec3 N = normalize(vec3(-slope.x, 1.0, -slope.y));
+    // Seen from underneath - the camera is in the pond - the surface faces the
+    // other way, or the Fresnel term reads inside out.
+    if (!gl_FrontFacing) N = -N;
+
+    // How much water the sightline crosses before it hits anything. The
+    // vertical distance to the terrain is the fallback; where the depth buffer
+    // is available it is exact, and it also picks up rocks, legs and anything
+    // else standing in the water.
+    float thick = vGeoDepth;
+    #ifdef JK_DEPTHTEX
+      float surfZ = jkEyeDist(gl_FragCoord.z);
+      float sceneZ = texture2D(tSceneDepth, suv).r;
+      thick = max(0.0, sceneZ - surfZ);
+    #endif
+    // The water column this sightline would cross if nothing were standing in
+    // it: the vertical depth, stretched by how flat the view is.
+    float column = min(vGeoDepth / max(0.18, abs(V.y)), uMaxDepth);
+    // Colour comes from the body of water, which is there whether or not a rock
+    // or a pair of legs happens to be in the way. The measured thickness is
+    // only used to soften where things poke through - taking the colour from it
+    // as well means anything in the shallows bleaches the river around it.
+    float tClamped = min(uMaxDepth, max(thick, column * 0.6));
+
+    // What is behind the surface, bent by the slope of it.
+    vec3 behind = uScatter;
+    #ifdef JK_REFRACT
+      vec2 off = N.xz * uRefract * min(1.0, thick * 0.8);
+      vec2 ruv = clamp(suv + off, vec2(0.002), vec2(0.998));
+      // If the bent sightline lands on something in FRONT of the water, that
+      // pixel is not behind the surface at all - bleeding it in smears the
+      // shoreline and anything wading. Fall back to the straight line.
+      if (texture2D(tSceneDepth, ruv).r < surfZ) ruv = suv;
+      behind = texture2D(tRefract, ruv).rgb;
+    #endif
+
+    #ifdef JK_CAUSTICS
+      // Where this sightline lands is where the web is painted, so the pattern
+      // sits on the bottom rather than on the surface.
+      vec3 floorPos = vWorld - V * tClamped;
+      float sunUp = clamp(uSunDir.y * 2.5, 0.0, 1.0);
+      // Extra light landing on the bottom, so it is modulated by what the
+      // bottom is. Added as white it paints a glowing maze over everything
+      // instead of lighting the silt.
+      // They need some water to be focused by, and they are gone again by the
+      // time there is enough of it to scatter the light on the way down.
+      float caus = jkCaustic(floorPos.xz, uTime) * uCaustic * sunUp
+                 * smoothstep(0.03, 0.4, tClamped) * (1.0 - smoothstep(1.0, 3.5, tClamped));
+      behind += behind * uSunColor * caus;
+    #endif
+
+    // Beer-Lambert. Red goes first, which is the whole reason deep water is
+    // blue-green and a hand held just under the surface is not.
+    vec3 absorb = exp(-uAbsorb * tClamped);
+    vec3 through = behind * absorb + uScatter * (1.0 - absorb);
+
+    // Reflection off the same analytic sky the dome is drawn from, so the water
+    // and the sky can never disagree. The sun disc is left in: broken up by the
+    // ripples it becomes the glitter path.
+    vec3 R = reflect(-V, N);
+    R.y = abs(R.y) + 0.001;
+    vec3 sky = atmoSky(R, uSunDir, uTurbidity, uRayleigh, uMieC, uMieG, 1.0) * uSkyGain;
+
+    // Schlick, F0 = 0.02 for water. At a grazing angle the surface is a mirror;
+    // looking straight down it is a window.
+    float fres = 0.02 + 0.98 * pow(clamp(1.0 - max(dot(N, V), 0.0), 0.0, 1.0), 5.0);
+    vec3 col = mix(through, sky, fres);
+
+    // Froth: at the waterline, over anything shallow, and wherever the flow is
+    // fast enough to break.
+    // Froth is sampled in the river's own frame - stretched four to one along
+    // the current and travelling with it - so broken water reads as streaks
+    // being carried downstream rather than as blobs sitting on the surface.
+    vec2 fdir = speed > 0.001 ? vFlow / speed : vec2(0.8, 0.6);
+    vec2 fperp = vec2(-fdir.y, fdir.x);
+    float froth = texture2D(tFoam, vec2(
+      dot(vWorld.xz, fdir) * 0.10 - uTime * max(speed, 0.25) * 0.24,
+      dot(vWorld.xz, fperp) * 0.40 + uTime * 0.012)).r;
+    // The band is measured straight down, not along the sightline: a waterline
+    // is a fixed width of ground, and measuring it along the view ray smeared
+    // it across half the pond as soon as you looked across the water.
+    // A band just inside the waterline, not a disc centred on it: at zero depth
+    // the surface has already faded out, so foam painted there fades with it.
+    float shore = smoothstep(0.0, 0.05, vGeoDepth)
+                * (1.0 - smoothstep(uFoamWidth * 0.2, uFoamWidth, vGeoDepth));
+    float white = smoothstep(0.45, 0.95, shore * (0.45 + froth * 0.95));
+    // Broken water wherever the current is quick enough to tear - which on a
+    // shallow stony river is most of it, not just the fastest chute.
+    white += smoothstep(0.35, 1.5, speed) * smoothstep(0.3, 0.8, froth) * 0.85;
+    col = mix(col, vec3(1.0, 1.02, 1.04), clamp(white, 0.0, 1.0) * uFoamAmount);
+
+    float alpha = uOpacity;
+    #ifdef JK_REFRACT
+      // The surface runs past the shoreline on purpose. Where the ground is
+      // above it the depth test throws it away; over the last shallow margin
+      // this fades it out, so the waterline follows the actual bank instead of
+      // being the rim of a drawn disc.
+      if (thick < 0.004 || vGeoDepth < 0.002) discard;
+      // Opaque, with the edge handled by fading back to exactly what is behind
+      // it - the same thing an alpha fade would do, without giving up the depth
+      // write that fog and depth of field need. Both measures matter: the
+      // sightline one softens where the water meets anything standing in it,
+      // the vertical one softens the waterline itself, which is otherwise a
+      // geometric clip and reads as a cut.
+      col = mix(behind, col, smoothstep(0.0, 0.22, thick) * smoothstep(0.0, 0.07, vGeoDepth));
+      alpha = 1.0;
+    #else
+      alpha = mix(0.35, uOpacity, smoothstep(0.0, 1.1, thick))
+            * smoothstep(0.0, 0.22, thick) * smoothstep(0.0, 0.07, vGeoDepth);
+      alpha = max(alpha, clamp(white, 0.0, 1.0) * uFoamAmount * smoothstep(0.02, 0.2, vGeoDepth));
+    #endif
+
+    gl_FragColor = vec4(col, alpha);
+    #include <tonemapping_fragment>
+    #include <colorspace_fragment>
+    #include <fog_fragment>
+  }
+`;
+}
+
+// A water surface knows how deep it is everywhere, because the terrain under it
+// is a function we can just evaluate. That depth rides along as a vertex
+// attribute, which is what lets Low - with no depth buffer to read - still
+// colour the shallows differently from the middle.
+function attachWaterDepth(geo, originX, originZ, surfaceY, flowFn) {
+  const pos = geo.attributes.position;
+  const depth = new Float32Array(pos.count);
+  const flow = new Float32Array(pos.count * 2);
+  for (let i = 0; i < pos.count; i++) {
+    const x = originX + pos.getX(i);
+    const z = originZ + pos.getZ(i);
+    depth[i] = Math.max(0, surfaceY - getTerrainHeight(x, z));
+    if (flowFn) {
+      const f = flowFn(x, z);
+      flow[i * 2] = f[0];
+      flow[i * 2 + 1] = f[1];
+    }
+  }
+  geo.setAttribute('aDepth', new THREE.BufferAttribute(depth, 1));
+  geo.setAttribute('aFlow', new THREE.BufferAttribute(flow, 2));
+  return geo;
+}
+
+function makeWaterMaterial(q) {
+  const [nA] = waterNormals();
+  const refracting = !!(q.waterRefract && q.post);
+  const defines = {};
+  if (q.post) defines.JK_DEPTHTEX = '';
+  if (refracting) defines.JK_REFRACT = '';
+  // Caustics need to know where the sightline hits the bottom, which is the
+  // depth buffer's job. Without it there is nowhere to paint them.
+  if (q.waterCaustics && q.post) defines.JK_CAUSTICS = '';
+  const u = {
+    uTime: { value: 0 },
+    uRipples: { value: waterRuntime.ripples },
+    uRippleLife: { value: JK_RIPPLE_LIFE },
+    uSwell: { value: 1 },
+    uResolution: { value: new THREE.Vector2(1, 1) },
+    uCamPos: { value: new THREE.Vector3() },
+    uSunDir: { value: new THREE.Vector3(0, 1, 0) },
+    uSkyGain: { value: ATMO.gain },
+    uTurbidity: { value: ATMO.turbidity },
+    uRayleigh: { value: ATMO.rayleigh },
+    uMieC: { value: ATMO.mieCoefficient },
+    uMieG: { value: ATMO.mieDirectionalG },
+    tNormal: { value: nA },
+    tFoam: { value: foamNoise() },
+    // Roughly the extinction of clear fresh water over a few metres, pushed
+    // green because a jungle pool is full of algae.
+    uAbsorb: { value: new THREE.Vector3(0.62, 0.21, 0.26) },
+    uScatter: { value: new THREE.Color('#1d4a4a') },
+    uNormalScale: { value: 0.5 },
+    uRefract: { value: 0.06 },
+    uFoamWidth: { value: 0.30 },
+    uFoamAmount: { value: 0.8 },
+    uMaxDepth: { value: 6 },
+    uOpacity: { value: 0.92 },
+    uSunColor: { value: new THREE.Color('#ffffff') },
+    uCaustic: { value: 0.55 },
+    tRefract: { value: null },
+    tSceneDepth: { value: null },
+    uNear: { value: 0.1 },
+    uFar: { value: 500 },
+  };
+  const m = new THREE.ShaderMaterial({
+    uniforms: THREE.UniformsUtils.clone(THREE.UniformsLib.fog),
+    vertexShader: WATER_VERT,
+    fragmentShader: waterFrag(),
+    defines: defines,
+    fog: true,
+    // Refracting water does its own blending in the shader, so it can be
+    // opaque and write depth - which is what lets fog, depth of field and the
+    // god rays treat it as the surface it is.
+    transparent: !refracting,
+    depthWrite: true,
+    side: THREE.DoubleSide,
+  });
+  // Added alongside the cloned fog uniforms, not in place of them: the renderer
+  // refreshes fogColor/fogNear/fogFar through those exact objects.
+  for (const k in u) m.uniforms[k] = u[k];
+  waterRuntime.uniforms = m.uniforms;
+  return m;
+}
+
+// The river's surface: a ribbon swept along the centreline, one row of vertices
+// per station. Like the pond it is built wider than its channel, so the bank
+// cuts the waterline rather than the geometry doing it.
+const RIVER_OVERRUN = 2.4;
+const RIVER_CROSS = 7;
+
+function buildRiverSurface() {
+  const n = RIVER.n;
+  const cols = RIVER_CROSS;
+  const half = RIVER_HALF + RIVER_OVERRUN;
+  const pos = [], depth = [], flow = [], uv = [], idx = [];
+  for (let i = 0; i < n; i++) {
+    const z = RIVER.zs[i];
+    const cx = riverCenterX(z);
+    const m = riverCenterSlope(z);
+    const norm = 1 / Math.sqrt(1 + m * m);
+    // Downstream is +z, so the tangent in world xz is (slope, 1) normalised.
+    const tx = m * norm, tz = norm;
+    // Grade drives how fast it looks: a slack stretch barely moves, the run up
+    // to the ledge races.
+    const j = Math.min(n - 1, i + 1);
+    const dz = Math.max(0.01, RIVER.zs[j] - RIVER.zs[i]);
+    const grade = i === RIVER.fallI ? 0.2 : Math.max(0, (RIVER.surf[i] - RIVER.surf[j]) / dz);
+    const speed = Math.min(2.6, 0.75 + grade * 16);
+    const y = RIVER.surf[i];
+    for (let c = 0; c < cols; c++) {
+      const t = c / (cols - 1) * 2 - 1;        // -1..1 across
+      const off = t * half;
+      const x = cx + off / norm;
+      pos.push(x, y, z);
+      depth.push(Math.max(0, y - getTerrainHeight(x, z)));
+      flow.push(tx * speed, tz * speed);
+      uv.push((t + 1) * 0.5, i / (n - 1));
+    }
+  }
+  for (let i = 0; i < n - 1; i++) {
+    // No quad across the ledge: that span is the waterfall, and stretching the
+    // surface over it would turn the drop into a ramp.
+    if (i === RIVER.fallI) continue;
+    for (let c = 0; c < cols - 1; c++) {
+      const a = i * cols + c, b = a + 1, d = a + cols, e = d + 1;
+      idx.push(a, d, b, b, d, e);
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setIndex(idx);
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setAttribute('aDepth', new THREE.Float32BufferAttribute(depth, 1));
+  g.setAttribute('aFlow', new THREE.Float32BufferAttribute(flow, 2));
+  g.computeVertexNormals();
+  return g;
+}
+
+// The sheet itself. Hung from the lip, leaning out a little, and widening as it
+// falls - water thrown off a ledge spreads.
+function buildWaterfallSheet() {
+  const i = RIVER.fallI;
+  const zTop = RIVER.zs[i];
+  const zBot = RIVER.zs[Math.min(RIVER.n - 1, i + 1)];
+  const yTop = RIVER.surf[i];
+  const yBot = RIVER.surf[Math.min(RIVER.n - 1, i + 1)] - 0.1;
+  const rows = 8, cols = 5;
+  const pos = [], uv = [], idx = [];
+  for (let r = 0; r < rows; r++) {
+    const v = r / (rows - 1);              // 0 at the lip, 1 at the base
+    // Falling water accelerates, so it covers the last of the drop in much less
+    // horizontal distance than the first.
+    const fall = v * v * 0.75 + v * 0.25;
+    const y = yTop + (yBot - yTop) * fall;
+    const z = zTop + (zBot - zTop) * (0.25 + v * 0.75);
+    const cx = riverCenterX(z);
+    const m = riverCenterSlope(z);
+    const norm = 1 / Math.sqrt(1 + m * m);
+    const half = RIVER_HALF * (0.86 + v * 0.3);
+    for (let c = 0; c < cols; c++) {
+      const t = c / (cols - 1) * 2 - 1;
+      pos.push(cx + t * half / norm, y, z);
+      uv.push((t + 1) * 0.5, v);
+    }
+  }
+  for (let r = 0; r < rows - 1; r++) {
+    for (let c = 0; c < cols - 1; c++) {
+      const a = r * cols + c, b = a + 1, d = a + cols, e = d + 1;
+      idx.push(a, d, b, b, d, e);
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setIndex(idx);
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.computeVertexNormals();
+  return g;
+}
+
+const WATERFALL_VERT = `
+  varying vec2 vUv;
+  #include <fog_pars_vertex>
+  void main() {
+    vUv = uv;
+    vec4 mvPosition = viewMatrix * modelMatrix * vec4(position, 1.0);
+    gl_Position = projectionMatrix * mvPosition;
+    #include <fog_vertex>
+  }
+`;
+
+// Falling water is mostly air. There is no point refracting through it or
+// reflecting a sky off it: what you actually see is streaks of aeration, solid
+// at the lip and shredding into spray by the time they reach the bottom.
+const WATERFALL_FRAG = `
+  uniform float uTime;
+  uniform sampler2D tFoam;
+  uniform vec3 uTint;
+  uniform float uOpacity;
+  varying vec2 vUv;
+  #include <fog_pars_fragment>
+  void main() {
+    float a = texture2D(tFoam, vec2(vUv.x * 2.0, vUv.y * 0.55 - uTime * 0.85)).r;
+    float b = texture2D(tFoam, vec2(vUv.x * 3.7 + 0.37, vUv.y * 0.95 - uTime * 1.4)).r;
+    float f = a * 0.65 + b * 0.6;
+    // Solid sheet at the lip, broken spray at the foot.
+    float shred = smoothstep(0.15, 1.0, vUv.y);
+    float m = mix(0.62 + f * 0.75, f * 1.5 - 0.1, shred);
+    // Thinner at the edges, where the sheet is tearing off the rock.
+    float edge = smoothstep(0.0, 0.14, vUv.x) * smoothstep(0.0, 0.14, 1.0 - vUv.x);
+    // Thin out into the spray at the foot instead of ending on a straight line.
+    edge *= 1.0 - smoothstep(0.78, 1.0, vUv.y) * (0.55 + f * 0.45);
+    float alpha = clamp(m, 0.0, 1.0) * edge * uOpacity;
+    gl_FragColor = vec4(uTint * (0.7 + f * 0.7), alpha);
+    #include <tonemapping_fragment>
+    #include <colorspace_fragment>
+    #include <fog_fragment>
+  }
+`;
+
+// A rainbow is sunlight refracted back out of the mist at 42 degrees from the
+// line opposite the sun, so it only exists when the sun is behind you and low
+// enough to put that cone above the ground. Drawn as a billboard arc that fades
+// out the moment either stops being true.
+const RAINBOW_FRAG = `
+  uniform float uStrength;
+  varying vec2 vUv;
+  #include <fog_pars_fragment>
+  vec3 jkSpectrum(float t) {
+    // Rough but recognisable: red outside, violet inside.
+    return clamp(vec3(
+      1.6 - abs(t - 0.88) * 5.0,
+      1.5 - abs(t - 0.58) * 4.6,
+      1.5 - abs(t - 0.30) * 4.4
+    ), 0.0, 1.0);
+  }
+  void main() {
+    vec2 p = vUv * 2.0 - 1.0;
+    p.y = p.y * 0.5 + 0.45;
+    float r = length(p);
+    float band = smoothstep(0.70, 0.78, r) * (1.0 - smoothstep(0.90, 0.99, r));
+    float t = clamp((r - 0.78) / 0.14, 0.0, 1.0);
+    float arc = step(0.0, p.y);
+    gl_FragColor = vec4(jkSpectrum(t) * band * arc * uStrength, 0.0);
+    gl_FragColor.a = band * arc * uStrength * 0.9;
+    #include <tonemapping_fragment>
+    #include <colorspace_fragment>
+  }
+`;
+
+// Console overrides, same channel as the wind: anything PostFX writes every
+// frame cannot be held from outside without one.
+function applyWaterOverride() {
+  const o = waterRuntime.override;
+  const u = waterRuntime.uniforms;
+  if (!o || !u) return;
+  for (const k in o) {
+    if (u[k] && typeof o[k] === 'number') u[k].value = o[k];
+  }
+}
+
+// The second pass. Everything behind the water has already been drawn, which is
+// the whole reason this is a separate pass, and the depth buffer is still live,
+// so the surface depth-tests against the world without being cleared first.
+const _bowFwd = new THREE.Vector3();
+function drawWater(gl, scene, camera, t, w, h) {
+  const ws = waterRuntime.scene;
+  const u = waterRuntime.uniforms;
+  if (!ws || !u) return 0;
+  // USE_FOG is a compile-time define, so the first frame where the scene's fog
+  // exists has to recompile, or the water never fogs at all.
+  if (ws.fog !== scene.fog) {
+    ws.fog = scene.fog;
+    ws.traverse((o) => { if (o.material) o.material.needsUpdate = true; });
+  }
+  u.uTime.value = t;
+  u.uResolution.value.set(w, h);
+  u.uCamPos.value.copy(camera.position);
+  u.uSunDir.value.copy(skyRuntime.sunDir);
+  const sunLit = Math.max(0, skyRuntime.sunI);
+  if (u.uSunColor) u.uSunColor.value.copy(skyRuntime.sunColor).multiplyScalar(sunLit);
+  applyWaterOverride();
+
+  const fm = waterRuntime.fallMat;
+  if (fm) {
+    fm.uniforms.uTime.value = t;
+    // Aerated water is white, but it is still only as bright as the light on
+    // it, so the fall goes grey at dusk with everything else.
+    fm.uniforms.uTint.value.copy(skyRuntime.sunColor)
+      .multiplyScalar(0.22 + sunLit * 0.55).addScalar(0.1);
+  }
+
+  const bow = waterRuntime.bow;
+  if (bow) {
+    // A rainbow is sunlight turned back out of the mist at 42 degrees, so it
+    // exists only when the sun is behind the viewer and low enough to throw
+    // that cone above the ground. Both conditions, or it is not drawn.
+    bow.quaternion.copy(camera.quaternion);
+    camera.getWorldDirection(_bowFwd);
+    const behind = -_bowFwd.dot(skyRuntime.sunDir);
+    // A bow in the sky sits 42 degrees off the anti-solar point and needs a low
+    // sun to clear the horizon - but this one is in spray at the foot of a
+    // waterfall, which you look down into, so a high sun only dims it rather
+    // than putting it out. Gating hard on sun height meant it never appeared at
+    // all: this sky keeps the sun above 0.75 all day.
+    const sy = skyRuntime.sunDir.y;
+    const low = 1 - 0.45 * Math.max(0, Math.min(1, (sy - 0.6) / 0.3));
+    const near = 1 - Math.max(0, Math.min(1, (camera.position.distanceTo(bow.position) - 14) / 42));
+    bow.material.uniforms.uStrength.value =
+      Math.max(0, Math.min(1, behind * 1.8 - 0.5)) * low * Math.min(1, sunLit) * near * 1.2;
+  }
+  // The shadow maps were rendered during the opaque pass and nothing has moved
+  // since. Without this every frame renders the whole cascade twice.
+  const autoShadow = gl.shadowMap.autoUpdate;
+  const autoClear = gl.autoClear;
+  gl.shadowMap.autoUpdate = false;
+  gl.autoClear = false;
+  gl.render(ws, camera);
+  gl.autoClear = autoClear;
+  gl.shadowMap.autoUpdate = autoShadow;
+  return gl.info.render.calls;
 }
 
 function Water() {
   const quality = useGame((s) => s.graphicsQuality);
-  const seg = (GRAPHICS_PRESETS[quality] || gfx()).waterSegments;
-  const ref = useRef();
-  const base = useRef(null);
+  const q = GRAPHICS_PRESETS[quality] || gfx();
 
-  // Radial rings (not a plain circle) so the surface has vertices to lift into
-  // swell. RingGeometry gives us those rings for free.
-  const geo = useMemo(() => {
-    const g = new THREE.RingGeometry(0.02, POND_RADIUS, seg, Math.max(4, Math.round(seg / 3)));
-    g.rotateX(-Math.PI / 2);
-    base.current = g.attributes.position.array.slice();
-    return g;
-  }, [seg]);
+  // The water lives in a scene of its own so the second pass costs one tiny
+  // traversal instead of walking the whole world again.
+  const rig = useMemo(() => {
+    const scene = new THREE.Scene();
+    const seg = q.waterSegments;
+    const geos = [];
+    const mats = [];
 
-  const mat = useMemo(() => {
-    const [nA] = waterNormals();
-    const m = new THREE.MeshStandardMaterial({
-      color: '#2d6f80',
-      normalMap: nA,
-      normalScale: new THREE.Vector2(0.7, 0.7),
-      roughness: 0.07,
-      metalness: 0.02,
+    // One material for every still-or-flowing surface in the world: the only
+    // difference between the pond and the river is the flow attribute.
+    const mat = makeWaterMaterial(q);
+    mats.push(mat);
+
+    const pondGeo = new THREE.RingGeometry(0.02, POND_RADIUS + POND_OVERRUN, seg,
+      Math.max(8, Math.round(seg / 1.6)));
+    pondGeo.rotateX(-Math.PI / 2);
+    attachWaterDepth(pondGeo, POND_CENTER[0], POND_CENTER[1], POND_SURFACE_Y, null);
+    const pond = new THREE.Mesh(pondGeo, mat);
+    pond.position.set(POND_CENTER[0], POND_SURFACE_Y, POND_CENTER[1]);
+    pond.frustumCulled = false;
+    scene.add(pond);
+    geos.push(pondGeo);
+
+    // The river is built in world coordinates, so its model matrix is identity
+    // and the depth already baked into each vertex stays correct.
+    const riverGeo = buildRiverSurface();
+    const river = new THREE.Mesh(riverGeo, mat);
+    river.frustumCulled = false;
+    scene.add(river);
+    geos.push(riverGeo);
+
+    const fallGeo = buildWaterfallSheet();
+    const fallMat = new THREE.ShaderMaterial({
+      uniforms: Object.assign(THREE.UniformsUtils.clone(THREE.UniformsLib.fog), {
+        uTime: { value: 0 },
+        tFoam: { value: foamNoise() },
+        uTint: { value: new THREE.Color('#ffffff') },
+        uOpacity: { value: 0.95 },
+      }),
+      vertexShader: WATERFALL_VERT,
+      fragmentShader: WATERFALL_FRAG,
+      fog: true,
       transparent: true,
-      opacity: 0.86,
-      envMapIntensity: 1.8,
+      depthWrite: false,
       side: THREE.DoubleSide,
     });
-    // Two scales of the same ripple normal, scrolling together. The interference
-    // between them is what stops it looking like a sliding wallpaper.
-    m.onBeforeCompile = (shader) => {
-      try { patchNormalDetail(shader, 1, 2.9, 0.75); } catch (e) {}
-    };
-    return m;
-  }, []);
+    const fall = new THREE.Mesh(fallGeo, fallMat);
+    fall.frustumCulled = false;
+    fall.renderOrder = 2;
+    scene.add(fall);
+    geos.push(fallGeo);
+    mats.push(fallMat);
 
-  const foamMat = useMemo(() => new THREE.MeshBasicMaterial({
-    map: foamTexture(),
-    transparent: true,
-    opacity: 0.5,
-    depthWrite: false,
-    side: THREE.DoubleSide,
-  }), []);
+    // The rainbow lives in the mist at the foot of the fall.
+    const bowZ = RIVER.zs[Math.min(RIVER.n - 1, RIVER.fallI + 1)];
+    const bowGeo = new THREE.PlaneGeometry(14, 10);
+    const bowMat = new THREE.ShaderMaterial({
+      uniforms: { uStrength: { value: 0 } },
+      vertexShader: 'varying vec2 vUv;\nvoid main() { vUv = uv;'
+        + ' gl_Position = projectionMatrix * viewMatrix * modelMatrix * vec4(position, 1.0); }',
+      fragmentShader: RAINBOW_FRAG,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+    });
+    const bow = new THREE.Mesh(bowGeo, bowMat);
+    bow.position.set(riverCenterX(bowZ), RIVER.surf[RIVER.fallI + 1] + 0.6, bowZ + 3.5);
+    bow.frustumCulled = false;
+    bow.renderOrder = 3;
+    scene.add(bow);
+    geos.push(bowGeo);
+    mats.push(bowMat);
 
-  // The froth ring that marks the waterline.
-  const foamGeo = useMemo(() => {
-    const g = new THREE.RingGeometry(POND_RADIUS * 0.80, POND_RADIUS * 1.04, 64, 1);
-    g.rotateX(-Math.PI / 2);
-    return g;
-  }, []);
+    waterRuntime.scene = scene;
+    waterRuntime.fallMat = fallMat;
+    waterRuntime.bow = bow;
+    waterRuntime.stats.surfaces = 3;
+    return { scene, geos, mats, mat };
+  }, [q.waterSegments, q.waterRefract, q.waterCaustics, q.post]);
 
-  const elapsed = useRef(0);
-  useFrame((_, delta) => {
-    elapsed.current += delta;
-    const t = elapsed.current;
-    const [nA] = waterNormals();
-    nA.offset.x = t * 0.022;
-    nA.offset.y = t * 0.013;
-    // Gentle crossing swell. Only a few hundred vertices, so this is cheap.
-    const mesh = ref.current;
-    if (mesh && base.current) {
-      const pos = mesh.geometry.attributes.position;
-      const src = base.current;
-      for (let i = 0; i < pos.count; i++) {
-        const x = src[i * 3];
-        const z = src[i * 3 + 2];
-        const h = Math.sin(x * 0.42 + t * 1.25) * 0.035
-                + Math.sin(z * 0.33 - t * 0.95) * 0.03
-                + Math.sin((x + z) * 0.6 + t * 1.9) * 0.015;
-        pos.setY(i, h);
-      }
-      pos.needsUpdate = true;
-      mesh.geometry.computeVertexNormals();
+  useEffect(() => () => {
+    for (const g of rig.geos) g.dispose();
+    for (const m of rig.mats) m.dispose();
+    if (waterRuntime.scene === rig.scene) {
+      waterRuntime.scene = null;
+      waterRuntime.uniforms = null;
+      waterRuntime.fallMat = null;
+      waterRuntime.bow = null;
     }
-    if (foamMat) foamMat.opacity = 0.42 + Math.sin(t * 1.1) * 0.08;
-  });
+  }, [rig]);
 
-  return html`
-    <${Fragment}>
-      <mesh
-        ref=${ref}
-        geometry=${geo}
-        material=${mat}
-        position=${[POND_CENTER[0], POND_SURFACE_Y, POND_CENTER[1]]}
-      />
-      <mesh
-        geometry=${foamGeo}
-        material=${foamMat}
-        position=${[POND_CENTER[0], POND_SURFACE_Y + 0.035, POND_CENTER[1]]}
-      />
-    <//>
-  `;
+  return null;
 }
 
 // ============================================================
@@ -6127,8 +6963,14 @@ function GrassField() {
         const idx = block * per + i;
         const x = cellX + rand() * GRASS_CELL;
         const z = cellZ + rand() * GRASS_CELL;
-        const keep = rand() <= density
-          && Math.hypot(x - POND_CENTER[0], z - POND_CENTER[1]) > POND_RADIUS + 0.6;
+        // Grass does not grow under water. Tested against the actual surface
+        // rather than against a radius, because the shallow margins reach well
+        // past the channel floor - and a blade standing in the river puts the
+        // depth buffer at the waterline, which tells the water shader there is
+        // no water there at all.
+        const gy = getTerrainHeight(x, z);
+        const ws = waterSurfaceAt(x, z);
+        const keep = rand() <= density && !(ws !== -Infinity && gy < ws + 0.06);
         if (!keep) {
           // Collapse unwanted blades to nothing rather than shrinking the pool -
           // keeps the slot bookkeeping trivial.
@@ -6141,7 +6983,7 @@ function GrassField() {
         const w = 0.8 + rand() * 0.55;
         sc.e.set((rand() - 0.5) * 0.28, rand() * Math.PI * 2, (rand() - 0.5) * 0.28);
         sc.q.setFromEuler(sc.e);
-        sc.v.set(x, getTerrainHeight(x, z) - 0.03, z);
+        sc.v.set(x, gy - 0.03, z);
         sc.s.set(w, h, w);
         sc.m.compose(sc.v, sc.q, sc.s);
         mesh.setMatrixAt(idx, sc.m);
@@ -6208,6 +7050,8 @@ function DecorativeFoliage() {
       const pondDist = Math.hypot(x - POND_CENTER[0], z - POND_CENTER[1]);
       if (pondDist < 14) continue; // keep the water clear
       const y = getTerrainHeight(x, z);
+      // Same for the river: plants on the banks, not standing in the current.
+      if (waterSurfaceAt(x, z) > y + 0.06) continue;
       const s = 0.7 + rand() * 0.9;
       const biome = getDominantBiome(x, z);
       const roll = rand();
@@ -6426,6 +7270,184 @@ function FallingLeaves() {
     castShadow=${false} receiveShadow=${true} frustumCulled=${false} />`;
 }
 
+// ---------- Spray, splashes and drips ----------
+// One pool of droplets serves every source: feet in the shallows, the splash
+// when you go in, what runs off you when you come out, and the mist at the foot
+// of a waterfall. Sources queue an emission rather than writing into the pool,
+// because they run in their own frame callbacks - the player's runs before this
+// one - and a queue means none of them needs to know the pool exists.
+const sprayQueue = [];
+function emitSpray(x, y, z, n, opts) {
+  if (!(n > 0)) return;
+  // A queue that is never drained means something is emitting with the system
+  // switched off. Drop the oldest rather than growing without bound.
+  if (sprayQueue.length > 32) sprayQueue.shift();
+  sprayQueue.push({ x: x, y: y, z: z, n: n, o: opts || {} });
+}
+
+const SPRAY_GRAVITY = 9.0;
+
+function WaterSpray() {
+  const quality = useGame((s) => s.graphicsQuality);
+  const q = GRAPHICS_PRESETS[quality] || gfx();
+  const count = Math.max(0, q.waterSpray | 0);
+  const ref = useRef();
+
+  const data = useMemo(() => {
+    const pos = new Float32Array(Math.max(1, count) * 3);
+    const col = new Float32Array(Math.max(1, count) * 3);
+    const drops = [];
+    for (let i = 0; i < count; i++) {
+      drops.push({ life: 0, max: 1, x: 0, y: -9999, z: 0, vx: 0, vy: 0, vz: 0, grav: 1, fade: 1 });
+      pos[i * 3 + 1] = -9999;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e5);
+    return { geo, pos, col, drops, next: 0 };
+  }, [count]);
+
+  const mat = useMemo(() => new THREE.PointsMaterial({
+    map: texFrom(buildSoftDisc(32), [1, 1], false),
+    size: 0.075,
+    sizeAttenuation: true,
+    transparent: true,
+    depthWrite: false,
+    vertexColors: true,
+    blending: THREE.AdditiveBlending,
+    toneMapped: false,
+  }), []);
+
+  useEffect(() => () => { data.geo.dispose(); mat.dispose(); }, [data, mat]);
+
+  useFrame((state, delta) => {
+    const pts = ref.current;
+    if (!pts || count === 0) { sprayQueue.length = 0; return; }
+    const d = Math.min(0.06, delta);
+
+    // Drain the queue into the pool. Oldest slot first: a burst never wipes out
+    // droplets that are still in the air if there is room for both.
+    while (sprayQueue.length) {
+      const e = sprayQueue.shift();
+      const o = e.o;
+      const speed = o.speed === undefined ? 2.2 : o.speed;
+      const spread = o.spread === undefined ? 1.0 : o.spread;
+      const up = o.up === undefined ? 1.0 : o.up;
+      const life = o.life === undefined ? 0.9 : o.life;
+      for (let k = 0; k < e.n; k++) {
+        const p = data.drops[data.next % count];
+        data.next++;
+        const a = Math.random() * Math.PI * 2;
+        const r = Math.sqrt(Math.random());
+        p.x = e.x + Math.cos(a) * r * (o.radius || 0.18);
+        p.y = e.y + (o.radiusY || 0) * (Math.random() - 0.5);
+        p.z = e.z + Math.sin(a) * r * (o.radius || 0.18);
+        p.vx = Math.cos(a) * r * speed * spread;
+        p.vz = Math.sin(a) * r * speed * spread;
+        p.vy = speed * up * (0.5 + Math.random() * 0.8);
+        p.grav = o.grav === undefined ? 1 : o.grav;
+        p.max = life * (0.7 + Math.random() * 0.6);
+        p.life = p.max;
+        p.fade = o.bright === undefined ? 1 : o.bright;
+      }
+    }
+
+    const pos = data.pos, col = data.col;
+    let live = 0;
+    for (let i = 0; i < count; i++) {
+      const p = data.drops[i];
+      if (p.life <= 0) { pos[i * 3 + 1] = -9999; col[i * 3] = col[i * 3 + 1] = col[i * 3 + 2] = 0; continue; }
+      p.life -= d;
+      p.vy -= SPRAY_GRAVITY * p.grav * d;
+      p.x += p.vx * d; p.y += p.vy * d; p.z += p.vz * d;
+      // A droplet that lands back in the water stops being a droplet and
+      // becomes a ring on the surface.
+      if (p.vy < 0) {
+        // A droplet that lands back in water becomes a ring on the surface; one
+        // that lands on the ground just stops.
+        const ws = waterSurfaceAt(p.x, p.z);
+        const floor = ws === -Infinity ? getTerrainHeight(p.x, p.z) - 0.02 : ws;
+        if (p.y < floor) {
+          if (ws !== -Infinity && p.life > 0.12) spawnRipple(p.x, p.z, 0.006);
+          p.life = 0;
+          pos[i * 3 + 1] = -9999;
+          continue;
+        }
+      }
+      live++;
+      pos[i * 3] = p.x; pos[i * 3 + 1] = p.y; pos[i * 3 + 2] = p.z;
+      // Droplets are lit by the sun, not emissive, so they go out with it.
+      const k = Math.max(0, p.life / p.max) * p.fade
+              * (0.25 + 0.75 * Math.min(1, Math.max(0, skyRuntime.sunI)));
+      col[i * 3] = k; col[i * 3 + 1] = k * 1.02; col[i * 3 + 2] = k * 1.06;
+    }
+    waterRuntime.stats.spray = live;
+    data.geo.attributes.position.needsUpdate = true;
+    data.geo.attributes.color.needsUpdate = true;
+  });
+
+  if (count === 0) return null;
+  return html`<points ref=${ref} geometry=${data.geo} material=${mat} frustumCulled=${false} />`;
+}
+
+// Animals standing or wading in the pond hold rings on the surface the same way
+// the player does. Cheap: a handful of entities, throttled.
+const _animalRipple = { t: 0 };
+const _mistTimer = { t: 0 };
+function WaterDisturbance() {
+  const quality = useGame((s) => s.graphicsQuality);
+  const q = GRAPHICS_PRESETS[quality] || gfx();
+
+  useFrame((state, delta) => {
+    // Mist at the foot of the fall. Only while it is in sight: the pool is
+    // finite and droplets spent on something 200m away are droplets the splash
+    // in front of you does not get.
+    if (q.waterMist > 0) {
+      const fz = RIVER.zs[Math.min(RIVER.n - 1, RIVER.fallI + 1)];
+      const fx = riverCenterX(fz);
+      const dx = playerTransform.position[0] - fx;
+      const dz = playerTransform.position[2] - fz;
+      if (dx * dx + dz * dz < 55 * 55) {
+        _mistTimer.t -= delta;
+        if (_mistTimer.t <= 0) {
+          _mistTimer.t = 0.07;
+          emitSpray(fx, RIVER.surf[RIVER.fallI + 1] + 0.15, fz, Math.max(1, q.waterMist / 28 | 0), {
+            // Mist hangs: almost no weight, thrown up and outward by the water
+            // hitting the pool.
+            speed: 1.1, spread: 1.5, up: 1.4, life: 2.2, radius: RIVER_HALF * 0.9,
+            radiusY: 0.4, grav: 0.12, bright: 0.55,
+          });
+        }
+      }
+    }
+    if (q.waterRipples <= 0) return;
+    _animalRipple.t -= delta;
+    if (_animalRipple.t > 0) return;
+    _animalRipple.t = 0.45;
+    for (const id in entityRegistry.animals) {
+      const a = entityRegistry.animals[id];
+      if (!a) continue;
+      if (Math.hypot(a[0] - POND_CENTER[0], a[2] - POND_CENTER[1]) > POND_RADIUS) continue;
+      spawnRipple(a[0], a[2], 0.03);
+    }
+    // Rain drives the surface too. The rate is zero until there is weather to
+    // drive it, which is the next section; the hook is here so the water does
+    // not have to be reopened for it.
+    const rain = waterRuntime.rain;
+    if (rain > 0) {
+      const n = Math.min(4, Math.round(rain * 4));
+      for (let i = 0; i < n; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const r = Math.sqrt(Math.random()) * POND_RADIUS;
+        spawnRipple(POND_CENTER[0] + Math.cos(a) * r, POND_CENTER[1] + Math.sin(a) * r, 0.012);
+      }
+    }
+  });
+
+  return null;
+}
+
 function World() {
   return html`
     <${Fragment}>
@@ -6436,6 +7458,8 @@ function World() {
       <${GrassField} />
       <${DustMotes} />
       <${FallingLeaves} />
+      <${WaterSpray} />
+      <${WaterDisturbance} />
       <${DecorativeFoliage} />
     <//>
   `;
@@ -6976,6 +8000,10 @@ function Player() {
   const statTimer = useRef(0);
   const lastNearId = useRef(null);
   const inWater = useRef(false);
+  const wasInWater = useRef(false);
+  const rippleTimer = useRef(0);
+  const dripTimer = useRef(0);
+  const wetFor = useRef(0);
   const attackTimer = useRef(0);
   const mpSendTimer = useRef(0);
   const deathTimer = useRef(0); // seconds since death, drives the collapse animation
@@ -7217,6 +8245,11 @@ function Player() {
     // jumping, no looking. Gravity still runs so the body settles onto the ground.
     const panelOpen = panelBlocksMovement(s.activePanel) || dead;
     const pos = group.current.position;
+    if (debugWarp.x !== null) {
+      pos.set(debugWarp.x, getTerrainHeight(debugWarp.x, debugWarp.z) + 0.2, debugWarp.z);
+      debugWarp.x = null;
+      debugWarp.z = null;
+    }
 
     // ---- input ----
     let moveX = 0;
@@ -7258,6 +8291,50 @@ function Player() {
     const dzw = pos.z - POND_CENTER[1];
     const swimming = Math.hypot(dxw, dzw) < POND_RADIUS;
     inWater.current = swimming;
+
+    // ---- what the water does about it ----
+    // Purely cosmetic: rings on the surface, a splash going in, and water
+    // running off you for a few seconds after you climb out.
+    const wq = gfx();
+    // Cosmetic only, and deliberately separate from `swimming` above: that one
+    // is gameplay - speed, floating, drinking - and is the pond, as it always
+    // has been. This is just "are your feet in water", which the river counts
+    // for as well.
+    const wSurf = waterSurfaceAt(pos.x, pos.z);
+    const wading = wSurf !== -Infinity && pos.y < wSurf + 0.55;
+    if (wq.waterRipples > 0 || wq.waterSpray > 0) {
+      if (wading && !wasInWater.current) {
+        spawnRipple(pos.x, pos.z, 0.11);
+        emitSpray(pos.x, wSurf + 0.05, pos.z, Math.min(26, wq.waterSpray),
+          { speed: 2.6, spread: 0.9, up: 1.1, life: 0.85, radius: 0.3 });
+      } else if (!wading && wasInWater.current) {
+        wetFor.current = 5.0;
+        emitSpray(pos.x, pos.y + 0.9, pos.z, Math.min(14, wq.waterSpray >> 1),
+          { speed: 1.2, spread: 0.7, up: 0.5, life: 0.7, radius: 0.28, radiusY: 0.9 });
+      }
+      if (wading) {
+        rippleTimer.current -= delta;
+        if (rippleTimer.current <= 0) {
+          spawnRipple(pos.x, pos.z, moving ? 0.055 : 0.018);
+          rippleTimer.current = moving ? 0.26 : 0.8;
+          if (moving) {
+            emitSpray(pos.x, wSurf + 0.08, pos.z, 4,
+              { speed: 1.4, spread: 1.0, up: 0.7, life: 0.5, radius: 0.26, bright: 0.8 });
+          }
+        }
+      } else if (wetFor.current > 0) {
+        // Dripping. Thins out as you dry off.
+        wetFor.current -= delta;
+        dripTimer.current -= delta;
+        if (dripTimer.current <= 0) {
+          const left = Math.max(0, wetFor.current) / 5.0;
+          dripTimer.current = 0.12 + (1 - left) * 0.45;
+          emitSpray(pos.x, pos.y + 0.7 + Math.random() * 0.6, pos.z, 1,
+            { speed: 0.12, spread: 0.3, up: 0.1, life: 1.1, radius: 0.22, bright: 0.7 });
+        }
+      }
+    }
+    wasInWater.current = wading;
 
     // ---- speed / meter multiplier ----
     let speed = WALK_SPEED;
@@ -11225,6 +12302,23 @@ const BRIGHT_FRAG = `
   }
 `;
 
+// The scene's depth, in metres from the eye, written to a colour target. The
+// water pass needs to read depth while the depth attachment it came from is
+// bound for testing, and sampling an attachment of the framebuffer you are
+// drawing into is a feedback loop. Linear metres also condition far better in
+// half float than raw window-space depth does.
+const LINEAR_DEPTH_FRAG = `
+  precision highp float;
+  varying vec2 vUv;
+  uniform sampler2D tDepth;
+  uniform float uNear;
+  uniform float uFar;
+  void main() {
+    float ndc = texture2D(tDepth, vUv).x * 2.0 - 1.0;
+    gl_FragColor = vec4((2.0 * uNear * uFar) / (uFar + uNear - ndc * (uFar - uNear)), 0.0, 0.0, 1.0);
+  }
+`;
+
 const DOWN_FRAG = `
   precision highp float;
   varying vec2 vUv;
@@ -11501,6 +12595,11 @@ function PostFX() {
       scene1.depthTexture.format = THREE.DepthFormat;
       scene1.depthTexture.type = THREE.UnsignedIntType;
 
+      // Water needs the colour behind it (half res is plenty - it is about to be
+      // smeared by a normal map) and the scene depth as linear metres.
+      const refract = makeRT(2, 2);
+      const wdepth = makeRT(2, 2);
+
       const ao1 = makeRT(2, 2, { type: THREE.UnsignedByteType });
       const ao2 = makeRT(2, 2, { type: THREE.UnsignedByteType });
       const rays = makeRT(2, 2);
@@ -11537,6 +12636,9 @@ function PostFX() {
           uKnee: { value: 0.6 },
         }),
         down: postMat(DOWN_FRAG, { tSrc: { value: null }, uTexel: { value: new THREE.Vector2() } }),
+        lindepth: postMat(LINEAR_DEPTH_FRAG, {
+          tDepth: { value: null }, uNear: { value: 0.1 }, uFar: { value: 500 },
+        }),
         up: postMat(UP_FRAG, {
           tSrc: { value: null }, tPrev: { value: null },
           uTexel: { value: new THREE.Vector2() }, uRadius: { value: 1.0 },
@@ -11573,7 +12675,8 @@ function PostFX() {
 
       postState.active = true;
       postState.reason = 'ok';
-      return { scene1, ao1, ao2, rays, bright, down, up, mats, quadScene, quadCam, quadMesh, levels, size: [0, 0] };
+      return { scene1, refract, wdepth, ao1, ao2, rays, bright, down, up, mats,
+               quadScene, quadCam, quadMesh, levels, size: [0, 0], fog: null };
     } catch (e) {
       postState.active = false;
       postState.reason = String(e && e.message || e);
@@ -11601,7 +12704,8 @@ function PostFX() {
 
   useEffect(() => () => {
     if (!rig) return;
-    const all = [rig.scene1, rig.ao1, rig.ao2, rig.rays, rig.bright].concat(rig.down, rig.up);
+    const all = [rig.scene1, rig.refract, rig.wdepth, rig.ao1, rig.ao2, rig.rays, rig.bright]
+      .concat(rig.down, rig.up);
     for (const rt of all) rt.dispose();
     for (const k in rig.mats) rig.mats[k].dispose();
   }, [rig]);
@@ -11611,6 +12715,7 @@ function PostFX() {
     // after every priority-0 callback. Applying them inside any one of those
     // would just let the next one overwrite them again - which it did.
     applyWindOverride();
+    updateRipples(delta);
     // Taking a priority above 0 switches off react-three-fiber's own render
     // call - for the whole component, not just for the frames where we do
     // something. So when the chain is off we still have to draw the scene
@@ -11620,6 +12725,12 @@ function PostFX() {
       gl.render(scene, camera);
       perfStats.draws = gl.info.render.calls;
       perfStats.tris = gl.info.render.triangles;
+      // No colour buffer to refract and no depth to read, so the water falls
+      // back to a transparent surface tinted by the depth it carries in its
+      // own vertices. Still a second pass - it is a second scene.
+      const dpr0 = gl.getPixelRatio();
+      perfStats.draws += drawWater(gl, scene, camera, state.clock.elapsedTime,
+        Math.max(2, Math.floor(size.width * dpr0)), Math.max(2, Math.floor(size.height * dpr0)));
       return;
     }
     const dpr = gl.getPixelRatio();
@@ -11628,7 +12739,9 @@ function PostFX() {
     if (rig.size[0] !== w || rig.size[1] !== h) {
       rig.size[0] = w; rig.size[1] = h;
       rig.scene1.setSize(w, h);
+      rig.wdepth.setSize(w, h);
       const aw = Math.max(2, w >> 1), ah = Math.max(2, h >> 1);
+      rig.refract.setSize(aw, ah);
       rig.ao1.setSize(aw, ah);
       rig.ao2.setSize(aw, ah);
       rig.rays.setSize(aw, ah);
@@ -11667,6 +12780,31 @@ function PostFX() {
       gl.setRenderTarget(target || null);
       gl.render(rig.quadScene, rig.quadCam);
     };
+
+    // --- 1b. the water, in a pass of its own ---
+    // Everything behind it is already drawn, so the surface can bend the view
+    // through itself. The colour copy is half res - a normal map is about to
+    // smear it anyway - but the depth copy is full res, because a soft
+    // shoreline is a sub-pixel feature and softening it is the entire point.
+    if (waterRuntime.scene && waterRuntime.uniforms) {
+      const wu = waterRuntime.uniforms;
+      const wantRefract = !!qq.waterRefract;
+      if (wantRefract) {
+        m.down.uniforms.tSrc.value = rig.scene1.texture;
+        m.down.uniforms.uTexel.value.set(1 / w, 1 / h);
+        draw(m.down, rig.refract);
+      }
+      m.lindepth.uniforms.tDepth.value = rig.scene1.depthTexture;
+      m.lindepth.uniforms.uNear.value = camera.near;
+      m.lindepth.uniforms.uFar.value = camera.far;
+      draw(m.lindepth, rig.wdepth);
+      wu.tRefract.value = wantRefract ? rig.refract.texture : null;
+      wu.tSceneDepth.value = rig.wdepth.texture;
+      wu.uNear.value = camera.near;
+      wu.uFar.value = camera.far;
+      gl.setRenderTarget(rig.scene1);
+      perfStats.draws += drawWater(gl, scene, camera, t, w, h);
+    }
 
     // --- 2. ambient occlusion at half res, then a depth-aware blur ---
     const wantAO = qq.ssaoSamples > 0;
@@ -11834,6 +12972,15 @@ if (typeof window !== 'undefined') {
     shaderPatchStats,
     windPatchStats,
     wind: windUniforms,
+    water: waterRuntime,
+    ripple: (x, z, a) => spawnRipple(x, z, a === undefined ? 0.05 : a),
+    teleport: (x, z) => { debugWarp.x = x; debugWarp.z = z; },
+    river: RIVER,
+    riverX: riverCenterX,
+    waterAt: waterSurfaceAt,
+    terrain: getTerrainHeight,
+    terrainBase: baseTerrainHeight,
+    riverDist: riverDistance,
     // Exposed so a headless run can aim the camera. It is the same channel the
     // touch look-drag writes to, and it accumulates, so driving it from outside
     // cannot fight a real input - it just adds to it.
