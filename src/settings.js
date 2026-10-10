@@ -1,3 +1,4 @@
+import { audioSettings, setMuted, setVolume } from './audio.js';
 import { Fragment, html, useEffect, useRef, useState } from './core.js';
 import { GRAPHICS_ORDER, GRAPHICS_PRESETS, gfx, perfStats } from './graphics.js';
 import { KEYBIND_ACTIONS, KEYBIND_GROUPS, keyLabel } from './keybinds.js';
@@ -86,6 +87,13 @@ function SettingsPanel() {
     <//>
   `;
 
+  // The audio settings live in their own module rather than the game store,
+  // because they have to be readable from inside the Web Audio graph where
+  // there is no React. These two pieces of state exist only to re-render these
+  // rows; the module is the source of truth.
+  const [vol, setVol] = useState(audioSettings.volume);
+  const [mute, setMute] = useState(audioSettings.muted);
+
   const generalTab = html`
     <${Fragment}>
       <p class="set-hint">
@@ -106,6 +114,29 @@ function SettingsPanel() {
       <div class="set-row">
         <span class="set-label">Invert vertical look</span>
         <input type="checkbox" checked=${invertY} onChange=${(e) => setInvertY(e.target.checked)} />
+      </div>
+      <h3 class="inv-section">Sound</h3>
+      <p class="set-hint">
+        Every sound in the game is synthesised as you play — the cicadas, the waterfall,
+        your own footsteps on four different surfaces. Nothing is downloaded, so the
+        jungle at dusk sounds different from the jungle at noon for the same reason it
+        looks different.
+      </p>
+      <div class="set-row">
+        <span class="set-label">Volume</span>
+        <div class="set-slider">
+          <input
+            type="range" min="0" max="1" step="0.05"
+            value=${vol}
+            onChange=${(e) => { const v = parseFloat(e.target.value); setVol(v); setVolume(v); }}
+          />
+          <strong style=${{ minWidth: '38px', color: '#ffe27a' }}>${Math.round(vol * 100)}%</strong>
+        </div>
+      </div>
+      <div class="set-row">
+        <span class="set-label">Mute</span>
+        <input type="checkbox" checked=${mute}
+          onChange=${(e) => { setMute(e.target.checked); setMuted(e.target.checked); }} />
       </div>
       <h3 class="inv-section">Good to know</h3>
       <p class="set-hint">

@@ -1,1 +1,9 @@
 .DS_Store
+
+# The headless Chrome profile the screenshot and measurement tools create.
+# It is a browser cache, not source, and it churns on every run.
+tools/chromeprof*/
+
+# Python bytecode from the tools.
+__pycache__/
+*.pyc

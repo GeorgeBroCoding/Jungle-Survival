@@ -1,3 +1,4 @@
+import { AudioSystem } from './audiosystem.js';
 import { Footprints, GroundClutter } from './clutter.js';
 import { Fragment, THREE, html, useEffect, useFrame, useMemo, useRef } from './core.js';
 import { PLAYER_SPAWN, POND_CENTER, POND_RADIUS, RIVER_HALF, mulberry32, riverCenterX } from './data.js';
@@ -878,6 +879,7 @@ function World() {
       <${DustMotes} />
       <${FallingLeaves} />
       <${WeatherSystem} />
+      <${AudioSystem} />
       <${Rain} />
       <${Fireflies} />
       <${GroundClutter} />

@@ -1,4 +1,6 @@
 import { Animals } from './animals.js';
+import { FOOTSTEP_KINDS, audio, audioSettings, burst, chirp, footstepSurface, makeLayer, makeNoiseBuffer, makePlace, playThunder, setVolume, startAudio } from './audio.js';
+import { ambienceMix, callRates } from './audiosystem.js';
 import { Buildings } from './buildings.js';
 import { footprints } from './clutter.js';
 import { CoinDropManager, CoinDrops } from './coins.js';
@@ -15,7 +17,7 @@ import { ACES_GLSL, DEPTH_GLSL, postState, skyRuntime } from './runtime.js';
 import { EXPOSURE_BASE, csmStats, debugClock, envRuntime, sampleSky, shadowOverride } from './sky.js';
 import { StartScreen } from './startscreen.js';
 import { useGame } from './store.js';
-import { RIVER, baseTerrainHeight, getTerrainHeight, shaderPatchStats, waterSurfaceAt } from './terrain.js';
+import { RIVER, baseTerrainHeight, getDominantBiome, getTerrainHeight, shaderPatchStats, waterSurfaceAt } from './terrain.js';
 import { smoothstep } from './textures.js';
 import { debugWarp, touchInput } from './touch.js';
 import { Hud } from './touchcontrols.js';
@@ -874,6 +876,9 @@ function PostFX() {
     waterRuntime.submerged += (submerged - waterRuntime.submerged)
       * Math.min(1, delta * 9);
     if (waterRuntime.submerged < 0.002) waterRuntime.submerged = 0;
+    if (waterRuntime.submergedOverride !== null) {
+      waterRuntime.submerged = waterRuntime.submergedOverride;
+    }
     c.uUnderwater.value = waterRuntime.submerged;
     c.uUnderwaterDepth.value = eyeSurface === -Infinity ? 0
       : Math.max(0, eyeSurface - camera.position.y);
@@ -973,10 +978,36 @@ if (typeof window !== 'undefined') {
     grime: playerGrime,
     prints: footprints,
     skinPatch: skinPatchStats,
+    // Audio. `audio` carries the whole graph and the live stats; `mix` is what
+    // the ambience resolved to this frame, so the time-of-day cross-fade can be
+    // read off rather than listened for. `ambienceMix` and `callRates` are pure
+    // functions of the hour, which is how the curves were tuned.
+    audio,
+    audioSettings,
+    // The synthesis primitives, exposed so they can be rendered into an
+    // OfflineAudioContext and measured. Every one of them takes its context as
+    // an argument for exactly this reason: the spectra these produce are
+    // checkable without a sound card, deterministically, in a fraction of a
+    // second, which is the only way claims like "the cicada band sits at
+    // 4.6kHz" are worth making.
+    audioLab: { makeNoiseBuffer, makeLayer, burst, chirp, makePlace, FOOTSTEP_KINDS },
+    audioMix: () => audio.mix,
+    ambienceMix,
+    callRates,
+    startAudio,
+    volume: setVolume,
+    footSurface: footstepSurface,
+    thunder: playThunder,
     river: RIVER,
     riverX: riverCenterX,
     waterAt: waterSurfaceAt,
     terrain: getTerrainHeight,
+    // Which biome a point is in, so a measurement can ask about the woodland
+    // without averaging it against the snowfield.
+    biome: getDominantBiome,
+    // The live campfire positions, so a measurement can say which fire the
+    // roving audio source has latched onto.
+    fires: fireRegistry,
     terrainBase: baseTerrainHeight,
     riverDist: riverDistance,
     // Exposed so a headless run can aim the camera. It is the same channel the

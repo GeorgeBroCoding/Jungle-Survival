@@ -1,3 +1,4 @@
+import { startAudio } from './audio.js';
 import { React, html, useEffect } from './core.js';
 import { keyLabel } from './keybinds.js';
 import { Kito } from './kito.js';
@@ -34,7 +35,14 @@ function StartScreen() {
         back when you raid an enemy camp, and the rest will stay home to guard your base. Watch out for
         wild boars and curious monkeys as day turns to night.
       </p>
-      <button onClick=${() => { start(); }}>Begin Survival</button>
+      <button onClick=${() => {
+        // A browser will not let an AudioContext start without a gesture, and
+        // this is the only gesture the game is guaranteed to get. Starting it
+        // here rather than lazily on the first sound means the ambience is
+        // already running by the time the world appears.
+        startAudio();
+        start();
+      }}>Begin Survival</button>
       <div class="controls-list">
         ${k('moveForward')}${k('moveLeft')}${k('moveBack')}${k('moveRight')} move · Hold the middle mouse button (the wheel) and move the mouse to look around, or use ${k('lookLeft')}${k('lookDown')}${k('lookUp')}${k('lookRight')}
         · ${k('jump')} jump · ${k('sprint')} sprint (drains energy)

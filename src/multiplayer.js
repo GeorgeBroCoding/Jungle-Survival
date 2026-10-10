@@ -1,3 +1,4 @@
+import { audio } from './audio.js';
 import { Peer } from './core.js';
 import { useGame } from './store.js';
 
@@ -146,8 +147,24 @@ function mpSend(msg) {
 let sharedAudioCtx = null;
 function playChingSound() {
   try {
-    if (!sharedAudioCtx) sharedAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const ctx = sharedAudioCtx;
+    // This was the only sound in the game for a long time and it had its own
+    // context wired straight to the speakers. Now that there is a mixer it goes
+    // through it, so the volume setting reaches it and it gets muffled under
+    // water like everything else. The private context stays as the fallback for
+    // the case where the coin lands before the player has pressed Begin.
+    let ctx, dest, scale;
+    if (audio.started) {
+      ctx = audio.ctx;
+      dest = audio.buses.world;
+      // The master is already attenuated, so this no longer has to be loud
+      // enough to be heard over nothing.
+      scale = 0.5;
+    } else {
+      if (!sharedAudioCtx) sharedAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      ctx = sharedAudioCtx;
+      dest = ctx.destination;
+      scale = 1;
+    }
     if (ctx.state === 'suspended') ctx.resume();
     const now = ctx.currentTime;
     [2200, 3300].forEach((freq, i) => {
@@ -155,10 +172,10 @@ function playChingSound() {
       const gain = ctx.createGain();
       osc.type = 'triangle';
       osc.frequency.value = freq;
-      gain.gain.setValueAtTime(0.22 / (i + 1), now);
+      gain.gain.setValueAtTime(0.22 * scale / (i + 1), now);
       gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.3);
       osc.connect(gain);
-      gain.connect(ctx.destination);
+      gain.connect(dest);
       osc.start(now);
       osc.stop(now + 0.3);
     });

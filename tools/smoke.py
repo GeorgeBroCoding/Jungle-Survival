@@ -77,11 +77,21 @@ CHECKS = r"""
   S().setTimeOfDay(11);
 
   // --- settings persist through localStorage ---
-  let persisted = false;
+  // This used to just check the key existed, which only passed because an
+  // earlier run on the same browser profile had written it - on a fresh debug
+  // port it failed and looked like a regression. Change a setting and read it
+  // back instead, which is the thing actually worth asserting.
+  let persisted = false, persistedDetail = '';
   try {
-    persisted = !!localStorage.getItem('jungleking.graphics.v1');
-  } catch (e) { /* blocked */ }
-  ok('graphics settings persist', persisted);
+    const was = S().graphicsQuality;
+    const other = was === 'low' ? 'high' : 'low';
+    S().setGraphicsQuality(other);
+    const saved = JSON.parse(localStorage.getItem('jungleking.graphics.v1') || '{}');
+    persisted = saved.quality === other;
+    persistedDetail = other + ' -> ' + String(saved.quality);
+    S().setGraphicsQuality(was);
+  } catch (e) { persistedDetail = String(e && e.message || e); }
+  ok('graphics settings persist', persisted, persistedDetail);
 
   // --- the player is on the ground, not inside it ---
   const p = window.__jk.player.position;

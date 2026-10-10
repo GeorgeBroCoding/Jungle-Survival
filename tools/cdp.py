@@ -7,7 +7,7 @@ navigate, run JS in the page, collect console errors, and grab the canvas.
 Runs Chrome headless on its own port with its own throwaway profile so it can
 never touch the user's real browser or their logged-in session.
 """
-import base64, json, os, re, select, socket, struct, subprocess, sys, time, urllib.request
+import base64, json, os, re, select, shutil, socket, struct, subprocess, sys, time, urllib.request
 
 
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -98,10 +98,24 @@ class WS:
 
 class Chrome:
     def __init__(self, width=1280, height=760, gpu="swiftshader"):
+        # Start from a clean profile every time. A Chrome profile is a few
+        # hundred megabytes of cache and ML models, and one per debug port
+        # accumulating across a long session filled the disk - which then
+        # looked like the whole machine had got mysteriously slow, because a
+        # full disk is exactly what that feels like. Nothing here needs state
+        # carried between runs: the one check that relied on it (settings
+        # persistence, in smoke.py) now writes the setting itself.
+        shutil.rmtree(PROFILE, ignore_errors=True)
         os.makedirs(PROFILE, exist_ok=True)
         args = [
             CHROME, "--headless=new", "--no-first-run", "--no-default-browser-check",
             "--disable-extensions", "--mute-audio", "--no-sandbox",
+            # Without this the page's AudioContext is handed back suspended and
+            # never advances, so the audio graph cannot be measured at all -
+            # ctx.currentTime stays at zero and an analyser reads silence. The
+            # output device is still muted by --mute-audio; this only lets the
+            # graph run.
+            "--autoplay-policy=no-user-gesture-required",
             "--remote-debugging-port=%d" % PORT,
             "--user-data-dir=" + PROFILE,
             "--window-size=%d,%d" % (width, height),

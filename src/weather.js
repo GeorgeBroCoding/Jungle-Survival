@@ -57,6 +57,15 @@ const weather = {
   // Lightning, as a decaying flash. Set to 1 by a strike and falls away.
   flash: 0,
   thunderIn: -1,
+  // How long the countdown started at, which is how far away the strike was.
+  // The audio reads it to decide how much high end survived the trip.
+  thunderDelay: 0,
+  // How many rumbles have landed. A counter rather than an edge on thunderIn,
+  // because a countdown can start and expire inside one frame - the delta is
+  // clamped to 0.1s, so anything under that never shows up as positive to a
+  // system reading it afterwards, and the strike would be silent. Anything
+  // watching this only has to notice it changed.
+  thunderCount: 0,
   lastStrike: 0,
   // Set from the console to pin the weather while looking at it.
   override: null,
@@ -99,14 +108,19 @@ function stepWeather(delta, rand) {
     weather.flash = 1;
     weather.lastStrike = 0;
     weather.stats.strikes++;
-    // Thunder follows the flash by the time sound takes to arrive. There is no
-    // audio system yet - that is section 10 - so this counts down to nothing
-    // for now and is the hook it will use.
+    // Thunder follows the flash by the time the sound takes to arrive, which
+    // at a third of a kilometre a second puts these strikes between a quarter
+    // of a kilometre and a kilometre and a half away. The audio system reads
+    // the countdown and fires the rumble when it expires.
     weather.thunderIn = 0.8 + rand() * 4.5;
+    weather.thunderDelay = weather.thunderIn;
   }
   if (weather.thunderIn > 0) {
     weather.thunderIn -= delta;
-    if (weather.thunderIn <= 0) weather.thunderIn = -1;
+    if (weather.thunderIn <= 0) {
+      weather.thunderIn = -1;
+      weather.thunderCount++;
+    }
   }
 }
 

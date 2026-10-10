@@ -16,6 +16,8 @@ import './water.js';
 import './vegetation.js';
 import './clutter.js';
 import './weather.js';
+import './audio.js';
+import './audiosystem.js';
 import './grass.js';
 import './humanbody.js';
 import './player.js';
@@ -39,10 +41,6 @@ import { ErrorBoundary } from './startscreen.js';
 // Evaluation order, pinned to the order these were written in. Without it
 // the import graph decides, and a module that reads another's tables at
 // import time can run before those tables exist.
-
-// Evaluation order, pinned to the order these were written in.
-// Without it the graph decides, and a module that reads another's
-// tables at import time can run before those tables exist.
 
 
 

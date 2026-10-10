@@ -40,6 +40,11 @@ const waterRuntime = {
   // 0 above the surface, 1 with the eye under it. Eased, so breaking the
   // surface is a transition rather than a switch.
   submerged: 0,
+  // Set from the console to pin the eye under or over the surface, the way
+  // weather.override pins the weather and debugClock pins the sky. Without it
+  // `submerged` can only be nudged between frames and is eased straight back,
+  // which makes the underwater path impossible to observe from outside.
+  submergedOverride: null,
   stats: { ripples: 0, surfaces: 0, spray: 0 },
 };
 

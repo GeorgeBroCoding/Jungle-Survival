@@ -1,3 +1,4 @@
+import { playFootstep } from './audio.js';
 import { groundSoftness, spawnFootprint } from './clutter.js';
 import { Fragment, THREE, html, useEffect, useFrame, useRef, useThree } from './core.js';
 import { ATTACK_DURATION, FRIEND_BASE_CENTER, PLAYER_COLL_R, PLAYER_SPAWN, POND_CENTER, POND_RADIUS, POND_SURFACE_Y, STATIC_OBSTACLES, WEAPONS } from './data.js';
@@ -624,6 +625,9 @@ function Player() {
       stepDist.current += moved;
       if (stepDist.current > 0.72) {
         stepDist.current = 0;
+        // The sound goes on every stride, whatever is underfoot. The print only
+        // goes on ground soft enough to hold one, which is a different test.
+        playFootstep(pos.x, pos.z);
         const soft = groundSoftness(pos.x, pos.z);
         if (soft > 0.25) {
           footSide.current = -footSide.current;
