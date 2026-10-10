@@ -274,6 +274,10 @@ const COMPOSITE_FRAG = `
   uniform vec2 uTexel;
   uniform float uExposure;
   uniform float uToneMapper;   // 0 = ACES, 1 = AgX
+  uniform float uUnderwater;   // 0 above the surface, 1 below it
+  uniform vec3 uUnderwaterTint;
+  uniform float uUnderwaterDensity;
+  uniform float uUnderwaterDepth;   // how far below the surface the eye is
   uniform float uBloom;
   uniform float uAOAmount;
   uniform float uRays;
@@ -315,6 +319,14 @@ ${ACES_GLSL}
       float rise = (uv.y - h.y) / max(0.0001, h.z);
       float w = sin(uv.y * 90.0 - uHazeTime * 5.0) * cos(uv.x * 70.0 + uHazeTime * 3.1);
       uv += vec2(w, w * 0.4) * 0.0022 * m * h.w * clamp(rise + 0.4, 0.0, 1.4);
+    }
+
+    // Underwater the whole frame is sampled through a slow ripple. Doing it on
+    // the fetch rather than as a tint afterwards is what makes it read as being
+    // IN the water rather than looking at a blue picture of it.
+    if (uUnderwater > 0.0) {
+      uv += vec2(sin(uv.y * 26.0 + uTime * 1.3), cos(uv.x * 21.0 + uTime * 1.1))
+          * 0.0045 * uUnderwater;
     }
 
     float d = rawDepth(uv);
@@ -375,6 +387,28 @@ ${ACES_GLSL}
     // frame rather than argued about: 0 = ACES, 1 = AgX.
     vec3 exposed = colour * uExposure;
     vec3 mapped = lin2srgb(mix(aces(exposed), agx(exposed), uToneMapper));
+
+    // --- under the surface ---
+    // Water is not a blue filter over the picture: it absorbs red within a
+    // couple of metres, scatters everything, and is seen through a surface
+    // that will not hold still. All three are here; only the first is usually
+    // bothered with, and it is the one that reads least on its own.
+    if (uUnderwater > 0.0) {
+      float eyeDist = isSky(d) ? uFar : linearDepth(d);
+      float ext = 1.0 - exp(-eyeDist * uUnderwaterDensity);
+      // How much light is left depends on how deep the eye is, not only on how
+      // far it is looking.
+      float gloom = exp(-uUnderwaterDepth * 0.30);
+      vec3 water = uUnderwaterTint * (0.18 + 0.82 * gloom);
+      mapped = mix(mapped, water, clamp(ext, 0.0, 0.96) * uUnderwater);
+
+      // Shafts coming down through the surface.
+      float shaft = sin(vUv.x * 34.0 + uTime * 0.7) * 0.5 + 0.5;
+      shaft *= sin(vUv.x * 11.0 - uTime * 0.4 + vUv.y * 3.0) * 0.5 + 0.5;
+      shaft = pow(shaft, 3.0) * smoothstep(0.1, 0.9, 1.0 - vUv.y) * gloom;
+      mapped += uUnderwaterTint * shaft * 0.18 * uUnderwater;
+      mapped *= 1.0 - 0.10 * uUnderwater;
+    }
 
     // --- vignette, in display space so it reads the same at any exposure ---
     if (uVignette > 0.0) {
@@ -529,6 +563,10 @@ function PostFX() {
           // not close. Revisit once the grading LUT exists to put the
           // saturation back; the transform is already here behind this switch.
           uToneMapper: { value: 0 },
+          uUnderwater: { value: 0 },
+          uUnderwaterTint: { value: new THREE.Color('#123f44') },
+          uUnderwaterDensity: { value: 0.085 },
+          uUnderwaterDepth: { value: 0 },
           uBloom: { value: 0.0 }, uAOAmount: { value: 0.0 }, uRays: { value: 0.0 },
           uVignette: { value: 0.3 }, uGrain: { value: 0.0 }, uTime: { value: 0 },
           uDofStart: { value: 60 }, uDofRange: { value: 140 }, uDofAmount: { value: 0 },
@@ -763,6 +801,20 @@ function PostFX() {
     c.tRays.value = rig.rays.texture;
     c.uTexel.value.set(1 / w, 1 / h);
     c.uExposure.value = skyRuntime.exposure;
+
+    // Is the eye under water? Asked of the same function the spray and the
+    // wading check use, so the three cannot disagree about where the surface
+    // is. Eased rather than switched, or breaking the surface flickers.
+    const eyeSurface = waterSurfaceAt(camera.position.x, camera.position.z);
+    const submerged = eyeSurface === -Infinity ? 0
+      : Math.max(0, Math.min(1, (eyeSurface - camera.position.y) / 0.22));
+    waterRuntime.submerged += (submerged - waterRuntime.submerged)
+      * Math.min(1, delta * 9);
+    if (waterRuntime.submerged < 0.002) waterRuntime.submerged = 0;
+    c.uUnderwater.value = waterRuntime.submerged;
+    c.uUnderwaterDepth.value = eyeSurface === -Infinity ? 0
+      : Math.max(0, eyeSurface - camera.position.y);
+    c.uTime.value = t;
     c.uBloom.value = qq.bloom;
     c.uAOAmount.value = wantAO ? qq.aoStrength : 0;
     c.uRays.value = rayAmount;

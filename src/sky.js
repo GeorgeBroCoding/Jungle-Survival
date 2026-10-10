@@ -1020,10 +1020,6 @@ function DayNightSystem() {
 
 
 export {
-  shadowOverride,
-  csmStats,
-  envRuntime,
-  debugClock,
   DAY_LENGTH_SECONDS,
   SKY_STATES,
   skyNow,
@@ -1046,6 +1042,16 @@ export {
   _cloudTex,
   cloudTexture,
   SkyDome,
+  debugClock,
+  envRuntime,
+  shadowOverride,
+  csmStats,
+  adoptForCsm,
+  buildEnvScene,
+  _envGround,
+  updateEnvGround,
+  JUNGLE_BOUNCE,
+  ENV_NIGHT_GROUND,
   ENV_ROWS,
   _envColor,
   acesToneMap,

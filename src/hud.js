@@ -363,7 +363,6 @@ function StatsOverlay() {
 }
 
 export {
-  StatsOverlay,
   formatTime,
   StatBar,
   getItemCategory,
@@ -374,4 +373,5 @@ export {
   BuildPanel,
   MultiplayerPanel,
   DeathScreen,
+  StatsOverlay,
 };

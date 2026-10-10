@@ -287,13 +287,13 @@ const SPLAT_BODY = `
 export {
   TERRAIN_LAYERS,
   TERRAIN_LAYER_COUNT,
+  TERRAIN_ATLAS_SIZE,
   TERRAIN_LAYER_SCALE,
   TERRAIN_LAYER_TINT,
-  TERRAIN_ATLAS_SIZE,
   terrainSplatState,
-  loadTerrainSplat,
   atlasToArrayTexture,
   loadImage,
+  loadTerrainSplat,
   SPLAT_PARS,
   SPLAT_BODY,
 };

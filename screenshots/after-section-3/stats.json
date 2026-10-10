@@ -1,0 +1,78 @@
+{
+ "spawn": {
+  "pos": [
+   0,
+   0,
+   8
+  ],
+  "draws": 1344,
+  "tris": 1163937,
+  "expo": 0.94,
+  "cover": 0.94,
+  "quality": "high"
+ },
+ "riverbank": {
+  "pos": [
+   38,
+   1.6,
+   -96
+  ],
+  "draws": 1109,
+  "tris": 1136162,
+  "expo": 0.52,
+  "cover": 0,
+  "quality": "high"
+ },
+ "lake": {
+  "pos": [
+   40,
+   -0.3,
+   -57
+  ],
+  "draws": 1744,
+  "tris": 1203806,
+  "expo": 0.52,
+  "cover": 0,
+  "quality": "high"
+ },
+ "forest-floor": {
+  "pos": [
+   -28,
+   0.1,
+   26
+  ],
+  "draws": 2199,
+  "tris": 1256869,
+  "expo": 0.529,
+  "cover": 0.05,
+  "quality": "high"
+ },
+ "clearing-noon": {
+  "pos": [
+   16,
+   0,
+   -22
+  ],
+  "draws": 1131,
+  "tris": 1138530,
+  "expo": 0.544,
+  "cover": 0.12,
+  "quality": "high"
+ },
+ "clearing-dusk": {
+  "pos": [
+   16,
+   0,
+   -22
+  ],
+  "draws": 694,
+  "tris": 1090457,
+  "expo": 0.635,
+  "cover": 0.12,
+  "quality": "high"
+ },
+ "_console": {
+  "total": 1,
+  "notFound404Excluded": []
+ }
+}

@@ -59,6 +59,18 @@ def main():
     changed = []
     for mod in mods:
         body = bodies[mod]
+        # Keep the export block in step with what the module declares. Adding a
+        # function by hand and forgetting to export it fails at page load with
+        # "does not provide an export named", which is a slow way to find a
+        # one-line omission.
+        if mod != 'main':
+            names = []
+            for n in DECL.findall(body):
+                if n not in names:
+                    names.append(n)
+            block = ('\nexport {\n' + ''.join('  %s,\n' % n for n in names) + '};\n') if names else ''
+            body = re.sub(r'\nexport \{[^}]*\};\n?$', '', body.rstrip('\n')) + block
+            bodies[mod] = body
         mine = set(DECL.findall(body))
         by_mod = {}
         for n in sorted(set(WORD.findall(code_only(body))) - mine):

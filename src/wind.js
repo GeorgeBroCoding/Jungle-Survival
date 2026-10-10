@@ -23,6 +23,12 @@ const windUniforms = {
   uGrassWind: { value: 0.16 },
   uMossAmount: { value: 0.55 },
   uMossColor: { value: new THREE.Color('#5c7a3a') },
+  // Where the spray lands. Set to the foot of the waterfall once the river
+  // profile exists; anything within a few metres of it is permanently soaked.
+  uWetCenter: { value: new THREE.Vector2(0, 0) },
+  uWetRadius: { value: 3.4 },
+  uWetHeight: { value: 0 },
+  uWetAmount: { value: 0.9 },
   uLodNear: { value: 45 },
   uLodFar: { value: 150 },
   uLodCull: { value: 0.7 },
@@ -172,6 +178,10 @@ const MOSS_GLSL = `
   varying vec3 vJkWorldPos;
   varying vec3 vJkWorldNormal;
   uniform float uMossAmount;
+  uniform vec2 uWetCenter;
+  uniform float uWetRadius;
+  uniform float uWetHeight;
+  uniform float uWetAmount;
   uniform vec3 uMossColor;
   float jkHash3(vec3 p) {
     p = fract(p * 0.3183099 + vec3(0.11, 0.17, 0.23));
@@ -197,10 +207,30 @@ const MOSS_APPLY = [
   '  float jkFine = jkNoise3( vJkWorldPos * 3.1 );',
   '  float jkMoss = smoothstep( 0.15, 0.8, jkUp ) * smoothstep( 0.42, 0.78, jkPatch ) * uMossAmount;',
   '  diffuseColor.rgb = mix( diffuseColor.rgb, uMossColor * ( 0.65 + 0.7 * jkFine ), jkMoss );',
+  // Rock at the foot of a waterfall is permanently soaked, and wet rock is
+  // darker and far glossier than dry rock. The terrain already does this for
+  // the ground; without it here the boulders in the spray look like they were
+  // dropped in from a different, drier scene.
+  '  float jkWetD = distance( vJkWorldPos.xz, uWetCenter ) - uWetRadius;',
+  '  float jkWet = clamp( 1.0 - jkWetD / 4.5, 0.0, 1.0 ) * uWetAmount;',
+  '  jkWet *= smoothstep( 3.2, 0.2, vJkWorldPos.y - uWetHeight );',
+  '  diffuseColor.rgb *= mix( 1.0, 0.42, jkWet );',
   '#endif',
 ].join('\n');
 
-const windPatchStats = { wind: 0, windFailed: 0, trans: 0, transFailed: 0, moss: 0, mossFailed: 0 };
+// Wet is darker AND glossier. The darkening goes in with the moss above; the
+// gloss has to go in at the roughness chunk, which runs later.
+const WET_ROUGHNESS = [
+  '#include <roughnessmap_fragment>',
+  '#ifdef JK_MOSS',
+  '  float jkWetR = clamp( 1.0 - ( distance( vJkWorldPos.xz, uWetCenter ) - uWetRadius ) / 4.5, 0.0, 1.0 )',
+  '    * uWetAmount * smoothstep( 3.2, 0.2, vJkWorldPos.y - uWetHeight );',
+  '  roughnessFactor = mix( roughnessFactor, roughnessFactor * 0.28 + 0.05, jkWetR );',
+  '#endif',
+].join('\n');
+
+const windPatchStats = { wind: 0, windFailed: 0, trans: 0, transFailed: 0, moss: 0, mossFailed: 0,
+  wet: 0, wetFailed: 0 };
 
 // Adds the shared uniforms and whichever of the extras this material wants.
 // Guarded on the chunks it rewrites, verified against three r160.
@@ -227,6 +257,10 @@ function makeWindy(mat, opts) {
       if (o.mossy) {
         shader.uniforms.uMossAmount = windUniforms.uMossAmount;
         shader.uniforms.uMossColor = windUniforms.uMossColor;
+        shader.uniforms.uWetCenter = windUniforms.uWetCenter;
+        shader.uniforms.uWetRadius = windUniforms.uWetRadius;
+        shader.uniforms.uWetHeight = windUniforms.uWetHeight;
+        shader.uniforms.uWetAmount = windUniforms.uWetAmount;
         prelude = 'varying vec3 vJkWorldPos;\nvarying vec3 vJkWorldNormal;\n' + prelude;
         defines += '#define JK_MOSS\n';
       }
@@ -242,6 +276,13 @@ function makeWindy(mat, opts) {
           shader.fragmentShader = '#define JK_MOSS\n' + MOSS_GLSL + '\n'
             + shader.fragmentShader.replace('#include <map_fragment>', MOSS_APPLY);
           windPatchStats.moss++;
+          if (shader.fragmentShader.indexOf('#include <roughnessmap_fragment>') !== -1) {
+            shader.fragmentShader = shader.fragmentShader
+              .replace('#include <roughnessmap_fragment>', WET_ROUGHNESS);
+            windPatchStats.wet++;
+          } else {
+            windPatchStats.wetFailed++;
+          }
         } else {
           windPatchStats.mossFailed++;
         }
@@ -466,6 +507,7 @@ export {
   LEAF_TRANSLUCENCY,
   MOSS_GLSL,
   MOSS_APPLY,
+  WET_ROUGHNESS,
   windPatchStats,
   makeWindy,
   applyWindOverride,

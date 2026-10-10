@@ -443,9 +443,6 @@ function riverDistance(x, z) {
 }
 
 export {
-  riverDistance,
-  POND_SILT_R,
-  MAP_CAVE_MOUTHS,
   RESOURCES,
   CRAFTING_RECIPES,
   WEAPONS,
@@ -468,6 +465,7 @@ export {
   POND_SHORE_Y,
   POND_DEPTH,
   POND_BLEND_R,
+  POND_SILT_R,
   POND_OVERRUN,
   BASE_CENTER,
   PLAYER_SPAWN,
@@ -520,4 +518,6 @@ export {
   _OBS_R,
   STATIC_OBSTACLES,
   mulberry32,
+  MAP_CAVE_MOUTHS,
+  riverDistance,
 };

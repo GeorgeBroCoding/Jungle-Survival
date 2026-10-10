@@ -235,7 +235,9 @@ export {
   CLUTTER_KINDS,
   buildMushroomGeometry,
   mergeSimpleGeometries,
+  _mushroomGeo,
   clutterGeometry,
-  clutterMaterial,
   GroundClutter,
+  CLUTTER_MATS,
+  clutterMaterial,
 };

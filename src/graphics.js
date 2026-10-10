@@ -21,7 +21,7 @@ const GRAPHICS_PRESETS = {
     // Water. Refraction needs the post chain's colour buffer, so Low falls
     // back to a plain transparent surface with depth-tinted colour.
     waterRefract: false, waterSSR: 0, waterCaustics: false, waterRipples: 0,
-    waterSpray: 0, waterMist: 0,
+    waterSpray: 0, waterMist: 0, waterDebris: 0,
   },
   medium: {
     label: 'Medium', grassRadius: 20, grassPerCell: 55, foliage: 220,
@@ -32,7 +32,7 @@ const GRAPHICS_PRESETS = {
     godRays: false, dof: false, vignette: 0.26, grain: 0.012, heightFog: 1, heatHaze: false,
     dustMotes: 140, fallingLeaves: 24,
     waterRefract: true, waterSSR: 0, waterCaustics: true, waterRipples: 8,
-    waterSpray: 70, waterMist: 60,
+    waterSpray: 70, waterMist: 60, waterDebris: 22,
   },
   high: {
     label: 'High', grassRadius: 28, grassPerCell: 95, foliage: 300,
@@ -43,7 +43,7 @@ const GRAPHICS_PRESETS = {
     godRays: true, dof: true, vignette: 0.28, grain: 0.014, heightFog: 1, heatHaze: true,
     dustMotes: 240, fallingLeaves: 40,
     waterRefract: true, waterSSR: 14, waterCaustics: true, waterRipples: 12,
-    waterSpray: 130, waterMist: 120,
+    waterSpray: 130, waterMist: 120, waterDebris: 40,
   },
   ultra: {
     label: 'Ultra', grassRadius: 38, grassPerCell: 130, foliage: 380,
@@ -54,7 +54,7 @@ const GRAPHICS_PRESETS = {
     godRays: true, dof: true, vignette: 0.30, grain: 0.015, heightFog: 1, heatHaze: true,
     dustMotes: 340, fallingLeaves: 60,
     waterRefract: true, waterSSR: 22, waterCaustics: true, waterRipples: 16,
-    waterSpray: 190, waterMist: 180,
+    waterSpray: 190, waterMist: 180, waterDebris: 60,
   },
 };
 

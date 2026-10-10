@@ -490,5 +490,6 @@ export {
   TERRAIN_SIZE,
   TERRAIN_SEGMENTS,
   createTerrainGeometry,
+  applySplatPatch,
   Ground,
 };

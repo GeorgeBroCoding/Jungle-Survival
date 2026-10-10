@@ -10,7 +10,7 @@ import { useGame } from './store.js';
 import { Ground, RIVER, getBiomeColor, getDominantBiome, getTerrainHeight, waterSurfaceAt } from './terrain.js';
 import { buildSoftDisc, texFrom } from './textures.js';
 import { InstancedModels, buildBushModel, buildCactusModel, buildFernModel, buildPalmModel, buildPineModel, buildRockModel, buildTreeModel, vegGeo, vegMat } from './vegetation.js';
-import { Water, spawnRipple, waterRuntime } from './water.js';
+import { RiverDebris, Water, spawnRipple, waterRuntime } from './water.js';
 import { PROJECT_WITH_WIND, WIND_GLSL, windUniforms } from './wind.js';
 
 // grass.js - instanced ground cover that follows the player
@@ -755,6 +755,7 @@ function World() {
       <${FallingLeaves} />
       <${GroundClutter} />
       <${WaterSpray} />
+      <${RiverDebris} />
       <${WaterDisturbance} />
       <${DecorativeFoliage} />
     <//>

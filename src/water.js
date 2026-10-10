@@ -1,12 +1,13 @@
-import { THREE, useEffect, useMemo } from './core.js';
-import { POND_CENTER, POND_OVERRUN, POND_RADIUS, POND_SURFACE_Y, RIVER_HALF, riverCenterSlope, riverCenterX } from './data.js';
+import { THREE, html, useEffect, useFrame, useMemo, useRef } from './core.js';
+import { POND_CENTER, POND_OVERRUN, POND_RADIUS, POND_SURFACE_Y, RIVER_HALF, RIVER_Z0, RIVER_Z1, mulberry32, riverCenterSlope, riverCenterX } from './data.js';
 import { GRAPHICS_PRESETS, gfx } from './graphics.js';
 import { skyRuntime } from './runtime.js';
 import { ATMO, ATMO_GLSL } from './sky.js';
 import { useGame } from './store.js';
-import { RIVER, getTerrainHeight } from './terrain.js';
+import { RIVER, getTerrainHeight, riverStation, riverSurfaceY } from './terrain.js';
 import { fbm, greyCanvasFromField, smoothstep, texFrom } from './textures.js';
-import { waterNormals } from './wind.js';
+import { vegGeo, vegMat } from './vegetation.js';
+import { waterNormals, windUniforms } from './wind.js';
 
 // ---------- Water ----------
 // Water is drawn in a pass of its own, after the opaque scene, out of its own
@@ -36,6 +37,9 @@ const waterRuntime = {
   // Driven by the weather system when there is one; until then the rain
   // ripple source is simply switched off.
   rain: 0,
+  // 0 above the surface, 1 with the eye under it. Eased, so breaking the
+  // surface is a transition rather than a switch.
+  submerged: 0,
   stats: { ripples: 0, surfaces: 0, spray: 0 },
 };
 
@@ -101,19 +105,35 @@ const WATER_WAVE_GLSL = `
   uniform vec4 uRipples[${JK_RIPPLE_SLOTS}];
   uniform float uRippleLife;
   uniform float uSwell;
+  uniform float uWindWave;   // how hard it is blowing, from the shared wind
 
+  // Three long waves plus a short chop. The chop is what the wind actually
+  // raises: a lake in a dead calm still has swell rolling across it, but the
+  // small steep stuff only appears when there is weather, so its amplitude
+  // comes from the same wind system the trees and grass move on.
+  //
+  // Crests are sharpened by pushing the sine through a power rather than by a
+  // full Gerstner displacement, which would want its own normal derivation.
+  // Both halves below are the same function and its exact derivative - if one
+  // is edited the other has to be, or the lighting stops matching the shape.
   float jkWaveH(vec2 p, float t) {
+    float chop = sin(p.x * 1.55 - p.y * 0.92 + t * 3.4) * 0.012 * uWindWave;
+    chop += sin(p.x * 0.78 + p.y * 1.71 - t * 2.9) * 0.009 * uWindWave;
     return ( sin(p.x * 0.42 + t * 1.25) * 0.035
            + sin(p.y * 0.33 - t * 0.95) * 0.030
-           + sin((p.x + p.y) * 0.60 + t * 1.90) * 0.015 ) * uSwell;
+           + sin((p.x + p.y) * 0.60 + t * 1.90) * 0.015 ) * uSwell
+           + chop;
   }
 
   vec2 jkWaveSlope(vec2 p, float t) {
     float c = cos((p.x + p.y) * 0.60 + t * 1.90) * 0.015 * 0.60;
-    return vec2(
+    vec2 swell = vec2(
       cos(p.x * 0.42 + t * 1.25) * 0.035 * 0.42 + c,
       cos(p.y * 0.33 - t * 0.95) * 0.030 * 0.33 + c
     ) * uSwell;
+    float c1 = cos(p.x * 1.55 - p.y * 0.92 + t * 3.4) * 0.012 * uWindWave;
+    float c2 = cos(p.x * 0.78 + p.y * 1.71 - t * 2.9) * 0.009 * uWindWave;
+    return swell + vec2(c1 * 1.55 + c2 * 0.78, c1 * -0.92 + c2 * 1.71);
   }
 
   // One expanding ring per live ripple. The ring travels outward at
@@ -180,7 +200,7 @@ const WATER_VERT = `
 // Built lazily: it splices in DEPTH_GLSL and ATMO_GLSL, which are declared
 // further down the file, so evaluating this at module scope would hit the
 // temporal dead zone.
-function waterFrag() {
+function waterFrag(ssrSteps) {
   return `
   uniform vec2 uResolution;
   uniform vec3 uCamPos;
@@ -196,6 +216,11 @@ function waterFrag() {
   uniform vec3 uScatter;     // what the water itself glows back at you
   uniform float uNormalScale;
   uniform float uRefract;
+  #ifdef JK_SSR
+    uniform mat4 uViewProj;
+    uniform mat4 uViewMatrix;
+    uniform float uSsrThickness;
+  #endif
   uniform float uFoamWidth;
   uniform float uFoamAmount;
   uniform float uMaxDepth;
@@ -332,6 +357,47 @@ function waterFrag() {
     R.y = abs(R.y) + 0.001;
     vec3 sky = atmoSky(R, uSunDir, uTurbidity, uRayleigh, uMieC, uMieG, 1.0) * uSkyGain;
 
+    #ifdef JK_SSR
+      // Trees in the water. Reflecting only the sky is what makes game water
+      // read as a blue sheet: at a grazing angle a real lake is a mirror, and
+      // what it mirrors is the bank.
+      //
+      // The reflected ray is walked in world space and projected each step,
+      // rather than marched in screen space, because the step then stays a
+      // fixed size in metres and does not stretch out toward the horizon. The
+      // scene's depth is already on hand as metres from the eye for the
+      // refraction, so the hit test is a comparison, not a reconstruction.
+      vec3 ssrColour = sky;
+      float ssrHit = 0.0;
+      {
+        float stride = 0.42;
+        vec3 p = vWorld + R * 0.25;
+        for (int i = 0; i < ${ssrSteps}; i++) {
+          p += R * stride;
+          stride *= 1.18;            // coarser the further it travels
+          vec4 clip = uViewProj * vec4(p, 1.0);
+          if (clip.w <= 0.0) break;
+          vec2 suv2 = clip.xy / clip.w * 0.5 + 0.5;
+          if (suv2.x < 0.0 || suv2.x > 1.0 || suv2.y < 0.0 || suv2.y > 1.0) break;
+          float rayZ = -(uViewMatrix * vec4(p, 1.0)).z;
+          float sceneZ2 = texture2D(tSceneDepth, suv2).r;
+          // A hit is the ray passing behind something, but only just behind:
+          // further than uSsrThickness and the ray went past the back of it and
+          // the "reflection" would be of a surface it never touched.
+          if (rayZ > sceneZ2 && rayZ - sceneZ2 < uSsrThickness) {
+            ssrColour = texture2D(tRefract, suv2).rgb;
+            // Fade out at the edge of the screen, where there is simply no
+            // information, and with distance, where the stride is too coarse.
+            vec2 edge = abs(suv2 - 0.5) * 2.0;
+            ssrHit = (1.0 - smoothstep(0.72, 1.0, max(edge.x, edge.y)))
+                   * (1.0 - smoothstep(0.55, 0.95, float(i) / float(${ssrSteps})));
+            break;
+          }
+        }
+      }
+      sky = mix(sky, ssrColour, ssrHit);
+    #endif
+
     // Schlick, F0 = 0.02 for water. At a grazing angle the surface is a mirror;
     // looking straight down it is a window.
     float fres = 0.02 + 0.98 * pow(clamp(1.0 - max(dot(N, V), 0.0), 0.0, 1.0), 5.0);
@@ -421,11 +487,16 @@ function makeWaterMaterial(q) {
   // Caustics need to know where the sightline hits the bottom, which is the
   // depth buffer's job. Without it there is nowhere to paint them.
   if (q.waterCaustics && q.post) defines.JK_CAUSTICS = '';
+  // Screen-space reflections need both the colour of the scene before the
+  // water and its depth, so they ride on the same pass refraction does.
+  const ssr = refracting && (q.waterSSR | 0) > 0;
+  if (ssr) defines.JK_SSR = '';
   const u = {
     uTime: { value: 0 },
     uRipples: { value: waterRuntime.ripples },
     uRippleLife: { value: JK_RIPPLE_LIFE },
     uSwell: { value: 1 },
+    uWindWave: { value: 1 },
     uResolution: { value: new THREE.Vector2(1, 1) },
     uCamPos: { value: new THREE.Vector3() },
     uSunDir: { value: new THREE.Vector3(0, 1, 0) },
@@ -447,7 +518,10 @@ function makeWaterMaterial(q) {
     uMaxDepth: { value: 6 },
     uOpacity: { value: 0.92 },
     uSunColor: { value: new THREE.Color('#ffffff') },
-    uCaustic: { value: 0.55 },
+    uCaustic: { value: 0.38 },
+    uViewProj: { value: new THREE.Matrix4() },
+    uViewMatrix: { value: new THREE.Matrix4() },
+    uSsrThickness: { value: 1.6 },
     tRefract: { value: null },
     tSceneDepth: { value: null },
     uNear: { value: 0.1 },
@@ -456,7 +530,7 @@ function makeWaterMaterial(q) {
   const m = new THREE.ShaderMaterial({
     uniforms: THREE.UniformsUtils.clone(THREE.UniformsLib.fog),
     vertexShader: WATER_VERT,
-    fragmentShader: waterFrag(),
+    fragmentShader: waterFrag(Math.max(1, q.waterSSR | 0)),
     defines: defines,
     fog: true,
     // Refracting water does its own blending in the shader, so it can be
@@ -638,6 +712,80 @@ const RAINBOW_FRAG = `
   }
 `;
 
+// ---------- What the river is carrying ----------
+// A current you cannot see anything moving in does not read as a current. These
+// are leaves and bits of bark riding the flow: they travel downstream at the
+// local speed, drift across the channel, spin, and are put back at the source
+// when they reach the pond. Cheap - one instanced mesh, a few dozen of them -
+// and the single clearest signal that the river is going somewhere.
+function RiverDebris() {
+  const quality = useGame((s) => s.graphicsQuality);
+  const q = GRAPHICS_PRESETS[quality] || gfx();
+  const count = Math.max(0, (q.waterDebris | 0));
+  const ref = useRef();
+
+  const data = useMemo(() => {
+    const rand = mulberry32(5512);
+    const bits = [];
+    for (let i = 0; i < count; i++) {
+      bits.push({
+        z: RIVER_Z0 + rand() * (RIVER_Z1 - RIVER_Z0),
+        across: (rand() * 2 - 1) * 0.78,
+        spin: (rand() - 0.5) * 2.2,
+        phase: rand() * 100,
+        size: 0.10 + rand() * 0.16,
+        drift: (rand() - 0.5) * 0.22,
+      });
+    }
+    return {
+      bits,
+      m: new THREE.Matrix4(), v: new THREE.Vector3(), q: new THREE.Quaternion(),
+      e: new THREE.Euler(), s: new THREE.Vector3(), c: new THREE.Color(),
+    };
+  }, [count]);
+
+  useFrame((state, delta) => {
+    const mesh = ref.current;
+    if (!mesh || count === 0) return;
+    const d = Math.min(0.1, delta);
+    const t = state.clock.elapsedTime;
+    for (let i = 0; i < data.bits.length; i++) {
+      const b = data.bits[i];
+      // Downstream is +z. Speed from the local grade, same number the surface
+      // shader uses for its flow, so debris and water move together.
+      const st = riverStation(b.z);
+      const j = Math.min(RIVER.n - 1, st.i + 1);
+      const dz = Math.max(0.01, RIVER.zs[j] - RIVER.zs[st.i]);
+      const grade = Math.max(0, (RIVER.surf[st.i] - RIVER.surf[j]) / dz);
+      const speed = Math.min(2.6, 0.75 + grade * 16);
+      b.z += speed * d;
+      b.across += b.drift * d;
+      if (b.across > 0.92 || b.across < -0.92) b.drift = -b.drift;
+      if (b.z >= RIVER_Z1) b.z = RIVER_Z0 + (b.z - RIVER_Z1);
+
+      const cx = riverCenterX(b.z);
+      const m = riverCenterSlope(b.z);
+      const norm = 1 / Math.sqrt(1 + m * m);
+      const x = cx + (b.across * RIVER_HALF) / norm;
+      const y = riverSurfaceY(b.z) + 0.03;
+      // Lying on the surface, turning slowly as it goes.
+      data.e.set(-Math.PI / 2 + Math.sin(t * 1.4 + b.phase) * 0.35,
+        t * b.spin * 0.5 + b.phase, Math.cos(t * 1.1 + b.phase) * 0.3);
+      data.q.setFromEuler(data.e);
+      data.v.set(x, y, b.z);
+      data.s.set(b.size, b.size, b.size);
+      data.m.compose(data.v, data.q, data.s);
+      mesh.setMatrixAt(i, data.m);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+  });
+
+  if (count === 0) return null;
+  return html`<instancedMesh ref=${ref}
+    args=${[vegGeo('leafCard'), vegMat('leafCard'), count]}
+    castShadow=${false} receiveShadow=${false} frustumCulled=${false} />`;
+}
+
 // Console overrides, same channel as the wind: anything PostFX writes every
 // frame cannot be held from outside without one.
 function applyWaterOverride() {
@@ -664,8 +812,18 @@ function drawWater(gl, scene, camera, t, w, h) {
     ws.traverse((o) => { if (o.material) o.material.needsUpdate = true; });
   }
   u.uTime.value = t;
+  // The chop follows the weather, not a constant. uWindStrength is the same
+  // number the trees and the grass lean to, so a gust crosses the water and
+  // the forest together instead of each keeping its own weather.
+  if (u.uWindWave) {
+    u.uWindWave.value = Math.max(0.15, windUniforms.uWindStrength.value / 0.09);
+  }
   u.uResolution.value.set(w, h);
   u.uCamPos.value.copy(camera.position);
+  if (u.uViewProj) {
+    u.uViewMatrix.value.copy(camera.matrixWorldInverse);
+    u.uViewProj.value.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  }
   u.uSunDir.value.copy(skyRuntime.sunDir);
   const sunLit = Math.max(0, skyRuntime.sunI);
   if (u.uSunColor) u.uSunColor.value.copy(skyRuntime.sunColor).multiplyScalar(sunLit);
@@ -793,8 +951,11 @@ function Water() {
     waterRuntime.fallMat = fallMat;
     waterRuntime.bow = bow;
     waterRuntime.stats.surfaces = 3;
+    // Tell the rock shader where the spray lands.
+    windUniforms.uWetCenter.value.set(riverCenterX(bowZ), bowZ);
+    windUniforms.uWetHeight.value = RIVER.surf[RIVER.fallI + 1];
     return { scene, geos, mats, mat };
-  }, [q.waterSegments, q.waterRefract, q.waterCaustics, q.post]);
+  }, [q.waterSegments, q.waterRefract, q.waterCaustics, q.waterSSR, q.post]);
 
   useEffect(() => () => {
     for (const g of rig.geos) g.dispose();
@@ -833,6 +994,7 @@ export {
   WATERFALL_VERT,
   WATERFALL_FRAG,
   RAINBOW_FRAG,
+  RiverDebris,
   applyWaterOverride,
   _bowFwd,
   drawWater,
