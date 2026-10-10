@@ -530,6 +530,95 @@ function wrapHalf(v, half) {
   return r - half;
 }
 
+// ---------- Fireflies ----------
+// Night here had stars, a moon and campfires, and nothing alive in it. These
+// drift in a box that follows the player like the dust motes do, but they are
+// lights rather than lit things: each carries its own slow pulse, and they
+// only exist once the sun is properly down.
+const FIREFLY_HALF = 14;
+
+function Fireflies() {
+  const quality = useGame((s) => s.graphicsQuality);
+  const q = GRAPHICS_PRESETS[quality] || gfx();
+  const count = Math.max(0, q.fireflies | 0);
+  const ref = useRef();
+
+  const data = useMemo(() => {
+    const rand = mulberry32(2718);
+    const pos = new Float32Array(Math.max(1, count) * 3);
+    const col = new Float32Array(Math.max(1, count) * 3);
+    const bugs = [];
+    for (let i = 0; i < count; i++) {
+      bugs.push({
+        x: (rand() * 2 - 1) * FIREFLY_HALF,
+        y: 0.35 + rand() * 2.1,
+        z: (rand() * 2 - 1) * FIREFLY_HALF,
+        phase: rand() * 100,
+        // Each has its own blink rate, or they pulse as one organism.
+        rate: 0.5 + rand() * 1.5,
+        drift: 0.18 + rand() * 0.3,
+      });
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), FIREFLY_HALF * 3);
+    return { geo, pos, col, bugs };
+  }, [count]);
+
+  const mat = useMemo(() => new THREE.PointsMaterial({
+    map: texFrom(buildSoftDisc(32), [1, 1], false),
+    size: 0.13,
+    sizeAttenuation: true,
+    transparent: true,
+    depthWrite: false,
+    vertexColors: true,
+    blending: THREE.AdditiveBlending,
+    toneMapped: false,
+  }), []);
+
+  useEffect(() => () => { data.geo.dispose(); mat.dispose(); }, [data, mat]);
+
+  useFrame((state) => {
+    const pts = ref.current;
+    if (!pts || count === 0) return;
+    // Only after dark, and faded in rather than switched on.
+    const night = Math.max(0, Math.min(1, (skyRuntime.star - 0.25) / 0.45));
+    pts.visible = night > 0.01;
+    if (!pts.visible) return;
+    const t = state.clock.elapsedTime;
+    const px = playerTransform.position[0];
+    const py = playerTransform.position[1];
+    const pz = playerTransform.position[2];
+    const pos = data.pos;
+    const col = data.col;
+    for (let i = 0; i < data.bugs.length; i++) {
+      const b = data.bugs[i];
+      // A wandering hover: two slow sines per axis at different rates, so the
+      // path never closes and never repeats visibly.
+      const wx = Math.sin(t * b.drift + b.phase) * 2.6
+               + Math.sin(t * b.drift * 0.37 + b.phase * 1.7) * 1.3;
+      const wz = Math.cos(t * b.drift * 0.82 + b.phase * 1.3) * 2.6
+               + Math.cos(t * b.drift * 0.29 + b.phase) * 1.1;
+      const wy = Math.sin(t * b.drift * 1.6 + b.phase * 2.1) * 0.5;
+      pos[i * 3] = px + wrapHalf(b.x + wx, FIREFLY_HALF);
+      pos[i * 3 + 1] = py + b.y + wy;
+      pos[i * 3 + 2] = pz + wrapHalf(b.z + wz, FIREFLY_HALF);
+      // The blink: mostly dark, with a sharp rise. A sine would read as a
+      // pulsing dot; a real one is off, then suddenly on.
+      const k = Math.pow(Math.max(0, Math.sin(t * b.rate + b.phase)), 7) * night;
+      col[i * 3] = k * 0.85;
+      col[i * 3 + 1] = k * 1.0;
+      col[i * 3 + 2] = k * 0.30;
+    }
+    data.geo.attributes.position.needsUpdate = true;
+    data.geo.attributes.color.needsUpdate = true;
+  });
+
+  if (count === 0) return null;
+  return html`<points ref=${ref} geometry=${data.geo} material=${mat} frustumCulled=${false} />`;
+}
+
 // ---------- Falling leaves ----------
 // A handful of leaves spiralling down, recycled in a box that follows the
 // player. They reuse the leaf-card geometry and material, so they cost one
@@ -787,6 +876,7 @@ function World() {
       <${GrassField} />
       <${DustMotes} />
       <${FallingLeaves} />
+      <${Fireflies} />
       <${GroundClutter} />
       <${WaterSpray} />
       <${RiverDebris} />
@@ -814,6 +904,8 @@ export {
   _dustCam,
   DustMotes,
   wrapHalf,
+  FIREFLY_HALF,
+  Fireflies,
   FALL_HALF,
   FALL_TOP,
   FallingLeaves,

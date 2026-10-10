@@ -1,11 +1,12 @@
 import { THREE, html, useEffect, useMemo, useState } from './core.js';
 import { POND_BLEND_R, POND_CENTER, POND_DEPTH, POND_OVERRUN, POND_RADIUS, POND_SHORE_Y, POND_SILT_R, POND_SURFACE_Y, RIVER_BANK, RIVER_DEPTH, RIVER_FALL_H, RIVER_FALL_Z, RIVER_HALF, RIVER_STATIONS, RIVER_Z0, RIVER_Z1, riverCenterSlope, riverCenterX, riverDistance } from './data.js';
 import { GRAPHICS_PRESETS, gfx } from './graphics.js';
+import { skyRuntime } from './runtime.js';
 import { useGame } from './store.js';
 import { SPLAT_BODY, SPLAT_PARS, TERRAIN_LAYER_SCALE, TERRAIN_LAYER_TINT, loadTerrainSplat, terrainSplatState } from './terrainsplat.js';
 import { smoothstep } from './textures.js';
 import { RIVER_OVERRUN } from './water.js';
-import { grainTiled, surface, surfaceTiled } from './wind.js';
+import { grainTiled, surface, surfaceTiled, windUniforms } from './wind.js';
 
 // ---------- Terrain: rolling hills + a ring of distant mountains ----------
 // Each entry is a smooth "bump" added to the terrain height field. Bumps are placed
@@ -376,6 +377,9 @@ function applySplatPatch(shader, maps) {
   shader.uniforms.uBiomeSnow = { value: zone(2) };
   shader.uniforms.uBiomeRock = { value: zone(3) };
   shader.uniforms.uBiomeSwamp = { value: zone(4) };
+  shader.uniforms.uSunDirTerrain = { value: skyRuntime.sunDir };
+  shader.uniforms.uDapple = { value: 0.62 };
+  shader.uniforms.uDappleTime = windUniforms.uWindTime;
 
   // World position and world normal, which the splat needs and the standard
   // material does not otherwise carry.
@@ -403,7 +407,14 @@ function applySplatPatch(shader, maps) {
       + '  normal = normalize(normal + (splatT * splatN.x + splatB * splatN.y) * 1.25);')
     .replace('#include <aomap_fragment>',
       '#include <aomap_fragment>\n'
-      + '  reflectedLight.indirectDiffuse *= mix(1.0, splatOrm.r, 0.85);');
+      + '  reflectedLight.indirectDiffuse *= mix(1.0, splatOrm.r, 0.85);')
+    // The dapple scales the DIRECT light only. Dimming the ambient as well
+    // would just make the floor darker; what makes it read is sun and shade
+    // sitting side by side.
+    .replace('#include <lights_fragment_end>',
+      '#include <lights_fragment_end>\n'
+      + '  reflectedLight.directDiffuse *= mix(1.0, splatDapple(vSplatWorld, uDappleTime),'
+      + ' uDapple);');
   return shader;
 }
 

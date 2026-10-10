@@ -137,6 +137,9 @@ const SPLAT_PARS = `
   uniform vec4 uBiomeRock;
   uniform vec4 uBiomeSnow;
   uniform vec4 uBiomeSwamp;
+  uniform vec3 uSunDirTerrain;
+  uniform float uDapple;
+  uniform float uDappleTime;
   varying vec3 vSplatWorld;
   varying vec3 vSplatNormalW;
 
@@ -169,6 +172,26 @@ const SPLAT_PARS = `
       d = min(d, abs(wpos.x - cx) / sqrt(1.0 + m * m) - uRiverHalf);
     }
     return d;
+  }
+
+  // Dappled light. The single most recognisable thing about a rainforest floor
+  // is that it is mostly shade with coins of sun moving across it, and the
+  // shadow map cannot give you that: a cascade covering thirty metres has
+  // texels far too coarse to resolve a leaf.
+  //
+  // So it is projected rather than cast. The ground position is pushed along
+  // the sun direction up to canopy height, which is where the gaps actually
+  // are, and sampled there - so the pattern slides across the floor as the sun
+  // moves, the way a real one does, instead of being painted on.
+  float splatDapple(vec3 wpos, float t) {
+    vec3 up = wpos + uSunDirTerrain * (7.5 / max(0.25, uSunDirTerrain.y));
+    vec2 q = up.xz * 0.42;
+    // Two layers drifting against each other: the canopy is not one surface.
+    q += vec2(sin(t * 0.21), cos(t * 0.17)) * 0.6;
+    float a = splatFbm(q);
+    float b = splatFbm(q * 2.3 - vec2(t * 0.06, t * 0.045));
+    float gap = smoothstep(0.52, 0.86, a * 0.62 + b * 0.48);
+    return gap;
   }
 
   float splatBiome(vec3 wpos, vec4 zone) {
