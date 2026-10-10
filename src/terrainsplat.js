@@ -139,6 +139,7 @@ const SPLAT_PARS = `
   uniform vec4 uBiomeSwamp;
   uniform vec3 uSunDirTerrain;
   uniform float uDapple;
+  uniform float uRainWet;      // how wet the weather has made everything
   uniform float uDappleTime;
   varying vec3 vSplatWorld;
   varying vec3 vSplatNormalW;
@@ -299,6 +300,10 @@ const SPLAT_BODY = `
   // alone reads as a stain, gloss alone as a plastic sheet.
   float splatWet = clamp(1.0 - splatWaterDistance(vSplatWorld) / 5.0, 0.0, 1.0);
   splatWet *= smoothstep(1.4, 0.1, vSplatWorld.y - uWaterLine);
+  // Rain wets everything, not only the margins. Hollows soak first and hold it
+  // longest, which is where puddles would form.
+  float hollow = 1.0 - smoothstep(0.0, 0.55, splatOrm.b);
+  splatWet = max(splatWet, uRainWet * (0.45 + hollow * 0.55));
   splatAlbedo.rgb *= mix(1.0, 0.46, splatWet);
   splatOrm.g = mix(splatOrm.g, splatOrm.g * 0.30 + 0.04, splatWet);
 

@@ -19,6 +19,7 @@ import { debugWarp, touchInput } from './touch.js';
 import { Hud } from './touchcontrols.js';
 import { DistantRaidManager, DistantRaiders, DistantTribeCamps, EscortWarriors, FriendBase, InterTribalRaidManager, InterTribalRaiders, PlayerTribeBase, PlayerWarriors, RaidManager, Raiders, TribeCamps, TribeSpawnManager } from './tribes.js';
 import { drawWater, spawnRipple, updateRipples, waterRuntime } from './water.js';
+import { weather } from './weather.js';
 import { applyWindOverride, windPatchStats, windUniforms } from './wind.js';
 
 // App.js - top-level composition
@@ -274,6 +275,7 @@ const COMPOSITE_FRAG = `
   uniform vec2 uTexel;
   uniform float uExposure;
   uniform float uToneMapper;   // 0 = ACES, 1 = AgX
+  uniform float uFlash;        // lightning, decaying
   uniform float uUnderwater;   // 0 above the surface, 1 below it
   uniform vec3 uUnderwaterTint;
   uniform float uUnderwaterDensity;
@@ -387,6 +389,13 @@ ${ACES_GLSL}
     // frame rather than argued about: 0 = ACES, 1 = AgX.
     vec3 exposed = colour * uExposure;
     vec3 mapped = lin2srgb(mix(aces(exposed), agx(exposed), uToneMapper));
+
+    // Lightning is blue-white and flat: it washes colour out of everything for
+    // the fraction of a second it lasts.
+    if (uFlash > 0.0) {
+      float lum = dot(mapped, vec3(0.2126, 0.7152, 0.0722));
+      mapped = mix(mapped, mix(vec3(lum), vec3(0.78, 0.86, 1.0) * lum, 0.55), uFlash * 0.8);
+    }
 
     // --- under the surface ---
     // Water is not a blue filter over the picture: it absorbs red within a
@@ -570,6 +579,7 @@ function PostFX() {
           // not close. Revisit once the grading LUT exists to put the
           // saturation back; the transform is already here behind this switch.
           uToneMapper: { value: 0 },
+          uFlash: { value: 0 },
           uUnderwater: { value: 0 },
           uUnderwaterTint: { value: new THREE.Color('#123f44') },
           uUnderwaterDensity: { value: 0.085 },
@@ -807,7 +817,12 @@ function PostFX() {
     c.tAO.value = rig.ao1.texture;
     c.tRays.value = rig.rays.texture;
     c.uTexel.value.set(1 / w, 1 / h);
-    c.uExposure.value = skyRuntime.exposure;
+    // A lightning strike as a brief exposure and cold-tint push rather than a
+    // real light: a directional light bright enough to read would also have to
+    // re-render every shadow cascade for the one frame it is up.
+    const flash = skyRuntime.flash || 0;
+    c.uExposure.value = skyRuntime.exposure * (1 + flash * 2.6);
+    c.uFlash.value = flash;
 
     // Is the eye under water? Asked of the same function the spray and the
     // wading check use, so the three cannot disagree about where the surface
@@ -913,6 +928,7 @@ if (typeof window !== 'undefined') {
     setTime: (t) => { debugClock.t = t; },
     envScale: (v) => { envRuntime.scale = v; },
     shadows: shadowOverride,
+    weather,
     river: RIVER,
     riverX: riverCenterX,
     waterAt: waterSurfaceAt,

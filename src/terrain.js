@@ -6,6 +6,7 @@ import { useGame } from './store.js';
 import { SPLAT_BODY, SPLAT_PARS, TERRAIN_LAYER_SCALE, TERRAIN_LAYER_TINT, loadTerrainSplat, terrainSplatState } from './terrainsplat.js';
 import { smoothstep } from './textures.js';
 import { RIVER_OVERRUN } from './water.js';
+import { terrainWet } from './weather.js';
 import { grainTiled, surface, surfaceTiled, windUniforms } from './wind.js';
 
 // ---------- Terrain: rolling hills + a ring of distant mountains ----------
@@ -379,6 +380,7 @@ function applySplatPatch(shader, maps) {
   shader.uniforms.uBiomeSwamp = { value: zone(4) };
   shader.uniforms.uSunDirTerrain = { value: skyRuntime.sunDir };
   shader.uniforms.uDapple = { value: 0.62 };
+  shader.uniforms.uRainWet = terrainWet;
   shader.uniforms.uDappleTime = windUniforms.uWindTime;
 
   // World position and world normal, which the splat needs and the standard

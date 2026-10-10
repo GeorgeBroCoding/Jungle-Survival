@@ -21,6 +21,8 @@ const skyRuntime = {
   exposure: 0.52,
   sunI: 0,
   star: 0,
+  // Lightning, 0..1, decaying. Read by the composite as an exposure push.
+  flash: 0,
 };
 
 const DEPTH_GLSL = `

@@ -11,6 +11,7 @@ import { Ground, RIVER, getBiomeColor, getDominantBiome, getTerrainHeight, water
 import { buildSoftDisc, texFrom } from './textures.js';
 import { InstancedModels, buildBambooModel, buildBigLeafModel, buildBushModel, buildCactusModel, buildFallenTrunkModel, buildFernModel, buildHeliconiaModel, buildPalmModel, buildPineModel, buildRockModel, buildTreeModel, vegGeo, vegMat } from './vegetation.js';
 import { RiverDebris, Water, spawnRipple, waterRuntime } from './water.js';
+import { Rain, WeatherSystem } from './weather.js';
 import { PROJECT_WITH_WIND, WIND_GLSL, windUniforms } from './wind.js';
 
 // grass.js - instanced ground cover that follows the player
@@ -876,6 +877,8 @@ function World() {
       <${GrassField} />
       <${DustMotes} />
       <${FallingLeaves} />
+      <${WeatherSystem} />
+      <${Rain} />
       <${Fireflies} />
       <${GroundClutter} />
       <${WaterSpray} />

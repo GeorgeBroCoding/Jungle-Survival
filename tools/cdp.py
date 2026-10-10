@@ -186,7 +186,10 @@ class Chrome:
                 self.drain(1.5)
 
     def shot(self, path, full=False):
-        r = self.call("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": full})
+        # A 1920x1080 capture of a dense scene can take minutes under software
+        # rendering, and the default timeout turns that into a failed run.
+        r = self.call("Page.captureScreenshot",
+                      {"format": "png", "captureBeyondViewport": full}, timeout=420)
         open(path, "wb").write(base64.b64decode(r["data"]))
         return path
 
