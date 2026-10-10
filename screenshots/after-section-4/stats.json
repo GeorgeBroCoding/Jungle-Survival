@@ -5,8 +5,8 @@
    0,
    8
   ],
-  "draws": 1344,
-  "tris": 1190270,
+  "draws": 1343,
+  "tris": 1163617,
   "expo": 0.94,
   "cover": 0.94,
   "quality": "high"
@@ -17,8 +17,8 @@
    1.6,
    -96
   ],
-  "draws": 1107,
-  "tris": 1162471,
+  "draws": 1108,
+  "tris": 1135842,
   "expo": 0.52,
   "cover": 0,
   "quality": "high"
@@ -29,8 +29,8 @@
    -0.3,
    -57
   ],
-  "draws": 1718,
-  "tris": 1227723,
+  "draws": 1862,
+  "tris": 1213636,
   "expo": 0.52,
   "cover": 0,
   "quality": "high"
@@ -41,10 +41,10 @@
    0.1,
    26
   ],
-  "draws": 2199,
-  "tris": 1283202,
-  "expo": 0.844,
-  "cover": 0.85,
+  "draws": 2115,
+  "tris": 1245220,
+  "expo": 0.529,
+  "cover": 0.05,
   "quality": "high"
  },
  "clearing-noon": {
@@ -53,10 +53,10 @@
    0,
    -22
   ],
-  "draws": 1130,
-  "tris": 1164861,
-  "expo": 0.52,
-  "cover": 0,
+  "draws": 1134,
+  "tris": 1138338,
+  "expo": 0.544,
+  "cover": 0.12,
   "quality": "high"
  },
  "clearing-dusk": {
@@ -65,10 +65,10 @@
    0,
    -22
   ],
-  "draws": 723,
-  "tris": 1119528,
-  "expo": 0.625,
-  "cover": 0,
+  "draws": 690,
+  "tris": 1090131,
+  "expo": 0.631,
+  "cover": 0.12,
   "quality": "high"
  },
  "_console": {

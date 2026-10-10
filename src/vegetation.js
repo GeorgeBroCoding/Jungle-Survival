@@ -731,6 +731,79 @@ function buildBushModel(rand, detail, swamp) {
   return parts;
 }
 
+// The understorey a rainforest is actually recognised by: a few enormous
+// leaves on long stalks, rather than many small ones. One elephant-ear plant
+// reads as jungle in a way that a hundred generic shrubs do not, because the
+// leaf is bigger than a person's head and you can see the shape of it.
+function buildBigLeafModel(rand, detail, kind) {
+  const parts = [];
+  const leaves = detail === 0 ? 3 : detail === 1 ? 5 : 7;
+  // monstera leaves sit flatter and wider; elephant ear stands up and points.
+  const monstera = kind === 'monstera';
+  for (let i = 0; i < leaves; i++) {
+    const a = (i / leaves) * Math.PI * 2 + rand() * 0.7;
+    const lean = monstera ? 0.85 + rand() * 0.5 : 0.45 + rand() * 0.45;
+    const stalk = 0.35 + rand() * 0.55;
+    // The stalk, which is most of what gives these plants their shape.
+    parts.push({
+      k: 'branch',
+      p: [Math.cos(a) * 0.04, 0, Math.sin(a) * 0.04],
+      r: [Math.cos(a) * lean * 0.55, -a, -Math.sin(a) * lean * 0.55],
+      s: [0.018, stalk, 0.018],
+      c: '#7f9c54',
+    });
+    const size = (monstera ? 0.62 : 0.80) * (0.75 + rand() * 0.5);
+    parts.push({
+      k: 'leaf',
+      p: [Math.cos(a) * (0.04 + Math.sin(lean * 0.55) * stalk),
+        stalk * Math.cos(lean * 0.55) * 0.95,
+        Math.sin(a) * (0.04 + Math.sin(lean * 0.55) * stalk)],
+      r: [lean, a, (rand() - 0.5) * 0.4],
+      s: [size, size * (monstera ? 1.05 : 1.35), size],
+      c: monstera
+        ? ['#3f7a34', '#4a8b3c', '#356b2d'][Math.floor(rand() * 3)]
+        : ['#4d8f3e', '#5aa047', '#427f36'][Math.floor(rand() * 3)],
+    });
+  }
+  return parts;
+}
+
+// Heliconia: the one splash of colour on a forest floor that is otherwise
+// every shade of green. Tall narrow leaves, and a bract that is nearly red.
+function buildHeliconiaModel(rand, detail) {
+  const parts = [];
+  const blades = detail === 0 ? 3 : 5;
+  for (let i = 0; i < blades; i++) {
+    const a = (i / blades) * Math.PI * 2 + rand() * 0.6;
+    const lean = 0.30 + rand() * 0.35;
+    const len = 0.75 + rand() * 0.55;
+    parts.push({
+      k: 'frond',
+      p: [Math.cos(a) * 0.05, 0.08, Math.sin(a) * 0.05],
+      r: [lean, a, 0],
+      s: [0.34 + rand() * 0.12, len, 0.34 + rand() * 0.12],
+      c: ['#54913f', '#4a8438', '#619c49'][Math.floor(rand() * 3)],
+    });
+  }
+  if (detail > 0) {
+    // The flower spike: a stack of bracts stepping out alternately.
+    const bx = (rand() - 0.5) * 0.12;
+    const bz = (rand() - 0.5) * 0.12;
+    const n = 4 + Math.floor(rand() * 3);
+    for (let i = 0; i < n; i++) {
+      const side = i % 2 ? 1 : -1;
+      parts.push({
+        k: 'leaf',
+        p: [bx + side * 0.07, 0.55 + i * 0.11, bz],
+        r: [1.35, side > 0 ? 1.57 : -1.57, 0],
+        s: [0.17, 0.26, 0.17],
+        c: i % 3 === 2 ? '#e8b02c' : '#cc3a22',
+      });
+    }
+  }
+  return parts;
+}
+
 // Ferns: the bottom of the three layers. Fronds radiating from a crown, which
 // is the shape that makes a forest floor read as overgrown rather than mown.
 function buildFernModel(rand, detail, swamp) {
@@ -983,6 +1056,8 @@ export {
   buildPalmModel,
   buildPineModel,
   buildBushModel,
+  buildBigLeafModel,
+  buildHeliconiaModel,
   buildFernModel,
   buildRockModel,
   buildCactusModel,

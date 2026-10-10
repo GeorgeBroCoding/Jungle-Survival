@@ -9,10 +9,15 @@ never touch the user's real browser or their logged-in session.
 """
 import base64, json, os, re, select, socket, struct, subprocess, sys, time, urllib.request
 
+
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 HERE = os.path.dirname(os.path.abspath(__file__))
-PROFILE = os.path.join(HERE, "chromeprof")
-PORT = 9333
+PROFILE = os.path.join(HERE, "chromeprof")  # suffixed per port below
+# One debug port means two harness runs fight over the same browser and the
+# loser dies mid-screenshot. Set JK_CDP_PORT to run them side by side.
+PORT = int(os.environ.get("JK_CDP_PORT", "9333"))
+# A profile directory can only be open once, so two browsers need two.
+PROFILE = PROFILE + ("" if PORT == 9333 else "-%d" % PORT)
 
 
 class WS:
