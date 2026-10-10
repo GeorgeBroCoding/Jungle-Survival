@@ -1,3 +1,4 @@
+import { GroundClutter } from './clutter.js';
 import { Fragment, THREE, html, useEffect, useFrame, useMemo, useRef } from './core.js';
 import { PLAYER_SPAWN, POND_CENTER, POND_RADIUS, RIVER_HALF, mulberry32, riverCenterX } from './data.js';
 import { GRAPHICS_PRESETS, canopyField, canopyReset, canopySplat, gfx } from './graphics.js';
@@ -752,6 +753,7 @@ function World() {
       <${GrassField} />
       <${DustMotes} />
       <${FallingLeaves} />
+      <${GroundClutter} />
       <${WaterSpray} />
       <${WaterDisturbance} />
       <${DecorativeFoliage} />

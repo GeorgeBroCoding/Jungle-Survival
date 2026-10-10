@@ -1,5 +1,8 @@
-import { THREE, html, useMemo } from './core.js';
+import { THREE, html, useEffect, useMemo, useState } from './core.js';
 import { POND_BLEND_R, POND_CENTER, POND_DEPTH, POND_OVERRUN, POND_RADIUS, POND_SHORE_Y, POND_SILT_R, POND_SURFACE_Y, RIVER_BANK, RIVER_DEPTH, RIVER_FALL_H, RIVER_FALL_Z, RIVER_HALF, RIVER_STATIONS, RIVER_Z0, RIVER_Z1, riverCenterSlope, riverCenterX, riverDistance } from './data.js';
+import { GRAPHICS_PRESETS, gfx } from './graphics.js';
+import { useGame } from './store.js';
+import { SPLAT_BODY, SPLAT_PARS, TERRAIN_LAYER_SCALE, TERRAIN_LAYER_TINT, loadTerrainSplat, terrainSplatState } from './terrainsplat.js';
 import { smoothstep } from './textures.js';
 import { RIVER_OVERRUN } from './water.js';
 import { grainTiled, surface, surfaceTiled } from './wind.js';
@@ -346,8 +349,83 @@ function createTerrainGeometry() {
   return geo;
 }
 
+// Patch the splat shader into a standard material. It replaces the albedo,
+// normal and roughness lookups and leaves everything else - lighting, the
+// cascaded shadows, fog - to three, which is the whole reason this is an
+// injection rather than a ShaderMaterial.
+function applySplatPatch(shader, maps) {
+  shader.uniforms.tSplatAlbedo = { value: maps.albedo };
+  shader.uniforms.tSplatNormal = { value: maps.normal };
+  shader.uniforms.tSplatOrm = { value: maps.orm };
+  shader.uniforms.uLayerScale = { value: TERRAIN_LAYER_SCALE.slice() };
+  shader.uniforms.uLayerTint = {
+    value: TERRAIN_LAYER_TINT.reduce((acc, _, i, a) => (i % 3 ? acc
+      : acc.concat([new THREE.Vector3(a[i], a[i + 1], a[i + 2])])), []),
+  };
+  shader.uniforms.uSplatHeightBlend = { value: 0.22 };
+  shader.uniforms.uSplatMacro = { value: 0.17 };
+  shader.uniforms.uPondCenter = { value: new THREE.Vector2(POND_CENTER[0], POND_CENTER[1]) };
+  shader.uniforms.uPondRadius = { value: POND_RADIUS };
+  shader.uniforms.uWaterLine = { value: POND_SURFACE_Y };
+  shader.uniforms.uRiverZ = { value: new THREE.Vector2(RIVER_Z0, RIVER_Z1) };
+  shader.uniforms.uRiverHalf = { value: RIVER_HALF };
+  // The same zones getBiomeColor uses, so the ground material and the biome
+  // tint cannot disagree about where the desert is.
+  const zone = (i) => new THREE.Vector4(BIOME_ZONES[i].cx, BIOME_ZONES[i].cz, BIOME_ZONES[i].r, 0);
+  shader.uniforms.uBiomeSand = { value: zone(1) };
+  shader.uniforms.uBiomeSnow = { value: zone(2) };
+  shader.uniforms.uBiomeRock = { value: zone(3) };
+  shader.uniforms.uBiomeSwamp = { value: zone(4) };
+
+  // World position and world normal, which the splat needs and the standard
+  // material does not otherwise carry.
+  shader.vertexShader = 'varying vec3 vSplatWorld;\nvarying vec3 vSplatNormalW;\n'
+    + shader.vertexShader.replace('#include <begin_vertex>',
+      '#include <begin_vertex>\n'
+      + '  vSplatWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;\n'
+      + '  vSplatNormalW = normalize(mat3(modelMatrix) * objectNormal);');
+
+  shader.fragmentShader = SPLAT_PARS + '\n' + shader.fragmentShader
+    .replace('#include <map_fragment>',
+      SPLAT_BODY + '\n  diffuseColor.rgb *= splatAlbedo.rgb;')
+    .replace('#include <roughnessmap_fragment>',
+      'float roughnessFactor = roughness * splatOrm.g;')
+    .replace('#include <normal_fragment_maps>',
+      // Tangent-space normal applied against the terrain's own basis. The
+      // ground is close enough to horizontal that deriving the tangent from
+      // world X is stable, and it avoids needing a tangent attribute.
+      'vec3 splatN = splatSample(tSplatNormal, vSplatWorld, normalize(vSplatNormalW),'
+      + ' float(i0), s0).xyz * m0 + splatSample(tSplatNormal, vSplatWorld,'
+      + ' normalize(vSplatNormalW), float(i1), s1).xyz * m1;\n'
+      + '  splatN = splatN * 2.0 - 1.0;\n'
+      + '  vec3 splatT = normalize(cross(vec3(0.0, 1.0, 0.0), normal) + vec3(1e-5, 0.0, 0.0));\n'
+      + '  vec3 splatB = normalize(cross(normal, splatT));\n'
+      + '  normal = normalize(normal + (splatT * splatN.x + splatB * splatN.y) * 1.25);')
+    .replace('#include <aomap_fragment>',
+      '#include <aomap_fragment>\n'
+      + '  reflectedLight.indirectDiffuse *= mix(1.0, splatOrm.r, 0.85);');
+  return shader;
+}
+
 function Ground() {
+  const quality = useGame((s) => s.graphicsQuality);
+  const q = GRAPHICS_PRESETS[quality] || gfx();
   const geo = useMemo(() => createTerrainGeometry(), []);
+  // Re-created when the textures finish loading, so the world is walkable on
+  // the procedural ground from the first frame and upgrades in place.
+  const [splatReady, setSplatReady] = useState(terrainSplatState.ready);
+  useEffect(() => {
+    if (!q.terrainSplat) return undefined;
+    loadTerrainSplat(THREE);
+    if (terrainSplatState.ready) { setSplatReady(true); return undefined; }
+    const timer = setInterval(() => {
+      if (terrainSplatState.ready) { setSplatReady(true); clearInterval(timer); }
+      else if (terrainSplatState.failed) clearInterval(timer);
+    }, 250);
+    return () => clearInterval(timer);
+  }, [q.terrainSplat]);
+
+  const useSplat = !!(q.terrainSplat && splatReady && terrainSplatState.maps);
   const mat = useMemo(() => {
     const s = surfaceTiled('ground', [1, 1]);
     const m = new THREE.MeshStandardMaterial({
@@ -361,16 +439,27 @@ function Ground() {
       envMapIntensity: 1.0,
     });
     const mean = surfaceMeanLuma('ground');
-    // UVs run 0..1 across all 600 units, so these numbers are tiles per world:
-    // 90 gives a ~6.7m macro tile, 520 a ~1.15m detail tile.
-    m.onBeforeCompile = (shader) => {
-      try {
-        patchMapDetail(shader, 90, 520, mean, 0.85);
-        patchNormalDetail(shader, 90, 520, 0.8);
-      } catch (e) {}
-    };
+    if (useSplat) {
+      const maps = terrainSplatState.maps;
+      // The biome tint stays, but gently: the photographed layers carry their
+      // own colour and a strong tint on top of them looks painted.
+      m.onBeforeCompile = (shader) => {
+        try { applySplatPatch(shader, maps); } catch (e) {}
+      };
+      m.customProgramCacheKey = () => 'jk-ground-splat';
+    } else {
+      // UVs run 0..1 across all 600 units, so these numbers are tiles per
+      // world: 90 gives a ~6.7m macro tile, 520 a ~1.15m detail tile.
+      m.onBeforeCompile = (shader) => {
+        try {
+          patchMapDetail(shader, 90, 520, mean, 0.85);
+          patchNormalDetail(shader, 90, 520, 0.8);
+        } catch (e) {}
+      };
+      m.customProgramCacheKey = () => 'jk-ground-proc';
+    }
     return m;
-  }, []);
+  }, [useSplat]);
   return html`<mesh geometry=${geo} material=${mat} receiveShadow=${true} />`;
 }
 

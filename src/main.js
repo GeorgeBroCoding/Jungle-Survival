@@ -14,6 +14,7 @@ import './sky.js';
 import './terrain.js';
 import './water.js';
 import './vegetation.js';
+import './clutter.js';
 import './grass.js';
 import './humanbody.js';
 import './player.js';

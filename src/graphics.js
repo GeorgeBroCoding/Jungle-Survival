@@ -9,7 +9,7 @@ const GRAPHICS_KEY = 'jungleking.graphics.v1';
 const GRAPHICS_PRESETS = {
   low: {
     label: 'Low', grassRadius: 12, grassPerCell: 22, foliage: 150,
-    shadowMap: 1024, shadowExtent: 48, envSeconds: 0, dpr: 1.0, cascades: 1,
+    shadowMap: 1024, shadowExtent: 48, envSeconds: 0, dpr: 1.0, cascades: 1, terrainSplat: false, clutter: 0, clutterRadius: 0,
     vines: false, treeDetail: 0, waterSegments: 24,
     // Eye adaptation stays on even here: it is a grid lookup and a lerp per
     // frame with no GPU cost at all, and without it Low sits under the canopy
@@ -25,7 +25,7 @@ const GRAPHICS_PRESETS = {
   },
   medium: {
     label: 'Medium', grassRadius: 20, grassPerCell: 55, foliage: 220,
-    shadowMap: 1024, shadowExtent: 40, envSeconds: 4, dpr: 1.35, cascades: 2,
+    shadowMap: 1024, shadowExtent: 40, envSeconds: 4, dpr: 1.35, cascades: 2, terrainSplat: true, clutter: 0.7, clutterRadius: 16,
     vines: false, treeDetail: 1, waterSegments: 48,
     fireLights: 2, fireShadows: false, contactShadows: true, eyeAdapt: true,
     post: true, ssaoSamples: 8, aoStrength: 0.65, bloomLevels: 3, bloom: 0.28,
@@ -36,7 +36,7 @@ const GRAPHICS_PRESETS = {
   },
   high: {
     label: 'High', grassRadius: 28, grassPerCell: 95, foliage: 300,
-    shadowMap: 1536, shadowExtent: 34, envSeconds: 2, dpr: 1.6, cascades: 3,
+    shadowMap: 1536, shadowExtent: 34, envSeconds: 2, dpr: 1.6, cascades: 3, terrainSplat: true, clutter: 1.0, clutterRadius: 22,
     vines: true, treeDetail: 2, waterSegments: 72,
     fireLights: 2, fireShadows: true, contactShadows: true, eyeAdapt: true,
     post: true, ssaoSamples: 12, aoStrength: 0.75, bloomLevels: 4, bloom: 0.30,
@@ -47,7 +47,7 @@ const GRAPHICS_PRESETS = {
   },
   ultra: {
     label: 'Ultra', grassRadius: 38, grassPerCell: 130, foliage: 380,
-    shadowMap: 2048, shadowExtent: 30, envSeconds: 1.2, dpr: 2.0, cascades: 4,
+    shadowMap: 2048, shadowExtent: 30, envSeconds: 1.2, dpr: 2.0, cascades: 4, terrainSplat: true, clutter: 1.4, clutterRadius: 30,
     vines: true, treeDetail: 2, waterSegments: 96,
     fireLights: 3, fireShadows: true, contactShadows: true, eyeAdapt: true,
     post: true, ssaoSamples: 16, aoStrength: 0.8, bloomLevels: 5, bloom: 0.32,
