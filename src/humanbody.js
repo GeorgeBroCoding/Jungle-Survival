@@ -83,10 +83,61 @@ function humanGeo(key) {
 }
 
 const HUMAN_MATS = {};
+// Light that goes into skin, bounces around under it and comes back out,
+// which is why an ear against the sun glows red and why skin without it reads
+// as painted plastic. The cheap form of it: a wrapped diffuse term so the
+// light carries past the terminator, plus a red-shifted glow where the light
+// is behind the surface. Both injected into the standard material rather than
+// written fresh, so skin keeps the shadows, the fog and everything else.
+const skinPatchStats = { ok: 0, failed: 0 };
+
+// How wet and how muddy the player currently is. Both climb while it is
+// happening and fade over minutes once it stops, which is the whole point:
+// walking out of a river clean is what makes a game world feel like a diorama.
+const playerGrime = { wet: 0, mud: 0 };
+
+const SKIN_SSS = [
+  '#include <lights_fragment_end>',
+  '#ifdef JK_SKIN',
+  '  vec3 jkSkinL = normalize( directionalLights[ 0 ].direction );',
+  '  float jkNdl = dot( normal, jkSkinL );',
+  // Wrap: light reaches a little past 90 degrees instead of stopping dead.
+  '  float jkWrap = max( 0.0, ( jkNdl + 0.42 ) / 1.42 ) - max( 0.0, jkNdl );',
+  // Transmission: strongest looking straight through a thin part at the light.
+  '  float jkThrough = pow( max( 0.0, dot( normalize( vViewPosition ), jkSkinL ) ), 3.0 );',
+  '  vec3 jkSub = uSkinSubColor * directionalLights[ 0 ].color',
+  '    * ( jkWrap * 0.55 + jkThrough * 0.30 ) * uSkinSub;',
+  '  reflectedLight.directDiffuse += jkSub * diffuseColor.rgb;',
+  '#endif',
+].join('\n');
+
+// Grime belongs to the player alone. Everyone else shares one set of body
+// materials, which is right - but the player is the one who wades, and a
+// shared material would muddy the whole tribe at once. HumanFigure already
+// looks its skin up by key, so the player simply asks for a key of its own and
+// gets a material nobody else is using.
+const PLAYER_SKIN_KEY = 'skinPlayer';
+const playerGrimeMat = { mat: null };
+
+// Wet darkens and sharpens the highlight. Mud darkens too, but browner, and
+// takes the gloss back off, because mud is matte. Driven every frame from the
+// eased values Player keeps.
+function applyPlayerGrime() {
+  const m = playerGrimeMat.mat;
+  if (!m) return;
+  const wet = Math.max(0, Math.min(1, playerGrime.wet));
+  const mud = Math.max(0, Math.min(1, playerGrime.mud));
+  const dark = 1 - wet * 0.32 - mud * 0.24;
+  m.color.setRGB(dark, dark * (1 - mud * 0.10), dark * (1 - mud * 0.22));
+  m.roughness = Math.max(0.10, 0.72 - wet * 0.50 + mud * 0.28);
+}
+
 function skinMat(key) {
   const id = 'skin:' + key;
   if (!HUMAN_MATS[id]) {
-    const s = surfaceTiled(key, [1.4, 2.2]);
+    // The player's key is not a surface; it is the pale skin with a material
+    // of its own so grime can be applied to it without touching anyone else.
+    const s = surfaceTiled(key === PLAYER_SKIN_KEY ? 'skinPale' : key, [1.4, 2.2]);
     HUMAN_MATS[id] = new THREE.MeshStandardMaterial({
       map: s.map,
       normalMap: s.normalMap,
@@ -100,6 +151,20 @@ function skinMat(key) {
       // chance of a limb turning inside out.
       side: THREE.DoubleSide,
     });
+    const skinSub = HUMAN_MATS[id];
+    skinSub.onBeforeCompile = (shader) => {
+      try {
+        if (shader.fragmentShader.indexOf('#include <lights_fragment_end>') === -1) return;
+        shader.uniforms.uSkinSub = { value: 0.85 };
+        shader.uniforms.uSkinSubColor = { value: new THREE.Color('#c4553a') };
+        shader.fragmentShader = '#define JK_SKIN\nuniform float uSkinSub;\n'
+          + 'uniform vec3 uSkinSubColor;\n'
+          + shader.fragmentShader.replace('#include <lights_fragment_end>', SKIN_SSS);
+        skinPatchStats.ok++;
+      } catch (e) { skinPatchStats.failed++; }
+    };
+    skinSub.customProgramCacheKey = () => 'jk-skin-sss';
+    if (key === PLAYER_SKIN_KEY) playerGrimeMat.mat = skinSub;
   }
   return HUMAN_MATS[id];
 }
@@ -365,6 +430,12 @@ export {
   HUMAN_GEO,
   humanGeo,
   HUMAN_MATS,
+  skinPatchStats,
+  playerGrime,
+  SKIN_SSS,
+  PLAYER_SKIN_KEY,
+  playerGrimeMat,
+  applyPlayerGrime,
   skinMat,
   clothMat,
   furMat,

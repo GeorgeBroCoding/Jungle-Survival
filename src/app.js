@@ -1,11 +1,13 @@
 import { Animals } from './animals.js';
 import { Buildings } from './buildings.js';
+import { footprints } from './clutter.js';
 import { CoinDropManager, CoinDrops } from './coins.js';
 import { Canvas, Fragment, THREE, html, useEffect, useFrame, useMemo, useRef, useThree } from './core.js';
 import { mulberry32, riverCenterX, riverDistance } from './data.js';
 import { Caves, FlyingSpears, FxEffects, GroundWeapons, LootPickups, RemotePlayer, Resources } from './entities.js';
 import { GRAPHICS_PRESETS, canopyCoverAt, fireRegistry, gfx, graphicsSettings, perfStats } from './graphics.js';
 import { World } from './grass.js';
+import { playerGrime, skinPatchStats } from './humanbody.js';
 import { Kito, Workbench } from './kito.js';
 import { playerTransform } from './multiplayer.js';
 import { Player } from './player.js';
@@ -929,6 +931,9 @@ if (typeof window !== 'undefined') {
     envScale: (v) => { envRuntime.scale = v; },
     shadows: shadowOverride,
     weather,
+    grime: playerGrime,
+    prints: footprints,
+    skinPatch: skinPatchStats,
     river: RIVER,
     riverX: riverCenterX,
     waterAt: waterSurfaceAt,

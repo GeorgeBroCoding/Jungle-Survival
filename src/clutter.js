@@ -1,11 +1,13 @@
 import { Fragment, THREE, html, useEffect, useFrame, useMemo, useRef } from './core.js';
-import { mulberry32 } from './data.js';
+import { POND_CENTER, POND_RADIUS, mulberry32 } from './data.js';
 import { GRAPHICS_PRESETS, gfx } from './graphics.js';
 import { recycleGrassCells } from './grass.js';
 import { playerTransform } from './multiplayer.js';
 import { useGame } from './store.js';
 import { getTerrainHeight, waterSurfaceAt } from './terrain.js';
+import { buildSoftDisc, texFrom } from './textures.js';
 import { vegGeo, vegMat } from './vegetation.js';
+import { terrainWet } from './weather.js';
 import { grainTiled } from './wind.js';
 
 // ============================================================
@@ -230,6 +232,123 @@ function clutterMaterial(key) {
   return m;
 }
 
+// ---------- Footprints ----------
+// Marks left in soft ground, fading as they fill in. A ring buffer, like the
+// trample trail: the oldest print is always the one given up, so a long walk
+// leaves a trail that ends rather than a trail that flickers.
+//
+// Only in ground soft enough to take a print - wet weather, or close enough to
+// water to be mud. Prints in dry leaf litter would be wrong, and they are the
+// kind of wrong that is more noticeable than having none.
+const FOOTPRINT_SLOTS = 48;
+const FOOTPRINT_LIFE = 26;
+
+const footprints = {
+  slots: [],
+  next: 0,
+  stats: { live: 0 },
+};
+for (let i = 0; i < FOOTPRINT_SLOTS; i++) {
+  footprints.slots.push({ x: 0, y: -9999, z: 0, yaw: 0, age: -1, size: 1 });
+}
+
+function spawnFootprint(x, y, z, yaw, size) {
+  const f = footprints.slots[footprints.next % FOOTPRINT_SLOTS];
+  footprints.next++;
+  f.x = x;
+  f.y = y;
+  f.z = z;
+  f.yaw = yaw;
+  f.size = size === undefined ? 1 : size;
+  f.age = 0;
+}
+
+// How readily this ground takes a print: 0 dry litter, 1 wet mud.
+function groundSoftness(x, z) {
+  const toWater = waterSurfaceAt(x, z) !== -Infinity ? 0
+    : Math.hypot(x - POND_CENTER[0], z - POND_CENTER[1]) - POND_RADIUS;
+  const nearWater = Math.max(0, Math.min(1, 1 - toWater / 6));
+  return Math.max(nearWater, terrainWet.value);
+}
+
+function Footprints() {
+  const quality = useGame((s) => s.graphicsQuality);
+  const q = GRAPHICS_PRESETS[quality] || gfx();
+  const on = (q.clutterRadius || 0) > 0;
+  const ref = useRef();
+
+  const geo = useMemo(() => {
+    // A rounded oval, longer than it is wide, pivoted flat on the ground.
+    const g = new THREE.PlaneGeometry(1, 1.7, 1, 1);
+    g.rotateX(-Math.PI / 2);
+    return g;
+  }, []);
+
+  const mat = useMemo(() => new THREE.MeshBasicMaterial({
+    map: texFrom(buildSoftDisc(32), [1, 1], false),
+    color: '#1b140c',
+    transparent: true,
+    opacity: 0.5,
+    depthWrite: false,
+    vertexColors: true,
+    // Printed INTO the ground, so it darkens rather than adds. Additive would
+    // make a footprint glow, which is the opposite of a hole.
+    blending: THREE.NormalBlending,
+    toneMapped: false,
+  }), []);
+
+  const scratch = useMemo(() => ({
+    m: new THREE.Matrix4(), v: new THREE.Vector3(), q: new THREE.Quaternion(),
+    e: new THREE.Euler(), s: new THREE.Vector3(), c: new THREE.Color(),
+  }), []);
+
+  useEffect(() => () => { geo.dispose(); mat.dispose(); }, [geo, mat]);
+
+  useFrame((state, delta) => {
+    const mesh = ref.current;
+    if (!mesh || !on) return;
+    const sc = scratch;
+    let live = 0;
+    for (let i = 0; i < FOOTPRINT_SLOTS; i++) {
+      const f = footprints.slots[i];
+      if (f.age < 0) {
+        sc.m.makeScale(0, 0, 0);
+        mesh.setMatrixAt(i, sc.m);
+        continue;
+      }
+      f.age += delta;
+      if (f.age > FOOTPRINT_LIFE) {
+        f.age = -1;
+        sc.m.makeScale(0, 0, 0);
+        mesh.setMatrixAt(i, sc.m);
+        continue;
+      }
+      live++;
+      sc.e.set(0, f.yaw, 0);
+      sc.q.setFromEuler(sc.e);
+      // Lifted a hair so it does not fight the ground for the same depth.
+      sc.v.set(f.x, f.y + 0.012, f.z);
+      const w = 0.17 * f.size;
+      sc.s.set(w, 1, w);
+      sc.m.compose(sc.v, sc.q, sc.s);
+      mesh.setMatrixAt(i, sc.m);
+      // Fills in slowly at first, then goes quickly - which is how a print in
+      // mud actually disappears.
+      const left = 1 - f.age / FOOTPRINT_LIFE;
+      const k = left * left;
+      sc.c.setRGB(k, k, k);
+      mesh.setColorAt(i, sc.c);
+    }
+    footprints.stats.live = live;
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  });
+
+  if (!on) return null;
+  return html`<instancedMesh ref=${ref} args=${[geo, mat, FOOTPRINT_SLOTS]}
+    castShadow=${false} receiveShadow=${false} frustumCulled=${false} />`;
+}
+
 export {
   CLUTTER_CELL,
   CLUTTER_KINDS,
@@ -240,4 +359,10 @@ export {
   GroundClutter,
   CLUTTER_MATS,
   clutterMaterial,
+  FOOTPRINT_SLOTS,
+  FOOTPRINT_LIFE,
+  footprints,
+  spawnFootprint,
+  groundSoftness,
+  Footprints,
 };

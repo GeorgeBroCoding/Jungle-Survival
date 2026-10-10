@@ -1,8 +1,9 @@
+import { groundSoftness, spawnFootprint } from './clutter.js';
 import { Fragment, THREE, html, useEffect, useFrame, useRef, useThree } from './core.js';
 import { ATTACK_DURATION, FRIEND_BASE_CENTER, PLAYER_COLL_R, PLAYER_SPAWN, POND_CENTER, POND_RADIUS, POND_SURFACE_Y, STATIC_OBSTACLES, WEAPONS } from './data.js';
 import { gfx } from './graphics.js';
 import { emitSpray } from './grass.js';
-import { HumanFigure } from './humanbody.js';
+import { HumanFigure, PLAYER_SKIN_KEY, applyPlayerGrime, playerGrime } from './humanbody.js';
 import { findNearest } from './interactions.js';
 import { actionForCode, inputSettings, keyHeld, panelBlocksMovement } from './keybinds.js';
 import { onKeyPress } from './keyboard.js';
@@ -13,6 +14,7 @@ import { getTerrainHeight, stdMat, surfaceMat, waterSurfaceAt } from './terrain.
 import { debugWarp, touchInput } from './touch.js';
 import { ContactShadow } from './tribes.js';
 import { spawnRipple } from './water.js';
+import { weather } from './weather.js';
 
 // Player.js - movement, camera, survival stats
 // ============================================================
@@ -199,6 +201,8 @@ function Player() {
   const rippleTimer = useRef(0);
   const dripTimer = useRef(0);
   const wetFor = useRef(0);
+  const stepDist = useRef(0);
+  const footSide = useRef(1);
   const attackTimer = useRef(0);
   const mpSendTimer = useRef(0);
   const deathTimer = useRef(0); // seconds since death, drives the collapse animation
@@ -531,6 +535,7 @@ function Player() {
     }
     wasInWater.current = wading;
 
+
     // ---- speed / meter multiplier ----
     let speed = WALK_SPEED;
     let meterMult = 1;
@@ -608,7 +613,40 @@ function Player() {
 
     if (moved > 0) {
       s.addMeters(moved * meterMult);
+
     }
+
+    // ---- footprints ----
+    // Left on the stride, alternating feet, and only where the ground is soft
+    // enough to take one. A print in dry leaf litter would be wrong in a way
+    // that is more noticeable than having no prints at all.
+    if (moving && onGround.current) {
+      stepDist.current += moved;
+      if (stepDist.current > 0.72) {
+        stepDist.current = 0;
+        const soft = groundSoftness(pos.x, pos.z);
+        if (soft > 0.25) {
+          footSide.current = -footSide.current;
+          // Offset to the side of the line of travel, so the trail is two
+          // tracks rather than one.
+          const across = yaw.current + Math.PI / 2;
+          const ox = Math.sin(across) * 0.16 * footSide.current;
+          const oz = Math.cos(across) * 0.16 * footSide.current;
+          spawnFootprint(pos.x + ox, getTerrainHeight(pos.x + ox, pos.z + oz), pos.z + oz,
+            yaw.current, 0.8 + soft * 0.4);
+        }
+      }
+    }
+
+    // ---- how muddy and wet you are ----
+    // Picked up by walking through soft ground and by being in the water, and
+    // it fades. Read by the figure's materials.
+    const soaked = wading ? 1 : weather.rain * 0.7;
+    playerGrime.wet += ((soaked) - playerGrime.wet) * Math.min(1, delta * (soaked > playerGrime.wet ? 1.2 : 0.09));
+    const mudHere = moving && onGround.current ? groundSoftness(pos.x, pos.z) : 0;
+    playerGrime.mud += (mudHere * 0.9 - playerGrime.mud)
+      * Math.min(1, delta * (mudHere * 0.9 > playerGrime.mud ? 0.25 : 0.05));
+    applyPlayerGrime();
 
     // ---- attack swing animation (overrides walk-cycle arm pose) ----
     if (attackTimer.current > 0) {
@@ -812,7 +850,7 @@ function Player() {
       <${ContactShadow} radius=${0.44} />
       <group ref=${bodyVisual}>
         <${HumanFigure}
-          skinKey="skinPale"
+          skinKey=${PLAYER_SKIN_KEY}
           clothColor="#3f6b8a"
           accentColor="#8a6a3c"
           hairColor="#2b1b10"
