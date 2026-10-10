@@ -1,6 +1,7 @@
-import { Fragment, THREE, html, useEffect, useMemo, useRef } from './core.js';
+import { Fragment, THREE, html, useEffect, useFrame, useMemo, useRef } from './core.js';
 import { mulberry32 } from './data.js';
 import { GRAPHICS_PRESETS, gfx } from './graphics.js';
+import { playerTransform } from './multiplayer.js';
 import { useGame } from './store.js';
 import { stdMat } from './terrain.js';
 import { grainTiled, makeWindy, surfaceTiled } from './wind.js';
@@ -900,11 +901,45 @@ function ProcModel({ model, position, scale = 1, rotY = 0 }) {
   return html`<${InstancedModels} instances=${instances} />`;
 }
 
-// One InstancedMesh per geometry key. frustumCulled is off because the instances
-// are scattered across the whole map while the geometry's own bounding sphere is
-// unit-sized - three would otherwise cull the entire batch the moment the
-// origin left the view.
-function InstancedPart({ geometry, material, matrices, colors }) {
+// ---------- culling and LOD ----------
+//
+// This used to be one InstancedMesh per geometry key with frustumCulled off,
+// and the comment explaining why was the whole problem: the instances were
+// scattered across the entire map while the geometry's own bounding sphere was
+// unit-sized, so three would have culled the whole batch the moment the origin
+// left the view. Turning culling off was the right fix for that bug and the
+// wrong shape for the renderer - it meant every leaf on the map was submitted
+// every frame, including the two thirds of them behind the camera.
+//
+// Batching by map cell fixes it properly. Each batch holds the parts of the
+// plants in one 56-metre cell, so its bounding sphere is cell-sized and
+// three's own frustum culling does exactly what it is for. It costs more draw
+// calls - one per key per occupied cell instead of one per key - and buys back
+// far more in instances never submitted.
+const VEG_CELL = 56;
+
+// The second tier. Within a cell, parts are split by how big they actually are
+// in the world: a trunk or a canopy mass is structure and has to be drawn as
+// far as you can see the plant, while a twig or a small leaf clump below this
+// radius stops being resolvable long before the plant does. Dropping the small
+// parts at distance is a real LOD - the silhouette survives, the filigree goes -
+// and it needs no second set of geometry, because the split is a matter of
+// which batch an instance lands in.
+const VEG_DETAIL_R = 0.45;
+
+// Every batch registers here so one system can do the distance pass, rather
+// than several hundred components each running their own frame callback.
+const vegBatches = [];
+const vegCullStats = { batches: 0, visible: 0, instances: 0, drawn: 0, detail: 0 };
+
+function vegGeoRadius(key) {
+  const g = vegGeo(key);
+  if (!g.boundingSphere) g.computeBoundingSphere();
+  return g.boundingSphere ? g.boundingSphere.radius : 1;
+}
+
+// One InstancedMesh per (geometry key x cell x tier).
+function InstancedPart({ geometry, material, matrices, colors, cell, tier }) {
   const ref = useRef();
   useEffect(() => {
     const mesh = ref.current;
@@ -917,23 +952,42 @@ function InstancedPart({ geometry, material, matrices, colors }) {
     }
     mesh.instanceMatrix.needsUpdate = true;
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-  }, [matrices, colors]);
+    // The bounding sphere has to be computed from the instance matrices, not
+    // from the geometry - the geometry is a unit shape at the origin and the
+    // instances are spread across a cell. Without this the culling would be
+    // wrong in the other direction and plants would vanish.
+    if (mesh.computeBoundingSphere) mesh.computeBoundingSphere();
+    const entry = { mesh, cx: cell ? cell[0] : 0, cz: cell ? cell[1] : 0,
+                    tier: tier || 'core', count: matrices.length };
+    vegBatches.push(entry);
+    vegCullStats.instances += entry.count;
+    return () => {
+      const i = vegBatches.indexOf(entry);
+      if (i >= 0) vegBatches.splice(i, 1);
+      vegCullStats.instances -= entry.count;
+    };
+  }, [matrices, colors, cell, tier]);
   return html`
     <instancedMesh
       ref=${ref}
       args=${[geometry, material, matrices.length]}
       castShadow=${true}
       receiveShadow=${true}
-      frustumCulled=${false}
+      frustumCulled=${true}
     />
   `;
 }
 
-// Flatten a list of placed models into one batch per geometry key. Each part's
-// local transform is composed with its plant's own placement, so the GPU gets a
-// single world matrix per part and we get one draw call per geometry rather than
-// one per part.
-function groupModelInstances(instances) {
+// Flatten a list of placed models into batches. Each part's local transform is
+// composed with its plant's own placement, so the GPU gets a single world
+// matrix per part.
+//
+// A batch is one geometry key, in one map cell, at one detail tier. Splitting by
+// cell is what lets the renderer cull; splitting by tier is what lets distance
+// drop the filigree. The cell comes from the *plant's* position rather than the
+// part's, so a tree never has its trunk in one cell and its canopy in another.
+function groupModelInstances(instances, cellSize) {
+  const cell = cellSize || VEG_CELL;
   const byKey = new Map();
   const m = new THREE.Matrix4();
   const parent = new THREE.Matrix4();
@@ -947,6 +1001,8 @@ function groupModelInstances(instances) {
     e.set(0, inst.rotY || 0, 0);
     q.setFromEuler(e);
     parent.compose(v.set(inst.position[0], inst.position[1], inst.position[2]), q, sc.set(s, s, s));
+    const cx = Math.round(inst.position[0] / cell);
+    const cz = Math.round(inst.position[2] / cell);
     for (const part of inst.model) {
       if (part.q) {
         q.set(part.q[0], part.q[1], part.q[2], part.q[3]);
@@ -957,10 +1013,16 @@ function groupModelInstances(instances) {
       }
       local.compose(v.set(part.p[0], part.p[1], part.p[2]), q, sc.set(part.s[0], part.s[1], part.s[2]));
       m.multiplyMatrices(parent, local);
-      let g = byKey.get(part.k);
+      // How big this part ends up in metres: the unit geometry's radius times
+      // the largest axis of its own scale times the plant's scale.
+      const biggest = Math.max(Math.abs(part.s[0]), Math.abs(part.s[1]), Math.abs(part.s[2]));
+      const worldR = vegGeoRadius(part.k) * biggest * s;
+      const tier = worldR < VEG_DETAIL_R ? 'detail' : 'core';
+      const id = part.k + '#' + cx + ',' + cz + '#' + tier;
+      let g = byKey.get(id);
       if (!g) {
-        g = { matrices: [], colors: [] };
-        byKey.set(part.k, g);
+        g = { geoKey: part.k, cell: [cx * cell, cz * cell], tier, matrices: [], colors: [] };
+        byKey.set(id, g);
       }
       g.matrices.push(m.clone());
       g.colors.push(part.c || null);
@@ -974,17 +1036,53 @@ function InstancedModels({ instances }) {
 
   return html`
     <${Fragment}>
-      ${groups.map(([key, g]) => html`
+      ${groups.map(([id, g]) => html`
         <${InstancedPart}
-          key=${key}
-          geometry=${vegGeo(key)}
-          material=${vegMat(key)}
+          key=${id}
+          geometry=${vegGeo(g.geoKey)}
+          material=${vegMat(g.geoKey)}
           matrices=${g.matrices}
           colors=${g.colors}
+          cell=${g.cell}
+          tier=${g.tier}
         />
       `)}
     <//>
   `;
+}
+
+// The distance pass. One callback for every batch on the map, which is a few
+// hundred distance checks - nothing next to what it saves. Frustum culling is
+// three's job and happens at render time; this is the range cull on top of it,
+// and it is where the two tiers diverge.
+function VegetationCulling() {
+  const quality = useGame((s) => s.graphicsQuality);
+  const q = GRAPHICS_PRESETS[quality] || gfx();
+  useFrame(() => {
+    const px = playerTransform.position[0];
+    const pz = playerTransform.position[2];
+    // Measured from the near corner of the cell rather than its centre, or a
+    // cell you are standing at the edge of counts as 28m away and its detail
+    // vanishes from under your feet.
+    const half = VEG_CELL * 0.5;
+    const coreR = q.plantRange;
+    const detailR = q.plantDetailRange;
+    let visible = 0, drawn = 0, detail = 0;
+    for (let i = 0; i < vegBatches.length; i++) {
+      const b = vegBatches[i];
+      const dx = Math.max(0, Math.abs(b.cx - px) - half);
+      const dz = Math.max(0, Math.abs(b.cz - pz) - half);
+      const d = Math.sqrt(dx * dx + dz * dz);
+      const on = d < (b.tier === 'detail' ? detailR : coreR);
+      b.mesh.visible = on;
+      if (on) { visible++; drawn += b.count; if (b.tier === 'detail') detail += b.count; }
+    }
+    vegCullStats.batches = vegBatches.length;
+    vegCullStats.visible = visible;
+    vegCullStats.drawn = drawn;
+    vegCullStats.detail = detail;
+  });
+  return null;
 }
 
 // ---------- The plants the game code asks for by name ----------
@@ -1063,9 +1161,15 @@ export {
   buildCactusModel,
   seedFromPosition,
   ProcModel,
+  VEG_CELL,
+  VEG_DETAIL_R,
+  vegBatches,
+  vegCullStats,
+  vegGeoRadius,
   InstancedPart,
   groupModelInstances,
   InstancedModels,
+  VegetationCulling,
   Tree,
   SnowTree,
   Cactus,

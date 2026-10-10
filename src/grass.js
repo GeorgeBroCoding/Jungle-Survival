@@ -10,7 +10,7 @@ import { DayNightSystem } from './sky.js';
 import { useGame } from './store.js';
 import { Ground, RIVER, getBiomeColor, getDominantBiome, getTerrainHeight, waterSurfaceAt } from './terrain.js';
 import { buildSoftDisc, texFrom } from './textures.js';
-import { InstancedModels, buildBambooModel, buildBigLeafModel, buildBushModel, buildCactusModel, buildFallenTrunkModel, buildFernModel, buildHeliconiaModel, buildPalmModel, buildPineModel, buildRockModel, buildTreeModel, vegGeo, vegMat } from './vegetation.js';
+import { InstancedModels, VegetationCulling, buildBambooModel, buildBigLeafModel, buildBushModel, buildCactusModel, buildFallenTrunkModel, buildFernModel, buildHeliconiaModel, buildPalmModel, buildPineModel, buildRockModel, buildTreeModel, vegGeo, vegMat } from './vegetation.js';
 import { RiverDebris, Water, spawnRipple, waterRuntime } from './water.js';
 import { Rain, WeatherSystem } from './weather.js';
 import { PROJECT_WITH_WIND, WIND_GLSL, windUniforms } from './wind.js';
@@ -888,6 +888,7 @@ function World() {
       <${RiverDebris} />
       <${WaterDisturbance} />
       <${DecorativeFoliage} />
+      <${VegetationCulling} />
     <//>
   `;
 }

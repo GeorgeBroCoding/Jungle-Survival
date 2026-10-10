@@ -5,6 +5,7 @@ import { bind, keyLabel } from './keybinds.js';
 import { Kito, Workbench } from './kito.js';
 import { mpDisconnect, mpHost, mpJoin } from './multiplayer.js';
 import { useGame } from './store.js';
+import { vegCullStats } from './vegetation.js';
 
 // Hud.js - DOM overlay (stats, hotbar, panels, toasts)
 // ============================================================
@@ -358,6 +359,10 @@ function StatsOverlay() {
       <span>${perfStats.ms.toFixed(1)} ms</span>
       <span>${perfStats.draws} draws</span>
       <span>${(perfStats.tris / 1000).toFixed(0)}k tris</span>
+      ${vegCullStats.batches > 0 ? html`
+        <span>${vegCullStats.visible}/${vegCullStats.batches} plant batches</span>
+        <span>${(vegCullStats.drawn / 1000).toFixed(0)}k of ${(vegCullStats.instances / 1000).toFixed(0)}k parts</span>
+      ` : null}
     </div>
   `;
 }

@@ -22,6 +22,7 @@ import { smoothstep } from './textures.js';
 import { debugWarp, touchInput } from './touch.js';
 import { Hud } from './touchcontrols.js';
 import { DistantRaidManager, DistantRaiders, DistantTribeCamps, EscortWarriors, FriendBase, InterTribalRaidManager, InterTribalRaiders, PlayerTribeBase, PlayerWarriors, RaidManager, Raiders, TribeCamps, TribeSpawnManager } from './tribes.js';
+import { vegCullStats } from './vegetation.js';
 import { drawWater, spawnRipple, updateRipples, waterRuntime } from './water.js';
 import { weather } from './weather.js';
 import { applyWindOverride, windPatchStats, windUniforms } from './wind.js';
@@ -960,6 +961,10 @@ if (typeof window !== 'undefined') {
     store: useGame,
     graphics: graphicsSettings,
     perf: perfStats,
+    // What the plant culling is doing this frame: how many of the map's
+    // batches survived the range pass and how many parts that submits. Frame
+    // rate cannot be measured on a software renderer; these can.
+    veg: vegCullStats,
     preset: gfx,
     player: playerTransform,
     canopyCoverAt,
