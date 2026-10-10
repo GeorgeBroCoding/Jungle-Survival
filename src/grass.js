@@ -9,7 +9,7 @@ import { DayNightSystem } from './sky.js';
 import { useGame } from './store.js';
 import { Ground, RIVER, getBiomeColor, getDominantBiome, getTerrainHeight, waterSurfaceAt } from './terrain.js';
 import { buildSoftDisc, texFrom } from './textures.js';
-import { InstancedModels, buildBushModel, buildCactusModel, buildFernModel, buildPalmModel, buildPineModel, buildRockModel, buildTreeModel, vegGeo, vegMat } from './vegetation.js';
+import { InstancedModels, buildBambooModel, buildBushModel, buildCactusModel, buildFallenTrunkModel, buildFernModel, buildPalmModel, buildPineModel, buildRockModel, buildTreeModel, vegGeo, vegMat } from './vegetation.js';
 import { RiverDebris, Water, spawnRipple, waterRuntime } from './water.js';
 import { PROJECT_WITH_WIND, WIND_GLSL, windUniforms } from './wind.js';
 
@@ -354,10 +354,13 @@ function DecorativeFoliage() {
         // Woodland: emergent giants over a broadleaf understorey, palms by the
         // water, and the floor filled in with shrubs and ferns.
         if (pondDist < 32 && roll > 0.72) add(buildPalmModel(rand, detail), x, y, z, 0.8 + rand() * 0.5, 3.1);
-        else if (roll > 0.56) add(buildTreeModel(rand, detail, 'jungleGiant'), x, y, z, s, 4.4);
-        else if (roll > 0.38) add(buildTreeModel(rand, detail, 'broadleaf'), x, y, z, s * 1.05, 2.8);
-        else if (roll > 0.33) add(buildTreeModel(rand, detail, 'deadTree'), x, y, z, s * 0.9, 0.6);
-        else if (roll > 0.16) add(buildBushModel(rand, detail, false), x, y, z, s * 0.95, 1.2);
+        else if (roll > 0.60) add(buildTreeModel(rand, detail, 'jungleGiant'), x, y, z, s, 4.4);
+        else if (roll > 0.54) add(buildTreeModel(rand, detail, 'strangler'), x, y, z, s * 1.05, 4.2);
+        else if (roll > 0.46) add(buildBambooModel(rand, detail), x, y, z, 0.8 + rand() * 0.6, 1.1);
+        else if (roll > 0.33) add(buildTreeModel(rand, detail, 'broadleaf'), x, y, z, s * 1.05, 2.8);
+        else if (roll > 0.29) add(buildTreeModel(rand, detail, 'deadTree'), x, y, z, s * 0.9, 0.6);
+        else if (roll > 0.24) add(buildFallenTrunkModel(rand, detail), x, y, z, 0.8 + rand() * 0.6, 1.0);
+        else if (roll > 0.12) add(buildBushModel(rand, detail, false), x, y, z, s * 0.95, 1.2);
         else add(buildFernModel(rand, detail, false), x, y, z, 0.8 + rand() * 0.6, 0.5);
       } else if (biome === 1) {
         // Dry scrub: flat-topped acacias over cactus and bare rock.
@@ -379,9 +382,11 @@ function DecorativeFoliage() {
       } else {
         // Swamp: mangroves on their stilts, palms standing out of the growth,
         // and a dense floor of fern.
-        if (roll > 0.66) add(buildTreeModel(rand, detail, 'mangrove'), x, y, z, s, 2.4);
+        if (roll > 0.72) add(buildTreeModel(rand, detail, 'mangrove'), x, y, z, s, 2.4);
+        else if (roll > 0.66) add(buildBambooModel(rand, detail), x, y, z, 0.9 + rand() * 0.6, 1.1);
         else if (roll > 0.54) add(buildPalmModel(rand, detail), x, y, z, 0.75 + rand() * 0.5, 3.1);
-        else if (roll > 0.46) add(buildTreeModel(rand, detail, 'deadTree'), x, y, z, s * 0.85, 0.5);
+        else if (roll > 0.50) add(buildTreeModel(rand, detail, 'deadTree'), x, y, z, s * 0.85, 0.5);
+        else if (roll > 0.44) add(buildFallenTrunkModel(rand, detail), x, y, z, 0.9 + rand() * 0.5, 1.0);
         else if (roll > 0.26) add(buildBushModel(rand, detail, true), x, y, z, s * 1.05, 1.4);
         else add(buildFernModel(rand, detail, true), x, y, z, 0.9 + rand() * 0.7, 0.6);
       }

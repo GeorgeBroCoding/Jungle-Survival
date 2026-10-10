@@ -144,6 +144,17 @@ const PROJECT_WITH_WIND = [
   '  #else',
   '    jkWorld.xyz += jkWind( jkWorld.xyz ) + jkTrample( jkWorld.xyz );',
   '  #endif',
+  // The third layer. jkWind is the slow one - the whole tree leaning, scaled by
+  // height, so the trunk barely moves and the crown swings. Flutter is the
+  // opposite: tiny, fast, and only on things light enough to have it. Together
+  // they read as a tree in wind rather than a tree being translated.
+  '  #ifdef JK_FLUTTER',
+  '    float jkF = uWindTime * 7.3 + jkWorld.x * 2.1 + jkWorld.z * 1.7;',
+  '    float jkFAmp = uWindStrength * 0.42 * clamp( ( jkWorld.y - 0.4 ) * 0.5, 0.0, 1.0 );',
+  '    jkWorld.x += sin( jkF ) * jkFAmp;',
+  '    jkWorld.y += sin( jkF * 1.37 + 1.1 ) * jkFAmp * 0.55;',
+  '    jkWorld.z += cos( jkF * 0.91 + 2.3 ) * jkFAmp;',
+  '  #endif',
   '#endif',
   '#ifdef JK_MOSS',
   '  vJkWorldPos = jkWorld.xyz;',
@@ -246,6 +257,7 @@ function makeWindy(mat, opts) {
       let prelude = WIND_GLSL;
       let defines = '';
       if (o.still) defines += '#define JK_STILL\n';
+      if (o.flutter) defines += '#define JK_FLUTTER\n';
       if (o.noTrample) defines += '#define JK_NOTRAMPLE\n';
       if (o.leafLod) {
         shader.uniforms.uLodNear = windUniforms.uLodNear;
@@ -304,7 +316,7 @@ function makeWindy(mat, opts) {
   };
   mat.customProgramCacheKey = () => 'jk-veg-'
     + (o.translucent ? 't' : '') + (o.mossy ? 'm' : '') + (o.leafLod ? 'l' : '')
-    + (o.still ? 's' : '') + (o.noTrample ? 'n' : '');
+    + (o.still ? 's' : '') + (o.noTrample ? 'n' : '') + (o.flutter ? 'f' : '');
   return mat;
 }
 
@@ -355,6 +367,59 @@ function updateTrampleTrail(delta) {
 // Lazily built, shared across every material that wants them. Building all of
 // these up front would stall the first frame, so each is made on first access.
 const SURFACES = {};
+// Photographed bark, loaded ahead of anything that asks for it. Procedural
+// value noise has no fissures - it is smooth everywhere at every scale - and a
+// trunk is a large, close, vertical thing that the eye reads carefully. This is
+// seeded into the surface cache before the first material is built, so nothing
+// downstream has to know it changed.
+const barkLoad = { started: false, done: false, maps: null };
+
+function startBarkLoad(onReady) {
+  if (barkLoad.started) {
+    if (barkLoad.done && onReady) onReady();
+    return;
+  }
+  barkLoad.started = true;
+  const names = [['albedo', 'map', true], ['normal', 'normalMap', false],
+                 ['rough', 'roughnessMap', false]];
+  let left = names.length;
+  const maps = {};
+  let failed = false;
+  for (const [file, slot, srgb] of names) {
+    const img = new Image();
+    img.onload = () => {
+      // Drawn into a canvas rather than used directly: the grain variants ask
+      // the surface's map for a 2D context so they can tint it, and an <img>
+      // has no getContext.
+      const cv = makeCanvas(img.width, img.height);
+      cv.getContext('2d').drawImage(img, 0, 0);
+      const t = new THREE.CanvasTexture(cv);
+      t.wrapS = THREE.RepeatWrapping;
+      t.wrapT = THREE.RepeatWrapping;
+      t.anisotropy = 8;
+      if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+      t.needsUpdate = true;
+      maps[slot] = t;
+      if (--left === 0 && !failed) {
+        barkLoad.maps = maps;
+        barkLoad.done = true;
+        // Seed the cache. surfaceTiled clones from here, so this has to land
+        // before any material is built or the clones carry the old image.
+        SURFACES.bark = maps;
+        if (onReady) onReady();
+      }
+    };
+    img.onerror = () => {
+      failed = true;
+      barkLoad.done = true;
+      // eslint-disable-next-line no-console
+      console.warn('[jungle-king] bark texture missing, keeping the procedural bark');
+      if (onReady) onReady();
+    };
+    img.src = './assets/bark/' + file + '.jpg';
+  }
+}
+
 function surface(name) {
   if (SURFACES[name]) return SURFACES[name];
   let s;
@@ -380,11 +445,16 @@ function surface(name) {
 // once. So the start screen builds them ahead of time, one per tick, which keeps
 // the menu responsive and means the world is fully dressed before you see it.
 const WARM_ORDER = [
-  'ground', 'bark', 'leaf', 'leafCard', 'rock',
+  'ground', 'leaf', 'leafCard', 'rock',
   'skin', 'skinPale', 'cloth', 'hide', 'boarFur', 'monkeyFur',
+  'bark',
 ];
 let warmStarted = false;
 function warmSurfaces(onDone) {
+  // Bark first and asynchronously: the warm-up below builds every surface, and
+  // once 'bark' is built procedurally the photographed one can no longer
+  // replace it without invalidating every clone downstream.
+  startBarkLoad();
   if (warmStarted) {
     if (onDone) onDone();
     return () => {};
@@ -400,6 +470,13 @@ function warmSurfaces(onDone) {
         for (const name of ['ground', 'bark', 'leaf', 'rock', 'cloth']) grainTiled(name, [1, 1]);
       } catch (e) {}
       if (onDone) onDone();
+      return;
+    }
+    // Bark waits for its image. Building it procedurally first would cache the
+    // procedural one, and every material that cloned it would keep that copy
+    // even after the photographed maps arrived.
+    if (WARM_ORDER[i] === 'bark' && !barkLoad.done) {
+      timer = setTimeout(step, 16);
       return;
     }
     try { surface(WARM_ORDER[i]); } catch (e) {}
@@ -514,6 +591,8 @@ export {
   trailState,
   updateTrampleTrail,
   SURFACES,
+  barkLoad,
+  startBarkLoad,
   surface,
   WARM_ORDER,
   warmStarted,

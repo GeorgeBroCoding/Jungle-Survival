@@ -170,13 +170,18 @@ function vegMat(key) {
       return makeWindy(new THREE.MeshStandardMaterial({
         map: t.map, normalMap: t.normalMap, roughnessMap: t.roughnessMap,
         // Alpha test rather than blending: cut-outs write depth, which the
-        // post chain needs, and they need no sorting.
+        // post chain needs, and they need no sorting. Alpha-to-coverage then
+        // turns the binary edge the test leaves into a soft one by spending
+        // MSAA samples on it - which is the only way to get a smooth edge on a
+        // cut-out, and the reason the scene target is multisampled at all. It
+        // does nothing without MSAA, so Low simply keeps the hard edge.
         alphaTest: 0.32,
+        alphaToCoverage: true,
         transparent: false,
         side: THREE.DoubleSide,
         roughness: 0.72, envMapIntensity: 1.0,
         vertexColors: true,
-      }), { translucent: true, leafLod: true });
+      }), { translucent: true, leafLod: true, flutter: true });
     });
   }
   if (key === 'canopy' || key === 'canopySmall' || key === 'needleSkirt') {
@@ -295,6 +300,16 @@ const TREE_SPECIES = {
     clump: [0, 0], clumpR: 0, cardSize: [0, 0],
     buttress: 0, vines: 0, bigLeaf: 0, bark: '#6d6457',
     tints: [],
+  },
+  // Strangler fig: it germinated in another tree's canopy and grew down. The
+  // shape is a jungle giant whose trunk is a cage of fused aerial roots, so it
+  // is the giant's profile with far more legs, coming from much higher up.
+  strangler: {
+    height: [5.8, 8.4], radius: [0.30, 0.44], depth: 3, split: [2, 3],
+    spread: 0.62, upBias: 0.34, lenFall: 0.75, radFall: 0.62, firstFork: 0.50,
+    clump: [16, 21], clumpR: 0.68, cardSize: [0.32, 0.52],
+    buttress: 3, stilts: 9, stiltHigh: true, vines: 2, bigLeaf: 1, bigLeafSize: 0.44,
+    tints: ['#cfe6ae', '#bad89d', '#a7c98d', '#dceec2'],
   },
   // Swamp edge: props itself up out of the water on stilt roots.
   mangrove: {
@@ -451,8 +466,10 @@ function buildTreeModel(rand, detail, speciesKey) {
     // Mangrove props: legs angling out of the trunk down into the mud.
     for (let i = 0; i < sp.stilts; i++) {
       const a = (i / sp.stilts) * Math.PI * 2 + rand() * 0.4;
-      const up = boleH * (0.35 + rand() * 0.35);
-      const out = 0.5 + rand() * 0.5;
+      const up = sp.stiltHigh
+        ? boleH * (0.55 + rand() * 0.42)       // aerial roots drop from high up
+        : boleH * (0.35 + rand() * 0.35);
+      const out = sp.stiltHigh ? 0.22 + rand() * 0.36 : 0.5 + rand() * 0.5;
       parts.push({
         k: 'branch',
         p: [0, up, 0],
@@ -501,6 +518,101 @@ function buildTreeModel(rand, detail, speciesKey) {
 // Kept so existing callers and saves keep working.
 function buildJungleTreeModel(rand, detail) {
   return buildTreeModel(rand, detail, 'jungleGiant');
+}
+
+// A bamboo clump. Not a tree at all: a dozen culms from one root, each a stack
+// of straight segments with a node between them, leaning out slightly as they
+// rise. Nothing else in a jungle has this silhouette, which is why it is worth
+// a builder of its own rather than another set of numbers in TREE_SPECIES.
+function buildBambooModel(rand, detail) {
+  const parts = [];
+  const culms = detail === 0 ? 5 : detail === 1 ? 8 : 12;
+  for (let c = 0; c < culms; c++) {
+    const a = rand() * Math.PI * 2;
+    const r = Math.pow(rand(), 0.6) * 0.55;
+    const bx = Math.cos(a) * r;
+    const bz = Math.sin(a) * r;
+    const h = 3.6 + rand() * 3.4;
+    const rad = 0.035 + rand() * 0.028;
+    const lean = 0.05 + rand() * 0.10;
+    const segs = Math.max(4, Math.round(h / 0.75));
+    let y = 0;
+    for (let i = 0; i < segs; i++) {
+      const sl = h / segs;
+      // Each segment is a touch narrower than the one below, and the lean
+      // accumulates, so the culm bows the way a real one does under its own top.
+      const t = i / segs;
+      parts.push({
+        k: 'trunk',
+        p: [bx + Math.cos(a) * lean * t * t * h, y, bz + Math.sin(a) * lean * t * t * h],
+        r: [Math.sin(a) * lean * t, 0, -Math.cos(a) * lean * t],
+        s: [rad * (1 - t * 0.35), sl * 0.93, rad * (1 - t * 0.35)],
+        c: ['#d9e4a8', '#cbdc97', '#e3e9b6'][Math.floor(rand() * 3)],
+      });
+      y += sl;
+    }
+    // Leaves only in the top third: bamboo is bare for most of its height.
+    if (detail > 0) {
+      const sprigs = detail === 1 ? 3 : 5;
+      for (let i = 0; i < sprigs; i++) {
+        const t = 0.62 + rand() * 0.38;
+        const cs = 0.26 + rand() * 0.22;
+        parts.push({
+          k: 'leafCard',
+          p: [bx + Math.cos(a) * lean * t * t * h + (rand() - 0.5) * 0.3,
+            h * t,
+            bz + Math.sin(a) * lean * t * t * h + (rand() - 0.5) * 0.3],
+          r: [(rand() - 0.5) * 1.4, rand() * 6.28, (rand() - 0.5) * 1.0],
+          s: [cs, cs, cs],
+          c: ['#a8c46a', '#93b85c', '#bcd47e'][Math.floor(rand() * 3)],
+        });
+      }
+    }
+  }
+  return parts;
+}
+
+// A trunk that came down years ago: lying over, half sunk, mossy, with the
+// stump of a branch or two still on it. Deadwood standing up is already here;
+// what a forest floor needs is the stuff that fell.
+function buildFallenTrunkModel(rand, detail) {
+  const parts = [];
+  const len = 3.2 + rand() * 4.0;
+  const rad = 0.22 + rand() * 0.20;
+  const a = rand() * Math.PI * 2;
+  const tilt = (rand() - 0.5) * 0.18;
+  // Laid along its own axis: the trunk geometry runs up +Y, so it is rotated
+  // onto the horizontal and then spun to face a random way.
+  parts.push({
+    k: 'trunk',
+    p: [0, rad * 0.78, 0],
+    r: [Math.PI / 2 + tilt, a, 0],
+    s: [rad, len, rad * 0.92],
+    c: '#5e5343',
+  });
+  // The root plate it tore up when it went over.
+  if (detail > 0) {
+    parts.push({
+      k: 'boulder',
+      p: [Math.sin(a) * len * 0.5, rad * 0.5, Math.cos(a) * len * 0.5],
+      r: [rand() * 6.28, rand() * 6.28, rand() * 6.28],
+      s: [rad * 2.1, rad * 1.7, rad * 0.7],
+      c: '#4d4436',
+    });
+  }
+  const stubs = detail === 0 ? 1 : 3;
+  for (let i = 0; i < stubs; i++) {
+    const t = 0.18 + rand() * 0.64;
+    const ang = rand() * Math.PI * 2;
+    parts.push({
+      k: 'branch',
+      p: [Math.sin(a) * len * (t - 0.5), rad * 0.9, Math.cos(a) * len * (t - 0.5)],
+      r: [Math.cos(ang) * 1.1, ang, Math.sin(ang) * 1.1],
+      s: [rad * 0.3, 0.3 + rand() * 0.55, rad * 0.3],
+      c: '#564c3d',
+    });
+  }
+  return parts;
 }
 
 function buildPalmModel(rand, detail) {
@@ -866,6 +978,8 @@ export {
   growLimb,
   buildTreeModel,
   buildJungleTreeModel,
+  buildBambooModel,
+  buildFallenTrunkModel,
   buildPalmModel,
   buildPineModel,
   buildBushModel,

@@ -8,7 +8,7 @@
 const GRAPHICS_KEY = 'jungleking.graphics.v1';
 const GRAPHICS_PRESETS = {
   low: {
-    label: 'Low', grassRadius: 12, grassPerCell: 22, foliage: 150,
+    label: 'Low', grassRadius: 12, grassPerCell: 22, foliage: 820,
     shadowMap: 1024, shadowExtent: 48, envSeconds: 0, dpr: 1.0, cascades: 1, terrainSplat: false, clutter: 0, clutterRadius: 0,
     vines: false, treeDetail: 0, waterSegments: 24,
     // Eye adaptation stays on even here: it is a grid lookup and a lerp per
@@ -21,10 +21,10 @@ const GRAPHICS_PRESETS = {
     // Water. Refraction needs the post chain's colour buffer, so Low falls
     // back to a plain transparent surface with depth-tinted colour.
     waterRefract: false, waterSSR: 0, waterCaustics: false, waterRipples: 0,
-    waterSpray: 0, waterMist: 0, waterDebris: 0,
+    waterSpray: 0, waterMist: 0, waterDebris: 0, msaa: 0,
   },
   medium: {
-    label: 'Medium', grassRadius: 20, grassPerCell: 55, foliage: 220,
+    label: 'Medium', grassRadius: 20, grassPerCell: 55, foliage: 560,
     shadowMap: 1024, shadowExtent: 40, envSeconds: 4, dpr: 1.35, cascades: 2, terrainSplat: true, clutter: 0.7, clutterRadius: 16,
     vines: false, treeDetail: 1, waterSegments: 48,
     fireLights: 2, fireShadows: false, contactShadows: true, eyeAdapt: true,
@@ -32,7 +32,7 @@ const GRAPHICS_PRESETS = {
     godRays: false, dof: false, vignette: 0.26, grain: 0.012, heightFog: 1, heatHaze: false,
     dustMotes: 140, fallingLeaves: 24,
     waterRefract: true, waterSSR: 0, waterCaustics: true, waterRipples: 8,
-    waterSpray: 70, waterMist: 60, waterDebris: 22,
+    waterSpray: 70, waterMist: 60, waterDebris: 22, msaa: 2,
   },
   high: {
     label: 'High', grassRadius: 28, grassPerCell: 95, foliage: 300,
@@ -43,10 +43,10 @@ const GRAPHICS_PRESETS = {
     godRays: true, dof: true, vignette: 0.28, grain: 0.014, heightFog: 1, heatHaze: true,
     dustMotes: 240, fallingLeaves: 40,
     waterRefract: true, waterSSR: 14, waterCaustics: true, waterRipples: 12,
-    waterSpray: 130, waterMist: 120, waterDebris: 40,
+    waterSpray: 130, waterMist: 120, waterDebris: 40, msaa: 4,
   },
   ultra: {
-    label: 'Ultra', grassRadius: 38, grassPerCell: 130, foliage: 380,
+    label: 'Ultra', grassRadius: 38, grassPerCell: 130, foliage: 1100,
     shadowMap: 2048, shadowExtent: 30, envSeconds: 1.2, dpr: 2.0, cascades: 4, terrainSplat: true, clutter: 1.4, clutterRadius: 30,
     vines: true, treeDetail: 2, waterSegments: 96,
     fireLights: 3, fireShadows: true, contactShadows: true, eyeAdapt: true,
@@ -54,7 +54,7 @@ const GRAPHICS_PRESETS = {
     godRays: true, dof: true, vignette: 0.30, grain: 0.015, heightFog: 1, heatHaze: true,
     dustMotes: 340, fallingLeaves: 60,
     waterRefract: true, waterSSR: 22, waterCaustics: true, waterRipples: 16,
-    waterSpray: 190, waterMist: 180, waterDebris: 60,
+    waterSpray: 190, waterMist: 180, waterDebris: 60, msaa: 4,
   },
 };
 

@@ -492,7 +492,14 @@ function PostFX() {
       const isWebGL2 = gl.capabilities.isWebGL2 !== false;
       if (!isWebGL2) throw new Error('needs WebGL2');
 
-      const scene1 = makeRT(2, 2, { depthBuffer: true });
+      // Multisampled. Until now the canvas asked for antialiasing and never got
+      // any, because the scene goes into an offscreen target and the canvas
+      // setting does not reach it - every leaf cut-out and blade of grass had a
+      // hard stair-stepped edge. It also unlocks alpha-to-coverage on the
+      // foliage, which is the only way to get a soft edge on an alpha-tested
+      // cut-out. three resolves the depth buffer along with the colour, so SSAO,
+      // the god rays, the fog and the water all still read what they expect.
+      const scene1 = makeRT(2, 2, { depthBuffer: true, samples: q.msaa | 0 });
       scene1.depthTexture = new THREE.DepthTexture(2, 2);
       scene1.depthTexture.format = THREE.DepthFormat;
       scene1.depthTexture.type = THREE.UnsignedIntType;
@@ -596,7 +603,7 @@ function PostFX() {
       console.warn('[jungle-king] post-processing unavailable, rendering direct:', postState.reason);
       return null;
     }
-  }, [gl, q.post, q.ssaoSamples, q.bloomLevels, q.godRays]);
+  }, [gl, q.post, q.ssaoSamples, q.bloomLevels, q.godRays, q.msaa]);
 
   // Materials have to output linear radiance into the HDR buffer; the chain
   // tone maps at the end. Without this the renderer would squash everything
