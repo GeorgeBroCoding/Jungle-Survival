@@ -449,8 +449,28 @@ function adoptForCsm(csm, scene, seen) {
     for (const mat of list) {
       if (!mat || !mat.isMeshStandardMaterial || seen.has(mat)) continue;
       seen.add(mat);
-      const prev = mat.onBeforeCompile;
-      const prevKey = mat.customProgramCacheKey;
+      // The material's own hook, from before CSM ever touched it, kept so that
+      // adoption can be done again. Changing the quality preset changes the
+      // cascade count, which means re-adopting every material - and without
+      // this, `prev` would be the *already composed* chain from the last
+      // adoption. The old CSM hook would then run first and declare
+      // `uniform vec2 CSM_cascades[1]` while the new one emitted tests against
+      // CSM_cascades[1] and CSM_cascades[2], and the fragment shader failed to
+      // compile with "array index out of range". The whole scene stopped
+      // drawing. It only showed up once a measurement swept the four presets
+      // in one page, which nothing had done before.
+      if (!mat.userData.jkPreCsm) {
+        mat.userData.jkPreCsm = {
+          hook: mat.onBeforeCompile,
+          key: mat.customProgramCacheKey,
+        };
+      }
+      const prev = mat.userData.jkPreCsm.hook;
+      const prevKey = mat.userData.jkPreCsm.key;
+      // Put the pristine pair back before handing the material to CSM, so CSM
+      // composes onto the original every time rather than onto its own work.
+      mat.onBeforeCompile = prev;
+      mat.customProgramCacheKey = prevKey;
       csm.setupMaterial(mat);
       const csmHook = mat.onBeforeCompile;
       mat.onBeforeCompile = function (shader, renderer) {
@@ -632,7 +652,10 @@ function DayNightSystem() {
   const localTime = useRef(8); // hours
   const sunDir = useRef(new THREE.Vector3(0, 1, 0));
   const sunTarget = useMemo(() => new THREE.Object3D(), []);
-  const shadowSetup = useRef({ map: 0, cascades: 0 });
+  // Pulled out as plain numbers so they can be effect dependencies: the rig is
+  // rebuilt when either changes, and nothing else in qRender should rebuild it.
+  const cascadeCount = qRender.cascades || 3;
+  const shadowMapSize = qRender.shadowMap;
   const envAge = useRef(1e9);
   const expo = useRef(EXPOSURE_BASE);
   // Per-frame scratch, so none of this allocates inside useFrame.
@@ -667,16 +690,25 @@ function DayNightSystem() {
     cloudTex: { value: cloudTexture() },
   }), []);
 
-  // One canvas and one PMREM generator reused for every environment rebuild.
-  // The rig has to be built against the live camera and scene, and torn down
-  // when the quality preset changes the cascade count.
+  // The rig has to be built against the live camera and scene, and rebuilt from
+  // scratch when the quality preset changes the cascade count - which is why
+  // the cascade count and the map size are dependencies here.
+  //
+  // They did not used to be. The frame loop assigned `csm.cascades` and called
+  // updateFrustums() instead, which looks like it should work and does not:
+  // three's CSM creates one directional light per cascade in its *constructor*,
+  // so mutating the field moved the CSM_CASCADES define without moving the
+  // lights. Switching from High to Low left three directional shadows in the
+  // scene and `uniform vec2 CSM_cascades[1]` in the shader, the fragment
+  // program failed to compile with "array index out of range", and the scene
+  // stopped drawing. Rebuilding is the only honest way to change the count.
   useEffect(() => {
     let csm = null;
     try {
       csm = new CSM({
         maxFar: 180,
-        cascades: qRender.cascades || 3,
-        shadowMapSize: qRender.shadowMap,
+        cascades: cascadeCount,
+        shadowMapSize: shadowMapSize,
         lightDirection: new THREE.Vector3(-0.5, -1, -0.5).normalize(),
         camera: camera,
         parent: scene,
@@ -699,7 +731,7 @@ function DayNightSystem() {
       }
       csmRig.current = null;
     };
-  }, [camera, scene]);
+  }, [camera, scene, cascadeCount, shadowMapSize]);
 
   const env = useMemo(() => {
     let pmrem = null;
@@ -832,16 +864,8 @@ function DayNightSystem() {
     // --- sun ---
     const csm = csmRig.current;
     if (csm) {
-      // Rebuild if the preset changed the cascade count or map size.
-      const setup = shadowSetup.current;
-      if (setup.map !== q.shadowMap || setup.cascades !== q.cascades) {
-        setup.map = q.shadowMap;
-        setup.cascades = q.cascades;
-        csm.cascades = q.cascades;
-        csm.shadowMapSize = q.shadowMap;
-        csm.updateFrustums();
-        csmSeen.current = new WeakSet();   // defines changed; re-adopt everything
-      }
+      // No cascade-count change here: the effect above owns that, because it
+      // needs a new CSM and a new set of lights rather than a new number.
       // CSM wants the direction the light travels, not where it sits.
       csm.lightDirection.copy(dir).multiplyScalar(-1).normalize();
       const lit = sky.sunI > 0.02;
