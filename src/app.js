@@ -278,6 +278,11 @@ const COMPOSITE_FRAG = `
   uniform float uExposure;
   uniform float uToneMapper;   // 0 = ACES, 1 = AgX
   uniform float uFlash;        // lightning, decaying
+  uniform float uGradeAmount;
+  uniform vec3 uGradeLift;     // what happens to the darks
+  uniform vec3 uGradeGain;     // and to the lights
+  uniform float uGradeSat;
+  uniform float uGradeShadowSat;
   uniform float uUnderwater;   // 0 above the surface, 1 below it
   uniform vec3 uUnderwaterTint;
   uniform float uUnderwaterDensity;
@@ -419,6 +424,32 @@ ${ACES_GLSL}
       shaft = pow(shaft, 3.0) * smoothstep(0.1, 0.9, 1.0 - vUv.y) * gloom;
       mapped += uUnderwaterTint * shaft * 0.18 * uUnderwater;
       mapped *= 1.0 - 0.10 * uUnderwater;
+    }
+
+    // --- grading ---
+    // A lift/gain pair and two saturations, which is what a grading LUT would
+    // bake anyway - done analytically here so it stays readable and tweakable
+    // instead of being a texture nobody can edit.
+    //
+    // The look: deep shadows that are cool rather than merely dark, warm
+    // light, and green that is rich without being poster paint. The two
+    // saturations are the important part. Pushing saturation globally makes a
+    // jungle look like a sweet wrapper; pushing it in the lights while PULLING
+    // it in the shadows is what reads as film, because a real shadow is lit by
+    // the sky and is closer to grey than people expect.
+    {
+      float luma = dot(mapped, vec3(0.2126, 0.7152, 0.0722));
+      vec3 lifted = uGradeLift * (1.0 - mapped) + uGradeGain * mapped;
+      lifted = mix(mapped, lifted, uGradeAmount);
+      // Saturation blended between the shadow and highlight amounts by how
+      // bright the pixel is.
+      float sat = mix(uGradeShadowSat, uGradeSat, smoothstep(0.08, 0.55, luma));
+      vec3 graded = mix(vec3(luma), lifted, sat);
+      // A touch more green in the midtones only, where the foliage lives.
+      float mid = smoothstep(0.06, 0.34, luma) * (1.0 - smoothstep(0.52, 0.92, luma));
+      graded.g *= 1.0 + 0.055 * mid * uGradeAmount;
+      graded.r *= 1.0 - 0.020 * mid * uGradeAmount;
+      mapped = clamp(mix(mapped, graded, uGradeAmount), 0.0, 1.0);
     }
 
     // --- vignette, in display space so it reads the same at any exposure ---
@@ -575,13 +606,21 @@ function PostFX() {
           tAO: { value: null }, tRays: { value: null },
           uTexel: { value: new THREE.Vector2() },
           uExposure: { value: 0.52 },
-          // ACES for now. AgX has the better highlight path, but it also
-          // desaturates hard, and in a frame that is almost entirely mid-green
-          // that reads as colourless fog - compared side by side at noon it was
-          // not close. Revisit once the grading LUT exists to put the
-          // saturation back; the transform is already here behind this switch.
-          uToneMapper: { value: 0 },
+          // AgX. In section 1 this lost to ACES, because AgX desaturates hard
+          // and there was nothing to put the colour back - a frame that is
+          // almost entirely mid-green came out as colourless fog. With the
+          // grade below doing that job the comparison reverses: AgX holds the
+          // highlight on sunlit bark where ACES slews it toward yellow, and
+          // its shadows stay green instead of going grey. Both transforms are
+          // still here behind this switch.
+          uToneMapper: { value: 1 },
           uFlash: { value: 0 },
+          uGradeAmount: { value: 1.0 },
+          // Cool, slightly blue shadows; warm, very slightly yellow lights.
+          uGradeLift: { value: new THREE.Vector3(-0.012, 0.004, 0.030) },
+          uGradeGain: { value: new THREE.Vector3(1.055, 1.020, 0.955) },
+          uGradeSat: { value: 1.14 },
+          uGradeShadowSat: { value: 0.80 },
           uUnderwater: { value: 0 },
           uUnderwaterTint: { value: new THREE.Color('#123f44') },
           uUnderwaterDensity: { value: 0.085 },

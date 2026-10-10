@@ -1,3 +1,6 @@
-2026/10/11-01:58:36.348 2c0a8bd Reusing MANIFEST /Users/ezekielgeorge/jungle-king/tools/chromeprof/Default/shared_proto_db/MANIFEST-000001
-2026/10/11-01:58:36.349 2c0a8bd Recovering log #3
-2026/10/11-01:58:36.352 2c0a8bd Reusing old log /Users/ezekielgeorge/jungle-king/tools/chromeprof/Default/shared_proto_db/000003.log 
+2026/10/11-04:34:23.101 2c407e3 Reusing MANIFEST /Users/ezekielgeorge/jungle-king/tools/chromeprof/Default/shared_proto_db/MANIFEST-000001
+2026/10/11-04:34:23.102 2c407e3 Recovering log #3
+2026/10/11-04:34:23.120 2c407e3 Reusing old log /Users/ezekielgeorge/jungle-king/tools/chromeprof/Default/shared_proto_db/000003.log 
+2026/10/11-04:34:23.288 2c4080b Level-0 table #5: started
+2026/10/11-04:34:23.298 2c4080b Level-0 table #5: 131051 bytes OK
+2026/10/11-04:34:23.305 2c4080b Delete type=0 #3

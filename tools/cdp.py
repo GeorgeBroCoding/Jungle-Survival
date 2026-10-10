@@ -26,7 +26,10 @@ class WS:
     def __init__(self, url):
         m = re.match(r"ws://([^:/]+):(\d+)(/.*)", url)
         host, port, path = m.group(1), int(m.group(2)), m.group(3)
-        self.sock = socket.create_connection((host, port), timeout=60)
+        # Generous: a single screenshot of a dense scene under software
+        # rendering can block the socket for minutes, and a short timeout
+        # turns that into a dead connection rather than a slow one.
+        self.sock = socket.create_connection((host, port), timeout=460)
         key = base64.b64encode(os.urandom(16)).decode()
         req = (
             "GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\n"
