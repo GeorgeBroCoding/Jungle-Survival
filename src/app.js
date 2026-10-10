@@ -10,7 +10,7 @@ import { Kito, Workbench } from './kito.js';
 import { playerTransform } from './multiplayer.js';
 import { Player } from './player.js';
 import { ACES_GLSL, DEPTH_GLSL, postState, skyRuntime } from './runtime.js';
-import { EXPOSURE_BASE, debugClock, sampleSky } from './sky.js';
+import { EXPOSURE_BASE, csmStats, debugClock, envRuntime, sampleSky, shadowOverride } from './sky.js';
 import { StartScreen } from './startscreen.js';
 import { useGame } from './store.js';
 import { RIVER, baseTerrainHeight, getTerrainHeight, shaderPatchStats, waterSurfaceAt } from './terrain.js';
@@ -273,6 +273,7 @@ const COMPOSITE_FRAG = `
   uniform sampler2D tRays;
   uniform vec2 uTexel;
   uniform float uExposure;
+  uniform float uToneMapper;   // 0 = ACES, 1 = AgX
   uniform float uBloom;
   uniform float uAOAmount;
   uniform float uRays;
@@ -370,7 +371,10 @@ ${ACES_GLSL}
     if (uBloom > 0.0) colour += texture2D(tBloom, uv).rgb * uBloom;
 
     // --- exposure, tone map, encode ---
-    vec3 mapped = lin2srgb(aces(colour * uExposure));
+    // uToneMapper picks the transform so the two can be compared on the same
+    // frame rather than argued about: 0 = ACES, 1 = AgX.
+    vec3 exposed = colour * uExposure;
+    vec3 mapped = lin2srgb(mix(aces(exposed), agx(exposed), uToneMapper));
 
     // --- vignette, in display space so it reads the same at any exposure ---
     if (uVignette > 0.0) {
@@ -519,6 +523,12 @@ function PostFX() {
           tAO: { value: null }, tRays: { value: null },
           uTexel: { value: new THREE.Vector2() },
           uExposure: { value: 0.52 },
+          // ACES for now. AgX has the better highlight path, but it also
+          // desaturates hard, and in a frame that is almost entirely mid-green
+          // that reads as colourless fog - compared side by side at noon it was
+          // not close. Revisit once the grading LUT exists to put the
+          // saturation back; the transform is already here behind this switch.
+          uToneMapper: { value: 0 },
           uBloom: { value: 0.0 }, uAOAmount: { value: 0.0 }, uRays: { value: 0.0 },
           uVignette: { value: 0.3 }, uGrain: { value: 0.0 }, uTime: { value: 0 },
           uDofStart: { value: 60 }, uDofRange: { value: 140 }, uDofAmount: { value: 0 },
@@ -834,12 +844,16 @@ if (typeof window !== 'undefined') {
     player: playerTransform,
     canopyCoverAt,
     shaderPatchStats,
+    csm: csmStats,
     windPatchStats,
     wind: windUniforms,
     water: waterRuntime,
     ripple: (x, z, a) => spawnRipple(x, z, a === undefined ? 0.05 : a),
     teleport: (x, z) => { debugWarp.x = x; debugWarp.z = z; },
+    // The sky owns the clock; setting the store's timeOfDay does not move it.
     setTime: (t) => { debugClock.t = t; },
+    envScale: (v) => { envRuntime.scale = v; },
+    shadows: shadowOverride,
     river: RIVER,
     riverX: riverCenterX,
     waterAt: waterSurfaceAt,

@@ -160,7 +160,7 @@ function vegMat(key) {
       const t = surfaceTiled('bark', [1.6, 2.4]);
       return makeWindy(new THREE.MeshStandardMaterial({
         map: t.map, normalMap: t.normalMap, roughnessMap: t.roughnessMap,
-        roughness: 0.95, envMapIntensity: 0.2,
+        roughness: 0.95, envMapIntensity: 1.0,
       }), { mossy: true, noTrample: true });
     });
   }
@@ -174,7 +174,7 @@ function vegMat(key) {
         alphaTest: 0.32,
         transparent: false,
         side: THREE.DoubleSide,
-        roughness: 0.72, envMapIntensity: 0.3,
+        roughness: 0.72, envMapIntensity: 1.0,
         vertexColors: true,
       }), { translucent: true, leafLod: true });
     });
@@ -186,7 +186,7 @@ function vegMat(key) {
       const t = surfaceTiled('leaf', [1.8, 1.8]);
       return makeWindy(new THREE.MeshStandardMaterial({
         map: t.map, normalMap: t.normalMap, roughnessMap: t.roughnessMap,
-        roughness: 0.68, envMapIntensity: 0.35, side: THREE.DoubleSide,
+        roughness: 0.68, envMapIntensity: 1.0, side: THREE.DoubleSide,
       }), { translucent: true, noTrample: true });
     });
   }
@@ -195,13 +195,13 @@ function vegMat(key) {
       const t = surfaceTiled('leaf', [1.8, 1.8]);
       return makeWindy(new THREE.MeshStandardMaterial({
         map: t.map, normalMap: t.normalMap, roughnessMap: t.roughnessMap,
-        roughness: 0.68, envMapIntensity: 0.35, side: THREE.DoubleSide,
+        roughness: 0.68, envMapIntensity: 1.0, side: THREE.DoubleSide,
       }), { translucent: true });
     });
   }
   if (key === 'snowCap') {
     return stdMat('snow', () => new THREE.MeshStandardMaterial({
-      color: '#eef5fa', roughness: 0.55, metalness: 0, envMapIntensity: 0.9,
+      color: '#eef5fa', roughness: 0.55, metalness: 0, envMapIntensity: 1.0,
     }));
   }
   if (key === 'boulder' || key === 'pebble') {
@@ -209,7 +209,7 @@ function vegMat(key) {
       const t = surfaceTiled('rock', [1.4, 1.4]);
       return makeWindy(new THREE.MeshStandardMaterial({
         map: t.map, normalMap: t.normalMap, roughnessMap: t.roughnessMap,
-        roughness: 0.95, envMapIntensity: 0.3,
+        roughness: 0.95, envMapIntensity: 1.0,
       }), { mossy: true, still: true });
     });
   }

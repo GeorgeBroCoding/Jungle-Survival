@@ -5,6 +5,7 @@ import { useFrame, useThree, Canvas } from '@react-three/fiber';
 import { create } from 'zustand';
 import htm from 'htm';
 import { Peer } from 'peerjs';
+import { CSM } from 'three/addons/csm/CSM.js';
 
 // JSX-like template tag, no build step required.
 // Usage: html`<mesh position=${[0,1,0]}><boxGeometry /></mesh>`
@@ -16,5 +17,5 @@ const html = htm.bind(React.createElement);
 
 export {
   React, Fragment, useState, useMemo, useRef, useEffect,
-  createRoot, THREE, useFrame, useThree, Canvas, create, htm, Peer, html,
+  createRoot, THREE, useFrame, useThree, Canvas, create, htm, Peer, html, CSM,
 };

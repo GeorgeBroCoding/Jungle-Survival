@@ -94,7 +94,7 @@ function skinMat(key) {
       normalScale: new THREE.Vector2(0.45, 0.45),
       roughness: 0.72,
       metalness: 0,
-      envMapIntensity: 0.35,
+      envMapIntensity: 1.0,
       // Lathed parts are only right-side-out if the profile winding is right;
       // double-siding them costs almost nothing at this size and removes any
       // chance of a limb turning inside out.
@@ -115,7 +115,7 @@ function clothMat(hex, surfKey) {
       color: hex,
       roughness: 0.92,
       metalness: 0,
-      envMapIntensity: 0.2,
+      envMapIntensity: 1.0,
       side: THREE.DoubleSide,
     });
   }
@@ -135,7 +135,7 @@ function furMat(key) {
       normalScale: new THREE.Vector2(0.8, 0.8),
       roughness: 0.9,
       metalness: 0,
-      envMapIntensity: 0.2,
+      envMapIntensity: 1.0,
       side: THREE.DoubleSide,
     });
   }

@@ -123,7 +123,7 @@ function GrassField() {
       roughness: 0.78,
       metalness: 0,
       side: THREE.DoubleSide,
-      envMapIntensity: 0.25,
+      envMapIntensity: 1.0,
     });
     // aPhase is our own instanced attribute, declared here rather than relying
     // on anything three exposes internally, so this stays stable across

@@ -46,16 +46,16 @@ function HeldWeapon({ id }) {
   // Shared materials so every weapon in the world is one draw state each:
   // real wood grain on the hafts, worn metal on the heads, cord on the grips.
   const wood = surfaceMat('weaponWood', 'bark', [1.4, 2.6], {
-    color: '#9a7446', roughness: 0.82, metalness: 0, envMapIntensity: 0.3,
+    color: '#9a7446', roughness: 0.82, metalness: 0, envMapIntensity: 1.0,
   });
   const cord = surfaceMat('weaponCord', 'cloth', [2.6, 2.6], {
     color: '#6a5436', roughness: 0.95, metalness: 0,
   });
   const steel = stdMat('weaponSteel', () => new THREE.MeshStandardMaterial({
-    color: '#b7bcc4', roughness: 0.28, metalness: 0.85, envMapIntensity: 1.3,
+    color: '#b7bcc4', roughness: 0.28, metalness: 0.85, envMapIntensity: 1.0,
   }));
   const stone = surfaceMat('weaponStone', 'rock', [1.6, 1.6], {
-    color: '#9a978e', roughness: 0.7, metalness: 0.05, envMapIntensity: 0.5,
+    color: '#9a978e', roughness: 0.7, metalness: 0.05, envMapIntensity: 1.0,
   });
 
   if (id === 'spear') {

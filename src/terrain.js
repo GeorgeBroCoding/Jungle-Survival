@@ -358,7 +358,7 @@ function Ground() {
       roughness: 0.95,
       metalness: 0,
       normalScale: new THREE.Vector2(1.1, 1.1),
-      envMapIntensity: 0.35,
+      envMapIntensity: 1.0,
     });
     const mean = surfaceMeanLuma('ground');
     // UVs run 0..1 across all 600 units, so these numbers are tiles per world:

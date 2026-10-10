@@ -1,9 +1,9 @@
-import { Fragment, THREE, html, useEffect, useFrame, useMemo, useRef, useThree } from './core.js';
-import { GRAPHICS_PRESETS, SHADOW_FORWARD_BIAS, canopyCoverAt, fireRegistry, gfx, graphicsSettings } from './graphics.js';
+import { CSM, Fragment, THREE, html, useEffect, useFrame, useMemo, useRef, useThree } from './core.js';
+import { GRAPHICS_PRESETS, canopyCoverAt, fireRegistry, gfx, graphicsSettings } from './graphics.js';
 import { playerTransform } from './multiplayer.js';
 import { postState, skyRuntime } from './runtime.js';
 import { useGame } from './store.js';
-import { fbm, greyCanvasFromField, makeCanvas, smoothstep, texFrom } from './textures.js';
+import { fbm, greyCanvasFromField, smoothstep, texFrom } from './textures.js';
 import { updateTrampleTrail, windUniforms } from './wind.js';
 
 // ============================================================
@@ -236,6 +236,7 @@ const SKY_FRAG = `
   uniform float time;
   uniform float uExposure;
   uniform float uToneMap;
+  uniform float uEnvScale;   // 1 on the dome; the canopy's share on the env map
   uniform float uTurbidity;
   uniform float uRayleigh;
   uniform float uMieC;
@@ -316,6 +317,7 @@ ${ATMO_GLSL}
     // With the post chain running, the dome is just another thing drawn into
     // the HDR buffer and the composite tone maps the lot. Doing it here as
     // well would crush the sun to white before bloom ever saw how bright it is.
+    col *= uEnvScale;
     gl_FragColor = uToneMap > 0.5
       ? vec4(lin2srgb(aces(col * uExposure)), 1.0)
       : vec4(col, 1.0);
@@ -409,12 +411,125 @@ function SkyDome({ uniforms }) {
   return html`<mesh ref=${ref} geometry=${geo} material=${mat} frustumCulled=${false} renderOrder=${-1} />`;
 }
 
-// A development hatch: the sky owns the clock and writes timeOfDay into the
-// store, so setting the store does nothing to the light. Screenshots at a
-// named hour need to move the clock itself.
+// A development hatch, like debugWarp in Player: the sky owns the clock and
+// writes timeOfDay into the store, so setting the store does nothing to the
+// light. Screenshots at a named hour need to move the clock itself.
 const debugClock = { t: null };
 
+// How much of the sky actually reaches the ground. Under a closed canopy almost
+// none of it does, which is the difference between a forest floor and a field,
+// and the thing a single global environment map cannot express on its own.
+// `scale` is the overall gain on image-based light. At 1.0 - a wholly
+// unobstructed sky - the understorey washes out: everything is lit from every
+// direction at once and the sun stops meaning anything. Ambient occlusion is
+// what should be darkening the understorey rather than a global knob, so
+// revisit this when AO lands.
+const envRuntime = { scale: 0.45, canopy: 1 };
+
+// Forced from the console to check that shadows are landing at all. `null`
+// means "whatever the sun is doing"; true/false pins it.
+const shadowOverride = { on: null, biasScale: 1 };
+
+// ---------- Cascaded shadow maps ----------
+// One shadow map across a 30-48m box is either sharp near you and gone in the
+// distance, or soft everywhere. Leaf shadows on the forest floor are the single
+// most recognisable thing about a rainforest and they need the near cascade to
+// be tight, so the view frustum gets split and each slice gets its own map.
+//
+// The addon assigns material.onBeforeCompile outright. Every lit material here
+// already uses that hook - detail textures, moss, wind, leaf translucency - so
+// adoption has to compose the two rather than let CSM win.
+const csmStats = { adopted: 0, sweeps: 0, cascades: 0 };
+function adoptForCsm(csm, scene, seen) {
+  let n = 0;
+  scene.traverse((o) => {
+    const m = o.material;
+    if (!m) return;
+    const list = Array.isArray(m) ? m : [m];
+    for (const mat of list) {
+      if (!mat || !mat.isMeshStandardMaterial || seen.has(mat)) continue;
+      seen.add(mat);
+      const prev = mat.onBeforeCompile;
+      const prevKey = mat.customProgramCacheKey;
+      csm.setupMaterial(mat);
+      const csmHook = mat.onBeforeCompile;
+      mat.onBeforeCompile = function (shader, renderer) {
+        if (prev) prev.call(this, shader, renderer);
+        csmHook.call(this, shader, renderer);
+      };
+      mat.customProgramCacheKey = function () {
+        return (prevKey ? prevKey.call(this) : '') + '|csm' + csm.cascades;
+      };
+      mat.needsUpdate = true;
+      n++;
+    }
+  });
+  csmStats.adopted += n;
+  csmStats.sweeps++;
+  return n;
+}
+
 // ---------- Environment map ----------
+// Built by rendering the *actual* sky shader into a float cubemap, not by
+// painting a canvas. A canvas is 8-bit, so every radiance above white clipped
+// and the image-based light came out with no range at all - which is why there
+// had to be a flat ambient term on top of it to get anything lit. Rendered at
+// full float, the environment carries real intensities and can be the only
+// indirect light in the scene.
+//
+// The lower hemisphere is the forest bouncing back up: dim, green, and much
+// darker than the sky. That is the half a photographed forest HDRI would
+// supply, except this one tracks the sun instead of being frozen at whatever
+// time of day the photograph was taken.
+function buildEnvScene(uniforms) {
+  const scene = new THREE.Scene();
+  const skyUniforms = {};
+  for (const k in uniforms) skyUniforms[k] = uniforms[k];
+  // Everything shared with the dome except the display transform: this one has
+  // to stay linear, because it is light, not a picture.
+  skyUniforms.uToneMap = { value: 0 };
+  // Scales the whole environment. Not a fudge: it is how much sky is left after
+  // the canopy, and the canopy is most of the sky in a rainforest.
+  skyUniforms.uEnvScale = { value: 1 };
+  const dome = new THREE.Mesh(
+    new THREE.SphereGeometry(100, 24, 16),
+    new THREE.ShaderMaterial({
+      uniforms: skyUniforms,
+      vertexShader: SKY_VERT,
+      fragmentShader: SKY_FRAG,
+      side: THREE.BackSide,
+      depthWrite: false,
+      toneMapped: false,
+    })
+  );
+  scene.add(dome);
+  const groundMat = new THREE.MeshBasicMaterial({
+    color: new THREE.Color(0.02, 0.03, 0.012),
+    side: THREE.BackSide,
+    toneMapped: false,
+  });
+  const ground = new THREE.Mesh(
+    new THREE.SphereGeometry(99, 16, 8, 0, Math.PI * 2, Math.PI * 0.5, Math.PI * 0.5),
+    groundMat
+  );
+  scene.add(ground);
+  return { scene, groundMat, dome };
+}
+
+// What the forest floor and canopy send back up. Mostly the sun's own colour,
+// filtered through leaves and bounced off wet litter, so it is green, dim, and
+// goes out with the light.
+const _envGround = new THREE.Color();
+function updateEnvGround(mat, sky, sunI) {
+  _envGround.copy(sky.sunColor);
+  _envGround.multiply(JUNGLE_BOUNCE);
+  _envGround.multiplyScalar(Math.max(0.0015, sunI * 0.035));
+  _envGround.lerp(ENV_NIGHT_GROUND, Math.min(1, sky.star));
+  mat.color.copy(_envGround);
+}
+const JUNGLE_BOUNCE = new THREE.Color(0.30, 0.52, 0.22);
+const ENV_NIGHT_GROUND = new THREE.Color(0.004, 0.006, 0.010);
+
 // Materials need something to reflect or the water and any metal read as flat
 // paint. This paints a small equirectangular sky by evaluating the *same*
 // scattering the dome draws, at a handful of elevations, then runs it through
@@ -498,9 +613,10 @@ function DayNightSystem() {
   const quality = useGame((s) => s.graphicsQuality);
   const qRender = GRAPHICS_PRESETS[quality] || gfx();
   const sunRef = useRef();
+  const csmRig = useRef(null);
+  const csmSeen = useRef(new WeakSet());
+  const adoptAge = useRef(0);
   const moonRef = useRef();
-  const ambRef = useRef();
-  const hemiRef = useRef();
   const fire0 = useRef(); const fire1 = useRef(); const fire2 = useRef();
   const fireRefs = [fire0, fire1, fire2];
   // Firelight shadows come from a single spotlight hung above the nearest fire
@@ -516,7 +632,7 @@ function DayNightSystem() {
   const localTime = useRef(8); // hours
   const sunDir = useRef(new THREE.Vector3(0, 1, 0));
   const sunTarget = useMemo(() => new THREE.Object3D(), []);
-  const shadowSetup = useRef({ map: 0, extent: 0 });
+  const shadowSetup = useRef({ map: 0, cascades: 0 });
   const envAge = useRef(1e9);
   const expo = useRef(EXPOSURE_BASE);
   // Per-frame scratch, so none of this allocates inside useFrame.
@@ -530,6 +646,7 @@ function DayNightSystem() {
   }), []);
 
   const uniforms = useMemo(() => ({
+    uEnvScale: { value: 1 },
     nightZenith: { value: new THREE.Color('#01030c') },
     nightHorizon: { value: new THREE.Color('#040814') },
     ground: { value: new THREE.Color('#8a9478') },
@@ -551,25 +668,68 @@ function DayNightSystem() {
   }), []);
 
   // One canvas and one PMREM generator reused for every environment rebuild.
+  // The rig has to be built against the live camera and scene, and torn down
+  // when the quality preset changes the cascade count.
+  useEffect(() => {
+    let csm = null;
+    try {
+      csm = new CSM({
+        maxFar: 180,
+        cascades: qRender.cascades || 3,
+        shadowMapSize: qRender.shadowMap,
+        lightDirection: new THREE.Vector3(-0.5, -1, -0.5).normalize(),
+        camera: camera,
+        parent: scene,
+        lightMargin: 160,
+        // Blend the seams between cascades instead of showing a hard step.
+        fade: true,
+      });
+      csm.lights.forEach((l) => { l.shadow.normalBias = 0.02; });
+    } catch (e) {
+      csm = null;
+      // eslint-disable-next-line no-console
+      console.warn('[jungle-king] cascaded shadows unavailable:', e && e.message);
+    }
+    csmRig.current = csm;
+    csmSeen.current = new WeakSet();
+    return () => {
+      if (csm) {
+        csm.dispose();
+        csm.remove();
+      }
+      csmRig.current = null;
+    };
+  }, [camera, scene]);
+
   const env = useMemo(() => {
-    const cv = makeCanvas(128, 64);
-    const tex = new THREE.CanvasTexture(cv);
-    tex.mapping = THREE.EquirectangularReflectionMapping;
-    tex.colorSpace = THREE.SRGBColorSpace;
     let pmrem = null;
+    let cubeRT = null;
+    let cubeCam = null;
     try {
       pmrem = new THREE.PMREMGenerator(gl);
-      pmrem.compileEquirectangularShader();
+      // Render the sky into a small float cube ourselves rather than letting
+      // PMREMGenerator.fromScene do it: that renders six 256px faces of the
+      // full scattering shader, which is 390k fragments of acos and exp every
+      // time the environment refreshes. The sky has no detail to lose at 64.
+      cubeRT = new THREE.WebGLCubeRenderTarget(64, {
+        type: THREE.HalfFloatType,
+        format: THREE.RGBAFormat,
+        generateMipmaps: false,
+      });
+      cubeCam = new THREE.CubeCamera(1, 200, cubeRT);
     } catch (e) {
       pmrem = null;
     }
-    return { cv, tex, pmrem, rt: null };
-  }, [gl]);
+    return { pmrem, rt: null, cubeRT, cubeCam, envScene: buildEnvScene(uniforms) };
+  }, [gl, uniforms]);
 
   useEffect(() => () => {
     if (env.rt) env.rt.dispose();
     if (env.pmrem) env.pmrem.dispose();
-    env.tex.dispose();
+    if (env.cubeRT) env.cubeRT.dispose();
+    env.envScene.dome.geometry.dispose();
+    env.envScene.dome.material.dispose();
+    env.envScene.groundMat.dispose();
     scene.environment = null;
   }, [env, scene]);
 
@@ -577,6 +737,8 @@ function DayNightSystem() {
     const q = gfx();
     clockAccum.current += delta;
     if (debugClock.t !== null) {
+      // Re-seat the accumulator so the clock continues from the requested hour
+      // instead of jumping back the moment the next frame advances it.
       clockAccum.current = (((debugClock.t - 8) + 24) % 24) / 24 * DAY_LENGTH_SECONDS;
       debugClock.t = null;
     }
@@ -668,49 +830,45 @@ function DayNightSystem() {
     }
 
     // --- sun ---
-    if (sunRef.current) {
-      const sun = sunRef.current;
-      const e = q.shadowExtent;
-      // Fit the box to what you can see rather than wrapping the player: push
-      // it forward along the view direction, then snap the centre to whole
-      // shadow texels so the edges stop crawling as you walk.
-      tmp.centre.set(px, py, pz).addScaledVector(tmp.fwd, e * SHADOW_FORWARD_BIAS);
-      const texel = (2 * e) / Math.max(1, q.shadowMap);
-      tmp.right.set(0, 1, 0).cross(dir);
-      if (tmp.right.lengthSq() < 1e-6) tmp.right.set(1, 0, 0);
-      tmp.right.normalize();
-      tmp.up.copy(dir).cross(tmp.right).normalize();
-      const ar = Math.round(tmp.centre.dot(tmp.right) / texel) * texel;
-      const au = Math.round(tmp.centre.dot(tmp.up) / texel) * texel;
-      const ad = tmp.centre.dot(dir);
-      tmp.centre.copy(tmp.right).multiplyScalar(ar).addScaledVector(tmp.up, au).addScaledVector(dir, ad);
-
-      sun.position.copy(tmp.centre).addScaledVector(dir, 110);
-      sunTarget.position.copy(tmp.centre);
-      sun.target = sunTarget;
-      sun.color.copy(sky.sunColor);
-      sun.intensity = sky.sunI;
-      sun.visible = sky.sunI > 0.02;
-
+    const csm = csmRig.current;
+    if (csm) {
+      // Rebuild if the preset changed the cascade count or map size.
       const setup = shadowSetup.current;
-      if (setup.map !== q.shadowMap || setup.extent !== e) {
+      if (setup.map !== q.shadowMap || setup.cascades !== q.cascades) {
         setup.map = q.shadowMap;
-        setup.extent = e;
-        sun.shadow.mapSize.set(q.shadowMap, q.shadowMap);
-        const c = sun.shadow.camera;
-        c.left = -e; c.right = e; c.top = e; c.bottom = -e;
-        c.near = 1;
-        c.far = 240;
-        c.updateProjectionMatrix();
-        // Smaller texels need less bias; too much and small objects detach
-        // from their own shadow.
-        sun.shadow.bias = -(0.00008 + texel * 0.008);
-        sun.shadow.normalBias = Math.max(0.02, texel * 1.2);
-        // Force the shadow map to be reallocated at the new resolution.
-        if (sun.shadow.map) {
-          sun.shadow.map.dispose();
-          sun.shadow.map = null;
-        }
+        setup.cascades = q.cascades;
+        csm.cascades = q.cascades;
+        csm.shadowMapSize = q.shadowMap;
+        csm.updateFrustums();
+        csmSeen.current = new WeakSet();   // defines changed; re-adopt everything
+      }
+      // CSM wants the direction the light travels, not where it sits.
+      csm.lightDirection.copy(dir).multiplyScalar(-1).normalize();
+      const lit = sky.sunI > 0.02;
+      csm.update();
+      csmStats.cascades = csm.cascades;
+      // Bias has to be set per cascade and after the update, because each
+      // cascade covers a different slice of the view and so has a different
+      // texel size on the ground - the far one's texels are metres across. One
+      // bias for all of them means acne in the distance or shadows detaching
+      // from their casters up close; this frame came back 65% black before the
+      // far cascades were given room.
+      for (const light of csm.lights) {
+        light.color.copy(sky.sunColor);
+        light.intensity = lit ? sky.sunI : 0;
+        light.castShadow = shadowOverride.on === null ? lit : shadowOverride.on;
+        const cam = light.shadow.camera;
+        const texel = (cam.right - cam.left) / Math.max(1, csm.shadowMapSize);
+        light.shadow.bias = -(0.0004 + texel * 0.0016);
+        light.shadow.normalBias = Math.max(0.02, texel * 1.4) * shadowOverride.biasScale;
+      }
+      // Materials are built lazily all over the world, so sweep for new ones
+      // rather than asking every module to register. A traverse of a scene this
+      // size costs far less than the shadow pass it is feeding.
+      adoptAge.current += delta;
+      if (adoptAge.current > 1.0) {
+        adoptAge.current = 0;
+        adoptForCsm(csm, scene, csmSeen.current);
       }
     }
 
@@ -726,22 +884,10 @@ function DayNightSystem() {
 
     // --- ambient and sky bounce take their hue from the scattering, their
     // strength from the keyframes ---
-    if (ambRef.current) {
-      normaliseHue(tmp.hue.copy(atmoLook.average), 0.30);
-      normaliseHue(tmp.night.copy(uniforms.nightZenith.value), 0.25);
-      ambRef.current.color.copy(tmp.hue).lerp(tmp.night, sky.star * 0.8);
-      ambRef.current.intensity = sky.ambI;
-    }
-    if (hemiRef.current) {
-      normaliseHue(tmp.hue.copy(atmoLook.zenith), 0.22);
-      normaliseHue(tmp.night.copy(uniforms.nightZenith.value), 0.25);
-      hemiRef.current.color.copy(tmp.hue).lerp(tmp.night, sky.star * 0.8);
-      // The ground half of the hemisphere light is the jungle bouncing back up.
-      normaliseHue(tmp.ground.copy(sky.grd).lerp(tmp.jungle, 0.5), 0.1);
-      hemiRef.current.groundColor.copy(tmp.ground);
-      hemiRef.current.intensity = sky.hemiI;
-    }
-
+    // No ambient or hemisphere light any more: both added a constant term to
+    // every surface regardless of what was above it, which is exactly the
+    // flatness this pass is removing. scene.environment carries the indirect
+    // light now, and it varies with direction.
     // --- campfires: a fixed pool of lights, handed to the nearest fires ---
     const picks = tmp.picks;
     picks.length = 0;
@@ -819,9 +965,13 @@ function DayNightSystem() {
     if (q.envSeconds > 0 && env.pmrem && envAge.current >= q.envSeconds) {
       envAge.current = 0;
       try {
-        paintEnvCanvas(env.cv, sky, dir, expo.current);
-        env.tex.needsUpdate = true;
-        const next = env.pmrem.fromEquirectangular(env.tex);
+        updateEnvGround(env.envScene.groundMat, sky, sky.sunI);
+        // A closed canopy leaves a quarter of the sky; a clearing leaves all
+        // of it. Same grid the eye adaptation reads, so the two agree.
+        envRuntime.canopy = 1 - canopyCoverAt(px, pz) * 0.78;
+        env.envScene.dome.material.uniforms.uEnvScale.value = envRuntime.scale * envRuntime.canopy;
+        env.cubeCam.update(gl, env.envScene.scene);
+        const next = env.pmrem.fromCubemap(env.cubeRT.texture);
         if (env.rt) env.rt.dispose();
         env.rt = next;
         scene.environment = next.texture;
@@ -842,12 +992,9 @@ function DayNightSystem() {
     <${Fragment}>
       <${SkyDome} uniforms=${uniforms} />
       <primitive object=${sunTarget} />
-      <directionalLight ref=${sunRef} position=${[50, 80, 40]} intensity=${2} castShadow=${true}
-        shadow-mapSize-width=${2048} shadow-mapSize-height=${2048}
-        shadow-bias=${-0.0004} shadow-normalBias=${0.035} />
+      <!-- The sun is CSM's now: one directional light per cascade, created and
+           parented by the rig above. -->
       <directionalLight ref=${moonRef} position=${[-50, 60, -40]} intensity=${0} color="#7d93c8" />
-      <ambientLight ref=${ambRef} intensity=${0.18} color="#bcd4ff" />
-      <hemisphereLight ref=${hemiRef} args=${['#bcd4ff', '#3a5a30', 0.6]} />
       <!-- Only as many lights as the preset actually uses get mounted: every
            light in the scene is evaluated per fragment on every lit material,
            whether or not it is switched on. Changing the count recompiles the
@@ -873,6 +1020,9 @@ function DayNightSystem() {
 
 
 export {
+  shadowOverride,
+  csmStats,
+  envRuntime,
   debugClock,
   DAY_LENGTH_SECONDS,
   SKY_STATES,

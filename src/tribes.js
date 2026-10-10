@@ -184,7 +184,7 @@ function fireMat(key) {
   }
   if (key === 'stones') {
     return surfaceMat('fireStones', 'rock', [2.4, 1.2], {
-      color: '#8e8a80', roughness: 0.82, metalness: 0.02, envMapIntensity: 0.5,
+      color: '#8e8a80', roughness: 0.82, metalness: 0.02, envMapIntensity: 1.0,
     });
   }
   if (key === 'log') {
